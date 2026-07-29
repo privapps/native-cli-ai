@@ -5,6 +5,9 @@ use nca_common::session::{SessionMeta, SessionState, SessionStatus};
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
+use std::process::Command as ProcessCommand;
+#[cfg(unix)]
+use std::process::Stdio;
 use tempfile::tempdir;
 
 fn write_local_config(workspace: &Path) {
@@ -62,6 +65,30 @@ fn write_event_log(workspace: &Path, id: &str, lines: &str) {
     let sessions_dir = workspace.join(".nca").join("sessions");
     fs::create_dir_all(&sessions_dir).expect("create sessions dir");
     fs::write(sessions_dir.join(format!("{id}.events.jsonl")), lines).expect("write event log");
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        ProcessCommand::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(windows)]
+    {
+        let Ok(output) = ProcessCommand::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+        else {
+            return false;
+        };
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout).contains(&format!(",\"{pid}\","))
+    }
 }
 
 #[test]
@@ -297,11 +324,17 @@ fn attach_falls_back_to_enveloped_event_log() {
 #[test]
 fn spawn_json_reports_machine_paths() {
     let temp = tempdir().expect("tempdir");
+    write_local_config(temp.path());
+    let nca_home = temp.path().join("nca-home");
+    let runtime_dir = temp.path().join("runtime");
 
     let output = Command::cargo_bin("nca")
         .expect("binary")
         .current_dir(temp.path())
         .env("HOME", temp.path())
+        .env("NCA_HOME", &nca_home)
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env_remove("MINIMAX_API_KEY")
         .arg("spawn")
         .arg("--prompt")
         .arg("hello")
@@ -327,6 +360,40 @@ fn spawn_json_reports_machine_paths() {
             .expect("event log path")
             .ends_with(".events.jsonl")
     );
+
+    let status_path = payload["status_path"].as_str().expect("status path");
+    let status: Value =
+        serde_json::from_str(&fs::read_to_string(status_path).expect("spawned session metadata"))
+            .expect("session metadata should be valid JSON");
+    assert_eq!(payload["socket_path"], status["meta"]["socket_path"]);
+
+    let pid = payload["pid"]
+        .as_u64()
+        .expect("spawned child pid")
+        .try_into()
+        .expect("pid should fit in u32");
+    let cancel = Command::cargo_bin("nca")
+        .expect("binary")
+        .current_dir(temp.path())
+        .env("HOME", temp.path())
+        .env("NCA_HOME", &nca_home)
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .arg("cancel")
+        .arg(session_id)
+        .arg("--json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let cancelled: Value = serde_json::from_slice(&cancel).expect("cancel response should be JSON");
+    assert_eq!(cancelled["cancelled"], true);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while process_is_alive(pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(!process_is_alive(pid), "spawned child should be terminated");
 }
 
 #[test]

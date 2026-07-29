@@ -60,17 +60,18 @@ pub fn spawn_openai_stream(
     tokio::spawn(async move {
         let mut buffer = String::new();
         let mut tool_calls: BTreeMap<u64, ToolCallAccumulator> = BTreeMap::new();
+        let mut produced_output = false;
 
         while let Some(item) = byte_stream.next().await {
             let chunk = match item {
                 Ok(chunk) => chunk,
                 Err(err) => {
                     let _ = tx
-                        .send(StreamChunk::TextDelta(format!(
-                            "\n[{provider_name} stream error: {err}]"
+                        .send(StreamChunk::Error(format!(
+                            "{provider_name} stream error: {err}"
                         )))
                         .await;
-                    break;
+                    return;
                 }
             };
 
@@ -91,8 +92,8 @@ pub fn spawn_openai_stream(
 
                 let data = line["data:".len()..].trim();
                 if data == "[DONE]" {
-                    flush_openai_tool_calls(&tx, &mut tool_calls).await;
-                    let _ = tx.send(StreamChunk::Done).await;
+                    produced_output |= flush_openai_tool_calls(&tx, &mut tool_calls).await;
+                    finish_stream(&tx, provider_name, produced_output).await;
                     return;
                 }
 
@@ -123,6 +124,7 @@ pub fn spawn_openai_stream(
                         && !text.is_empty()
                     {
                         let _ = tx.send(StreamChunk::TextDelta(text.to_string())).await;
+                        produced_output = true;
                     }
 
                     if let Some(tool_deltas) = delta["tool_calls"].as_array() {
@@ -142,14 +144,14 @@ pub fn spawn_openai_stream(
                     }
 
                     if choice["finish_reason"].as_str() == Some("tool_calls") {
-                        flush_openai_tool_calls(&tx, &mut tool_calls).await;
+                        produced_output |= flush_openai_tool_calls(&tx, &mut tool_calls).await;
                     }
                 }
             }
         }
 
-        flush_openai_tool_calls(&tx, &mut tool_calls).await;
-        let _ = tx.send(StreamChunk::Done).await;
+        produced_output |= flush_openai_tool_calls(&tx, &mut tool_calls).await;
+        finish_stream(&tx, provider_name, produced_output).await;
     });
 
     rx
@@ -176,8 +178,9 @@ struct ToolCallAccumulator {
 async fn flush_openai_tool_calls(
     tx: &tokio::sync::mpsc::Sender<StreamChunk>,
     tool_calls: &mut BTreeMap<u64, ToolCallAccumulator>,
-) {
+) -> bool {
     let drained = std::mem::take(tool_calls);
+    let mut emitted = false;
     for (index, call) in drained {
         if call.name.is_empty() {
             continue;
@@ -195,7 +198,25 @@ async fn flush_openai_tool_calls(
                     input,
                 }))
                 .await;
+            emitted = true;
         }
+    }
+    emitted
+}
+
+async fn finish_stream(
+    tx: &tokio::sync::mpsc::Sender<StreamChunk>,
+    provider_name: &'static str,
+    produced_output: bool,
+) {
+    if produced_output {
+        let _ = tx.send(StreamChunk::Done).await;
+    } else {
+        let _ = tx
+            .send(StreamChunk::Error(format!(
+                "{provider_name} provider returned an empty completion"
+            )))
+            .await;
     }
 }
 

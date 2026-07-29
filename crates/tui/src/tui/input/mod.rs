@@ -7,6 +7,7 @@ mod branch_picker;
 mod chat;
 mod command_palette;
 mod connect_modal;
+mod custom_provider;
 mod question;
 mod slash_panel;
 
@@ -17,6 +18,11 @@ pub use branch_picker::{BranchPickerKeyResult, handle_branch_picker_key, render_
 pub use chat::handle_chat_key;
 pub use command_palette::{PaletteKeyResult, handle_command_palette_key, render_command_palette};
 pub use connect_modal::{ConnectModalKeyResult, handle_connect_modal_key};
+pub use custom_provider::{
+    CustomProviderProbeAction, CustomProviderSetupKeyResult, CustomProviderSetupSubmission,
+    ProviderActivationOutcome, custom_provider_probe_action, custom_provider_submission,
+    handle_custom_provider_setup_key, provider_activation_outcome,
+};
 pub use question::{QuestionModalKeyResult, handle_question_modal_key};
 pub use slash_panel::{handle_slash_panel_key, render_slash_panel};
 
@@ -29,6 +35,7 @@ pub enum InputContext {
     CommandPalette,
     ConnectModal,
     ApiKeyModal,
+    CustomProviderSetup,
     BranchPicker,
     QuestionModal,
     Approval,
@@ -48,6 +55,9 @@ pub fn resolve_input_context(state: &TuiSessionState, at_active: bool) -> InputC
         crate::tui::overlay::UiOverlayKind::CommandPalette => InputContext::CommandPalette,
         crate::tui::overlay::UiOverlayKind::ConnectModal => InputContext::ConnectModal,
         crate::tui::overlay::UiOverlayKind::ApiKeyModal => InputContext::ApiKeyModal,
+        crate::tui::overlay::UiOverlayKind::CustomProviderSetup => {
+            InputContext::CustomProviderSetup
+        }
         crate::tui::overlay::UiOverlayKind::BranchPicker => InputContext::BranchPicker,
         crate::tui::overlay::UiOverlayKind::QuestionModal => InputContext::QuestionModal,
         _ if slash_panel_visible(&state.input_buffer) => InputContext::SlashPanel,
@@ -114,5 +124,21 @@ mod tests {
             input: "{}".into(),
         });
         assert_eq!(resolve_input_context(&st, false), InputContext::Approval);
+    }
+
+    #[test]
+    fn resolve_custom_provider_setup_over_chat() {
+        let mut st = TuiSessionState::new(
+            "s".into(),
+            "m".into(),
+            "a".into(),
+            "default".into(),
+            PathBuf::from("/tmp"),
+        );
+        st.open_custom_provider_setup("model");
+        assert_eq!(
+            resolve_input_context(&st, false),
+            InputContext::CustomProviderSetup
+        );
     }
 }

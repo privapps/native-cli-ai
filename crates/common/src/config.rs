@@ -1,7 +1,13 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
+use std::fs::OpenOptions;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use toml_edit::{DocumentMut, Item, Table, value};
 
 /// Top-level configuration, merged from global, workspace, env, and CLI sources.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -93,6 +99,31 @@ impl NcaConfig {
         save_config_to_path(self, &path)
     }
 
+    /// Persist only the provider and onboarding fields represented by `patch`.
+    ///
+    /// This is the safe persistence seam for global onboarding and provider
+    /// setup. It deliberately does not serialize this merged runtime config,
+    /// because that config may contain values supplied by the environment or
+    /// workspace overlays.
+    pub fn save_provider_patch_global(
+        &self,
+        patch: &ProviderConfigPatch,
+    ) -> Result<(), ConfigError> {
+        let path = global_config_path_for_save().ok_or(ConfigError::NoHomeDir)?;
+        save_provider_patch_to_path(&path, patch)
+    }
+
+    /// Persist only the provider and onboarding fields represented by `patch`
+    /// in the workspace-local override file.
+    pub fn save_provider_patch_workspace(
+        &self,
+        workspace_root: &Path,
+        patch: &ProviderConfigPatch,
+    ) -> Result<(), ConfigError> {
+        let path = workspace_config_path(workspace_root);
+        save_provider_patch_to_path(&path, patch)
+    }
+
     /// Remove the workspace-local config file, if present.
     pub fn clear_workspace_file(workspace_root: &Path) -> Result<(), ConfigError> {
         let path = workspace_config_path(workspace_root);
@@ -167,20 +198,12 @@ impl NcaConfig {
             self.apply_model_override(&model);
         }
 
-        if let Ok(api_key) = env::var("MINIMAX_API_KEY") {
-            self.provider.minimax.api_key = Some(api_key);
-        }
-
         if let Ok(base_url) = env::var("MINIMAX_BASE_URL") {
             self.provider.minimax.base_url = base_url;
         }
 
         if let Ok(model) = env::var("MINIMAX_MODEL") {
             self.provider.minimax.model = model;
-        }
-
-        if let Ok(api_key) = env::var("OPENAI_API_KEY") {
-            self.provider.openai.api_key = Some(api_key);
         }
 
         if let Ok(base_url) = env::var("OPENAI_BASE_URL") {
@@ -191,20 +214,12 @@ impl NcaConfig {
             self.provider.openai.model = model;
         }
 
-        if let Ok(api_key) = env::var("ANTHROPIC_API_KEY") {
-            self.provider.anthropic.api_key = Some(api_key);
-        }
-
         if let Ok(base_url) = env::var("ANTHROPIC_BASE_URL") {
             self.provider.anthropic.base_url = base_url;
         }
 
         if let Ok(model) = env::var("ANTHROPIC_MODEL") {
             self.provider.anthropic.model = model;
-        }
-
-        if let Ok(api_key) = env::var("OPENROUTER_API_KEY") {
-            self.provider.openrouter.api_key = Some(api_key);
         }
 
         if let Ok(base_url) = env::var("OPENROUTER_BASE_URL") {
@@ -221,10 +236,6 @@ impl NcaConfig {
 
         if let Ok(app_name) = env::var("OPENROUTER_APP_NAME") {
             self.provider.openrouter.app_name = Some(app_name);
-        }
-
-        if let Ok(api_key) = env::var("CUSTOM_PROVIDER_API_KEY") {
-            self.provider.custom.api_key = Some(api_key);
         }
 
         if let Ok(base_url) = env::var("CUSTOM_PROVIDER_BASE_URL") {
@@ -412,7 +423,8 @@ pub fn global_config_path_for_save() -> Option<PathBuf> {
 /// Resolution order:
 /// 1. `$NCA_HOME` (explicit override)
 /// 2. `$XDG_DATA_HOME/ncacli` when `XDG_DATA_HOME` is set
-/// 3. `$HOME/.local/share/ncacli` (XDG Base Directory default)
+/// 3. The platform user home (`$HOME`, or `%USERPROFILE%` on Windows)
+///    under `.local/share/ncacli`
 pub fn nca_product_home() -> Option<PathBuf> {
     if let Ok(override_home) = env::var("NCA_HOME") {
         let trimmed = override_home.trim();
@@ -426,22 +438,39 @@ pub fn nca_product_home() -> Option<PathBuf> {
             return Some(PathBuf::from(trimmed).join("ncacli"));
         }
     }
-    env::var_os("HOME").map(|home| {
-        PathBuf::from(home)
-            .join(".local")
-            .join("share")
-            .join("ncacli")
-    })
+    user_home_dir().map(|home| home.join(".local").join("share").join("ncacli"))
+}
+
+/// Resolve the current user's home directory on Unix and Windows.
+pub fn user_home_dir() -> Option<PathBuf> {
+    if let Some(home) = env::var_os("HOME")
+        && !home.is_empty()
+    {
+        return Some(PathBuf::from(home));
+    }
+    #[cfg(windows)]
+    if let Some(home) = env::var_os("USERPROFILE")
+        && !home.is_empty()
+    {
+        return Some(PathBuf::from(home));
+    }
+    #[cfg(windows)]
+    if let (Some(drive), Some(path)) = (env::var_os("HOMEDRIVE"), env::var_os("HOMEPATH")) {
+        let mut home = PathBuf::from(drive);
+        home.push(path);
+        return Some(home);
+    }
+    None
 }
 
 /// Legacy `$HOME/.nca` directory (pre-unification).
 pub fn legacy_nca_home_dir() -> Option<PathBuf> {
-    env::var_os("HOME").map(|home| PathBuf::from(home).join(".nca"))
+    user_home_dir().map(|home| home.join(".nca"))
 }
 
 /// Accidental personal path from an early unification prototype (`~/.aris/ncacli`).
 fn legacy_aris_product_home() -> Option<PathBuf> {
-    env::var_os("HOME").map(|home| PathBuf::from(home).join(".aris").join("ncacli"))
+    user_home_dir().map(|home| home.join(".aris").join("ncacli"))
 }
 
 /// Prefer product home; fall back to legacy `~/.nca` when the product root does not exist yet.
@@ -805,6 +834,198 @@ fn save_config_to_path(config: &NcaConfig, path: &Path) -> Result<(), ConfigErro
     })
 }
 
+/// A targeted provider update for persisted configuration.
+///
+/// `api_key` is an explicit user-supplied value only. Callers must leave it
+/// as `None` when the effective key came from an environment variable; this
+/// keeps resolved secrets out of persisted TOML.
+#[derive(Debug, Clone)]
+pub struct ProviderConfigPatch {
+    pub provider: ProviderKind,
+    pub set_default_provider: bool,
+    pub api_key_env: Option<String>,
+    pub api_key: Option<String>,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub temperature: Option<f32>,
+    pub compatibility: Option<ProviderCompatibility>,
+    pub onboarding_completed: Option<bool>,
+}
+
+impl ProviderConfigPatch {
+    pub fn activate(provider: ProviderKind) -> Self {
+        Self {
+            provider,
+            set_default_provider: true,
+            api_key_env: None,
+            api_key: None,
+            base_url: None,
+            model: None,
+            temperature: None,
+            compatibility: None,
+            onboarding_completed: None,
+        }
+    }
+}
+
+fn save_provider_patch_to_path(
+    path: &Path,
+    patch: &ProviderConfigPatch,
+) -> Result<(), ConfigError> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(source) => {
+            return Err(ConfigError::ReadFile {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+
+    let mut document = raw
+        .parse::<DocumentMut>()
+        .map_err(|source| ConfigError::PatchToml {
+            path: path.to_path_buf(),
+            message: source.to_string(),
+        })?;
+    patch_document(&mut document, patch).map_err(|message| ConfigError::PatchToml {
+        path: path.to_path_buf(),
+        message,
+    })?;
+
+    atomic_write(path, document.to_string().as_bytes())
+}
+
+fn patch_document(document: &mut DocumentMut, patch: &ProviderConfigPatch) -> Result<(), String> {
+    let provider = table_for_patch(document.as_table_mut(), "provider")?;
+    if patch.set_default_provider {
+        provider["default"] = value(provider_kind_name(patch.provider));
+    }
+
+    let provider_name = provider_kind_name(patch.provider);
+    if patch.api_key_env.is_some()
+        || patch.api_key.is_some()
+        || patch.base_url.is_some()
+        || patch.model.is_some()
+        || patch.temperature.is_some()
+        || patch.compatibility.is_some()
+    {
+        let provider_fields = table_for_patch(provider, provider_name)?;
+        if let Some(api_key_env) = &patch.api_key_env {
+            provider_fields["api_key_env"] = value(api_key_env.clone());
+        }
+        if let Some(api_key) = &patch.api_key {
+            provider_fields["api_key"] = value(api_key.clone());
+        }
+        if let Some(base_url) = &patch.base_url {
+            provider_fields["base_url"] = value(base_url.clone());
+        }
+        if let Some(model) = &patch.model {
+            provider_fields["model"] = value(model.clone());
+        }
+        if let Some(temperature) = patch.temperature {
+            provider_fields["temperature"] = value(temperature as f64);
+        }
+        if let Some(compatibility) = patch.compatibility {
+            provider_fields["compatibility"] = value(match compatibility {
+                ProviderCompatibility::OpenAi => "openai",
+                ProviderCompatibility::Anthropic => "anthropic",
+            });
+        }
+    }
+
+    if let Some(onboarding_completed) = patch.onboarding_completed {
+        let ui = table_for_patch(document.as_table_mut(), "ui")?;
+        ui["onboarding_completed"] = value(onboarding_completed);
+    }
+
+    Ok(())
+}
+
+fn table_for_patch<'a>(table: &'a mut Table, name: &str) -> Result<&'a mut Table, String> {
+    let item = table.entry(name).or_insert(Item::Table(Table::new()));
+    item.as_table_mut()
+        .ok_or_else(|| format!("cannot patch [{name}]: existing value is not a table"))
+}
+
+fn provider_kind_name(provider: ProviderKind) -> &'static str {
+    match provider {
+        ProviderKind::MiniMax => "minimax",
+        ProviderKind::OpenRouter => "openrouter",
+        ProviderKind::Anthropic => "anthropic",
+        ProviderKind::OpenAi => "openai",
+        ProviderKind::Custom => "custom",
+    }
+}
+
+fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), ConfigError> {
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
+            action: "create config directory",
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.toml");
+    let temp_path = parent.join(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    #[cfg(unix)]
+    let file_mode = std::fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions().mode() & 0o777)
+        .unwrap_or(0o600);
+
+    let write_result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|source| ConfigError::Io {
+                action: "create temporary config file",
+                path: temp_path.clone(),
+                source,
+            })?;
+        #[cfg(unix)]
+        file.set_permissions(std::fs::Permissions::from_mode(file_mode))
+            .map_err(|source| ConfigError::Io {
+                action: "set temporary config permissions",
+                path: temp_path.clone(),
+                source,
+            })?;
+        file.write_all(contents).map_err(|source| ConfigError::Io {
+            action: "write temporary config file",
+            path: temp_path.clone(),
+            source,
+        })?;
+        file.sync_all().map_err(|source| ConfigError::Io {
+            action: "sync temporary config file",
+            path: temp_path.clone(),
+            source,
+        })?;
+        std::fs::rename(&temp_path, path).map_err(|source| ConfigError::Io {
+            action: "replace config file",
+            path: path.to_path_buf(),
+            source,
+        })
+    })();
+
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    write_result
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("unable to determine the home directory for global config")]
@@ -830,6 +1051,8 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("failed to patch config file {path}: {message}")]
+    PatchToml { path: PathBuf, message: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1241,6 +1464,49 @@ pub struct CustomProviderConfig {
     pub compatibility: ProviderCompatibility,
 }
 
+/// The credential action selected by a custom-provider setup flow.
+///
+/// `Preserve` is used when the secret field is left blank while editing. It
+/// keeps an existing inline override, or leaves the value environment-backed
+/// when there is no inline override. `Environment` explicitly removes an
+/// inline value without resolving or persisting the environment secret.
+#[derive(Clone, PartialEq, Eq)]
+pub enum CustomCredentialSource {
+    Preserve,
+    Environment,
+    Inline(String),
+}
+
+impl std::fmt::Debug for CustomCredentialSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Preserve => formatter.write_str("Preserve"),
+            Self::Environment => formatter.write_str("Environment"),
+            Self::Inline(_) => formatter.write_str("Inline(<redacted>)"),
+        }
+    }
+}
+
+/// Public input contract shared by custom-provider setup surfaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomProviderSetup {
+    pub compatibility: ProviderCompatibility,
+    pub base_url: String,
+    pub api_key_env: String,
+    pub credential: CustomCredentialSource,
+    pub model: String,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CustomProviderConfigError {
+    #[error("custom provider base URL must be an HTTP(S) origin or origin/v1")]
+    InvalidBaseUrl,
+    #[error("custom provider API-key environment variable name is not portable")]
+    InvalidApiKeyEnvironmentName,
+    #[error("custom provider API key is required")]
+    MissingApiKey,
+}
+
 impl Default for CustomProviderConfig {
     fn default() -> Self {
         Self {
@@ -1255,6 +1521,39 @@ impl Default for CustomProviderConfig {
 }
 
 impl CustomProviderConfig {
+    /// Build a validated custom-provider configuration from setup input.
+    pub fn from_setup(setup: CustomProviderSetup) -> Result<Self, CustomProviderConfigError> {
+        let mut config = Self::default();
+        config.apply_setup(setup)?;
+        Ok(config)
+    }
+
+    /// Apply validated setup input without ever resolving an environment
+    /// secret into the persisted configuration value.
+    pub fn apply_setup(
+        &mut self,
+        setup: CustomProviderSetup,
+    ) -> Result<(), CustomProviderConfigError> {
+        let mut updated = self.clone();
+        updated.base_url = normalize_custom_provider_base_url(&setup.base_url)?;
+        validate_custom_api_key_env_name(&setup.api_key_env)?;
+        updated.compatibility = setup.compatibility;
+        updated.api_key_env = setup.api_key_env;
+        updated.model = setup.model;
+        match setup.credential {
+            CustomCredentialSource::Preserve => {}
+            CustomCredentialSource::Environment => updated.api_key = None,
+            CustomCredentialSource::Inline(value) => {
+                if value.trim().is_empty() {
+                    return Err(CustomProviderConfigError::MissingApiKey);
+                }
+                updated.api_key = Some(value);
+            }
+        }
+        *self = updated;
+        Ok(())
+    }
+
     pub fn resolve_api_key(&self) -> Option<String> {
         resolve_api_key_value(&self.api_key, &self.api_key_env)
     }
@@ -1279,6 +1578,57 @@ impl CustomProviderConfig {
             self.compatibility = compatibility;
         }
     }
+}
+
+/// Normalize the endpoint accepted by both custom compatibility adapters.
+pub fn normalize_custom_provider_base_url(raw: &str) -> Result<String, CustomProviderConfigError> {
+    let parsed =
+        url::Url::parse(raw.trim()).map_err(|_| CustomProviderConfigError::InvalidBaseUrl)?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(CustomProviderConfigError::InvalidBaseUrl);
+    }
+
+    let path = parsed.path().trim_end_matches('/');
+    if !path.is_empty() && path != "/v1" {
+        return Err(CustomProviderConfigError::InvalidBaseUrl);
+    }
+
+    let mut origin = parsed;
+    origin.set_path("");
+    origin.set_query(None);
+    origin.set_fragment(None);
+    Ok(origin.as_str().trim_end_matches('/').to_string())
+}
+
+/// Return the host portion of a validated custom-provider endpoint for
+/// non-secret status displays.
+pub fn custom_provider_host(base_url: &str) -> Option<String> {
+    let normalized = normalize_custom_provider_base_url(base_url).ok()?;
+    match url::Url::parse(&normalized).ok()?.host()? {
+        url::Host::Domain(host) => (!host.is_empty()).then(|| host.to_string()),
+        url::Host::Ipv4(host) => Some(host.to_string()),
+        url::Host::Ipv6(host) => Some(host.to_string()),
+    }
+}
+
+/// Validate a shell-portable environment variable name.
+pub fn validate_custom_api_key_env_name(name: &str) -> Result<(), CustomProviderConfigError> {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return Err(CustomProviderConfigError::InvalidApiKeyEnvironmentName);
+    };
+    if !(first == '_' || first.is_ascii_alphabetic())
+        || !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    {
+        return Err(CustomProviderConfigError::InvalidApiKeyEnvironmentName);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1960,6 +2310,151 @@ mod tests {
     use super::*;
 
     #[test]
+    fn custom_setup_normalizes_origin_and_v1_urls() {
+        let setup = CustomProviderSetup {
+            compatibility: ProviderCompatibility::OpenAi,
+            base_url: "https://gateway.example/v1/".into(),
+            api_key_env: "GATEWAY_API_KEY".into(),
+            credential: CustomCredentialSource::Environment,
+            model: "gateway-model".into(),
+        };
+
+        let config = CustomProviderConfig::from_setup(setup).expect("valid setup");
+
+        assert_eq!(config.base_url, "https://gateway.example");
+        assert_eq!(config.api_key_env, "GATEWAY_API_KEY");
+        assert_eq!(config.api_key, None);
+    }
+
+    #[test]
+    fn custom_provider_host_uses_the_parsed_url_host() {
+        assert_eq!(
+            custom_provider_host("https://gateway.example/v1"),
+            Some("gateway.example".into())
+        );
+        assert_eq!(
+            custom_provider_host("http://[::1]:8080"),
+            Some("::1".into())
+        );
+        assert_eq!(custom_provider_host("not a url"), None);
+    }
+
+    #[test]
+    fn custom_setup_rejects_non_portable_environment_names() {
+        let setup = CustomProviderSetup {
+            api_key_env: "gateway.api-key".into(),
+            ..custom_setup_for_testing()
+        };
+
+        let error = CustomProviderConfig::from_setup(setup).expect_err("invalid env name");
+
+        assert!(matches!(
+            error,
+            CustomProviderConfigError::InvalidApiKeyEnvironmentName
+        ));
+    }
+
+    #[test]
+    fn custom_setup_rejects_credentials_queries_fragments_and_request_paths() {
+        for base_url in [
+            "https://user:secret@gateway.example",
+            "https://gateway.example/v1/models?x=1",
+            "https://gateway.example/v1#fragment",
+            "https://gateway.example/v1/chat/completions",
+            "https://gateway.example/messages",
+            "not a url",
+        ] {
+            let setup = CustomProviderSetup {
+                base_url: base_url.into(),
+                ..custom_setup_for_testing()
+            };
+
+            assert!(
+                matches!(
+                    CustomProviderConfig::from_setup(setup),
+                    Err(CustomProviderConfigError::InvalidBaseUrl)
+                ),
+                "expected {base_url:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_setup_preserves_inline_key_when_secret_is_omitted() {
+        let mut existing = CustomProviderConfig::default();
+        existing.api_key = Some("existing-secret".into());
+
+        existing
+            .apply_setup(CustomProviderSetup {
+                credential: CustomCredentialSource::Preserve,
+                ..custom_setup_for_testing()
+            })
+            .expect("valid setup");
+
+        assert_eq!(existing.api_key.as_deref(), Some("existing-secret"));
+    }
+
+    #[test]
+    fn custom_setup_never_materializes_environment_secret() {
+        let _guard = EnvGuard::set(&[("NCA_CUSTOM_TEST_KEY", Some("environment-secret"))]);
+        let setup = CustomProviderSetup {
+            api_key_env: "NCA_CUSTOM_TEST_KEY".into(),
+            credential: CustomCredentialSource::Environment,
+            ..custom_setup_for_testing()
+        };
+
+        let config = CustomProviderConfig::from_setup(setup).expect("valid setup");
+
+        assert_eq!(config.api_key, None);
+        assert_eq!(
+            config.resolve_api_key().as_deref(),
+            Some("environment-secret")
+        );
+    }
+
+    #[test]
+    fn custom_setup_persists_explicit_inline_key_as_override() {
+        let config = CustomProviderConfig::from_setup(CustomProviderSetup {
+            credential: CustomCredentialSource::Inline("pasted-secret".into()),
+            ..custom_setup_for_testing()
+        })
+        .expect("valid setup");
+
+        assert_eq!(config.api_key.as_deref(), Some("pasted-secret"));
+    }
+
+    #[test]
+    fn custom_setup_rejects_missing_explicit_inline_key() {
+        let mut existing = CustomProviderConfig::default();
+        existing.base_url = "https://old.example".into();
+        existing.model = "old-model".into();
+
+        let setup = CustomProviderSetup {
+            base_url: "https://new.example/v1".into(),
+            model: "new-model".into(),
+            credential: CustomCredentialSource::Inline("  ".into()),
+            ..custom_setup_for_testing()
+        };
+
+        assert!(matches!(
+            existing.apply_setup(setup),
+            Err(CustomProviderConfigError::MissingApiKey)
+        ));
+        assert_eq!(existing.base_url, "https://old.example");
+        assert_eq!(existing.model, "old-model");
+    }
+
+    fn custom_setup_for_testing() -> CustomProviderSetup {
+        CustomProviderSetup {
+            compatibility: ProviderCompatibility::OpenAi,
+            base_url: "https://gateway.example".into(),
+            api_key_env: "GATEWAY_API_KEY".into(),
+            credential: CustomCredentialSource::Environment,
+            model: "gateway-model".into(),
+        }
+    }
+
+    #[test]
     fn session_accepts_max_turn_per_run_typo_alias() {
         let raw = r#"
             [session]
@@ -2005,6 +2500,10 @@ mod tests {
         config.apply_env();
 
         assert_eq!(config.provider.default, ProviderKind::OpenRouter);
+        assert!(config.provider.openai.api_key.is_none());
+        assert!(config.provider.anthropic.api_key.is_none());
+        assert!(config.provider.openrouter.api_key.is_none());
+        assert!(config.provider.custom.api_key.is_none());
         assert_eq!(
             config.provider.openai.resolve_api_key().as_deref(),
             Some("openai-key")
@@ -2045,6 +2544,36 @@ mod tests {
             ProviderCompatibility::Anthropic
         );
         assert_eq!(config.model.default_model, "anthropic/claude-3.7-sonnet");
+    }
+
+    #[test]
+    fn environment_credentials_remain_dynamic_and_inline_keys_keep_precedence() {
+        let _guard = EnvGuard::set(&[("CUSTOM_PROVIDER_API_KEY", Some("environment-secret"))]);
+        let mut config = NcaConfig::default();
+        config.provider.custom.api_key = Some("inline-secret".into());
+        config.apply_env();
+
+        assert_eq!(
+            config.provider.custom.resolve_api_key().as_deref(),
+            Some("inline-secret")
+        );
+        assert_eq!(
+            config.provider.custom.api_key.as_deref(),
+            Some("inline-secret")
+        );
+    }
+
+    #[test]
+    fn full_workspace_save_does_not_materialize_environment_credentials() {
+        let _guard = EnvGuard::set(&[("CUSTOM_PROVIDER_API_KEY", Some("environment-secret"))]);
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut config = NcaConfig::default();
+        config.apply_env();
+        config.save_workspace_file(workspace.path()).expect("save");
+
+        let raw = std::fs::read_to_string(workspace.path().join(".nca/config.local.toml"))
+            .expect("saved config");
+        assert!(!raw.contains("environment-secret"));
     }
 
     struct EnvGuard {
@@ -2181,6 +2710,212 @@ mod tests {
         let loaded = NcaConfig::load_for_workspace(dir.path()).expect("load");
         assert_eq!(loaded.ui.editor.as_deref(), Some("vim"));
         assert_eq!(loaded.effective_editor_command(), "vim");
+    }
+
+    #[test]
+    fn workspace_provider_patch_preserves_unrelated_toml_and_redacts_environment_keys() {
+        let _guard = EnvGuard::set(&[("CUSTOM_PROVIDER_API_KEY", Some("resolved-secret"))]);
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let config_dir = workspace.path().join(".nca");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        let path = config_dir.join("config.local.toml");
+        let original = r#"# keep this comment
+[provider]
+default = "openai"
+
+[provider.openai]
+api_key = "unrelated-openai-secret"
+custom_unknown = "keep-me"
+
+[custom-section]
+answer = 42
+"#;
+        std::fs::write(&path, original).expect("write config");
+
+        let mut config = NcaConfig::default();
+        config.provider.custom.api_key = None;
+        config.provider.custom.api_key_env = "CUSTOM_PROVIDER_API_KEY".into();
+        config.apply_env();
+        let patch = ProviderConfigPatch {
+            provider: ProviderKind::Custom,
+            set_default_provider: true,
+            api_key_env: None,
+            api_key: None,
+            base_url: Some("https://custom.example/v1".into()),
+            model: Some("custom-model".into()),
+            temperature: None,
+            compatibility: Some(ProviderCompatibility::OpenAi),
+            onboarding_completed: None,
+        };
+
+        config
+            .save_provider_patch_workspace(workspace.path(), &patch)
+            .expect("patch workspace config");
+
+        let updated = std::fs::read_to_string(&path).expect("read config");
+        assert!(updated.contains("# keep this comment"));
+        assert!(updated.contains("custom_unknown = \"keep-me\""));
+        assert!(updated.contains("[custom-section]"));
+        assert!(updated.contains("answer = 42"));
+        assert!(updated.contains("api_key = \"unrelated-openai-secret\""));
+        assert!(updated.contains("default = \"custom\""));
+        assert!(updated.contains("base_url = \"https://custom.example/v1\""));
+        assert!(updated.contains("model = \"custom-model\""));
+        assert!(!updated.contains("resolved-secret"));
+    }
+
+    #[test]
+    fn global_provider_patch_writes_only_selected_fields() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _guard = EnvGuard::set(&[
+            ("NCA_HOME", home.path().to_str()),
+            ("CUSTOM_PROVIDER_API_KEY", Some("resolved-global-secret")),
+        ]);
+        let config = NcaConfig::default();
+        let patch = ProviderConfigPatch {
+            provider: ProviderKind::Custom,
+            set_default_provider: true,
+            api_key_env: Some("CUSTOM_PROVIDER_API_KEY".into()),
+            api_key: None,
+            base_url: Some("https://global-custom.example".into()),
+            model: Some("global-model".into()),
+            temperature: None,
+            compatibility: Some(ProviderCompatibility::Anthropic),
+            onboarding_completed: Some(true),
+        };
+
+        config
+            .save_provider_patch_global(&patch)
+            .expect("save global patch");
+
+        let path = home.path().join("config.toml");
+        let raw = std::fs::read_to_string(path).expect("read global config");
+        assert!(raw.contains("default = \"custom\""));
+        assert!(raw.contains("api_key_env = \"CUSTOM_PROVIDER_API_KEY\""));
+        assert!(raw.contains("base_url = \"https://global-custom.example\""));
+        assert!(raw.contains("compatibility = \"anthropic\""));
+        assert!(raw.contains("onboarding_completed = true"));
+        assert!(!raw.contains("resolved-global-secret"));
+        assert!(!raw.contains("[model]"));
+        assert!(!raw.contains("[provider.openai]"));
+    }
+
+    #[test]
+    fn provider_patch_creates_minimal_workspace_config() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let config = NcaConfig::default();
+        let patch = ProviderConfigPatch {
+            provider: ProviderKind::OpenAi,
+            set_default_provider: true,
+            api_key_env: None,
+            api_key: Some("explicit-key".into()),
+            base_url: None,
+            model: None,
+            temperature: None,
+            compatibility: None,
+            onboarding_completed: Some(true),
+        };
+
+        config
+            .save_provider_patch_workspace(workspace.path(), &patch)
+            .expect("create workspace config");
+
+        let raw = std::fs::read_to_string(workspace_config_path(workspace.path()))
+            .expect("read workspace config");
+        assert!(raw.contains("[provider]"));
+        assert!(raw.contains("default = \"openai\""));
+        assert!(raw.contains("[provider.openai]"));
+        assert!(raw.contains("api_key = \"explicit-key\""));
+        assert!(raw.contains("[ui]"));
+        assert!(raw.contains("onboarding_completed = true"));
+        assert!(!raw.contains("[provider.minimax]"));
+        assert!(!raw.contains("[model]"));
+    }
+
+    #[test]
+    fn activating_provider_does_not_copy_or_create_provider_credentials() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let path = workspace_config_path(workspace.path());
+        std::fs::create_dir_all(path.parent().expect("config parent")).expect("config dir");
+        std::fs::write(&path, "[provider.openai]\napi_key = \"keep-existing\"\n")
+            .expect("write config");
+
+        NcaConfig::default()
+            .save_provider_patch_workspace(
+                workspace.path(),
+                &ProviderConfigPatch::activate(ProviderKind::Custom),
+            )
+            .expect("activate provider");
+
+        let raw = std::fs::read_to_string(path).expect("read config");
+        assert!(raw.contains("default = \"custom\""));
+        assert!(raw.contains("[provider.openai]"));
+        assert!(raw.contains("api_key = \"keep-existing\""));
+        assert!(!raw.contains("[provider.custom]"));
+    }
+
+    #[test]
+    fn malformed_provider_patch_leaves_workspace_config_untouched() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let config_dir = workspace.path().join(".nca");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        let path = config_dir.join("config.local.toml");
+        let original = "[provider\ndefault = \"openai\"\n";
+        std::fs::write(&path, original).expect("write malformed config");
+
+        let patch = ProviderConfigPatch {
+            provider: ProviderKind::Custom,
+            set_default_provider: true,
+            api_key_env: None,
+            api_key: Some("must-not-be-written".into()),
+            base_url: Some("https://custom.example".into()),
+            model: None,
+            temperature: None,
+            compatibility: None,
+            onboarding_completed: None,
+        };
+
+        let result = NcaConfig::default().save_provider_patch_workspace(workspace.path(), &patch);
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read config"),
+            original
+        );
+    }
+
+    #[test]
+    fn atomic_write_failure_leaves_existing_target_untouched() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let target = workspace.path().join("config.toml");
+        std::fs::create_dir(&target).expect("create target directory");
+
+        let result = atomic_write(&target, b"default = \"custom\"\n");
+
+        assert!(result.is_err());
+        assert!(target.is_dir());
+        assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn unsafe_provider_shape_leaves_workspace_config_untouched() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let config_dir = workspace.path().join(".nca");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        let path = config_dir.join("config.local.toml");
+        let original = "provider = \"not-a-table\"\n";
+        std::fs::write(&path, original).expect("write unsafe config");
+
+        let result = NcaConfig::default().save_provider_patch_workspace(
+            workspace.path(),
+            &ProviderConfigPatch::activate(ProviderKind::Custom),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read config"),
+            original
+        );
     }
 
     #[test]

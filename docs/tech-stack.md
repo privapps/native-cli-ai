@@ -34,7 +34,7 @@ This document records every dependency choice, the rationale behind it, and the 
 |-------|---------|------|
 | `ratatui` | 0.30.x | Widget-based terminal UI framework |
 | `crossterm` | 0.29.x | Cross-platform terminal backend (events, raw mode, colors) |
-| `reedline` | 0.44.x | Line editor with history, completions, and hints |
+| `reedline` | 0.38.0 | Line editor with history, completions, and hints |
 | `arboard` | 3.x | Clipboard access for pasting bitmap images into the TUI composer |
 | `image` | 0.25.x | Encode clipboard RGBA payloads to PNG for session attachments |
 
@@ -74,13 +74,9 @@ This document records every dependency choice, the rationale behind it, and the 
 
 ## MCP (Model Context Protocol)
 
-| Crate | Version | Role |
-|-------|---------|------|
-| `mcpr` | 0.2.x | MCP client and server, stdio/SSE/WebSocket transports |
-
-**Why mcpr**: Only serious Rust MCP implementation with complete schema definitions and multiple transports. Aligns with Anthropic's protocol spec.
-
-**Deferred**: MCP is Phase 3. The crate is included in the workspace but not wired into the agent loop until after MVP.
+MCP tool discovery and invocation currently use a small Rust-native stdio client in
+`crates/core/src/tools/mcp.rs`. There is no external MCP crate dependency; broader
+transport support remains deferred.
 
 ---
 
@@ -127,7 +123,7 @@ This document records every dependency choice, the rationale behind it, and the 
 |-------|---------|------|
 | `serde` | 1.x | Serialization framework |
 | `serde_json` | 1.x | JSON for API payloads, session files, IPC messages |
-| `toml` | 0.9.x | TOML for config files |
+| `toml` | 1.1.x | TOML for config files |
 
 ---
 
@@ -135,15 +131,18 @@ This document records every dependency choice, the rationale behind it, and the 
 
 Session state and event streams are stored as JSON and JSONL under `<workspace>/.nca/sessions/` (see `runtime::session_store`). Global user config lives under `~/.nca/config.toml`. No separate SQLite control-plane database is used in this workspace.
 
+| Crate | Version | Role |
+|-------|---------|------|
+| `toml_edit` | 0.25.x | Syntax-preserving provider-config patches that retain comments and unknown keys |
+| `url` | 2.x | Strict HTTP(S) endpoint parsing and custom-provider URL normalization |
+
+**Why these crates**: Provider setup must update only owned TOML fields while preserving surrounding user-authored content, and URL validation should use a standards-compliant parser rather than string heuristics.
+
+**Rejected**: Serializing the merged config (would leak environment-derived values and discard comments), and ad-hoc URL parsing (would accept malformed endpoint forms).
+
 ---
 
 ## Filesystem and Search
-
-| Crate | Version | Role |
-|-------|---------|------|
-| `ignore` | 0.4.x | Gitignore-aware directory walking |
-| `globset` | 0.4.x | Glob pattern matching for permission rules |
-| `walkdir` | 2.x | Recursive directory traversal |
 
 **Code search**: The current implementation shells out to `rg` (ripgrep) and consumes `--json` output so the tool layer can return structured search matches. This keeps search fast and local without committing to a persistent index yet.
 
@@ -206,11 +205,11 @@ Session state and event streams are stored as JSON and JSONL under `<workspace>/
 ## Summary: Dependency Tree by Crate
 
 ```
-crates/common   -> serde, serde_json, toml, thiserror, tracing
+crates/common   -> serde, serde_json, toml, toml_edit, url, thiserror, tracing
 crates/core     -> common, genai, anthropic-async, async-openai, reqwest,
-                   serde_json, thiserror, tracing, tokio, similar, globset
+                   serde_json, thiserror, tracing, tokio, regex
 crates/cli      -> common, core, runtime, clap, ratatui, crossterm, reedline,
                    syntect, pulldown-cmark, colored, anyhow, tracing, tokio
 crates/runtime  -> common, core, portable-pty, tokio, serde_json, tracing,
-                   thiserror, ignore, walkdir
+                   thiserror
 ```

@@ -942,6 +942,11 @@ async fn spawn_run(
     }
 
     let child = command.stdout(stdout).stderr(stderr).spawn()?;
+    let socket_path = if json {
+        Some(wait_for_spawned_socket_path(&sessions_dir, &session_id, child.id()).await?)
+    } else {
+        None
+    };
 
     if json {
         print_json(
@@ -951,7 +956,7 @@ async fn spawn_run(
                 status_path: sessions_dir.join(format!("{session_id}.json")),
                 event_log_path: sessions_dir.join(format!("{session_id}.events.jsonl")),
                 spawn_log_path: spawn_log,
-                socket_path: nca_runtime::ipc::IpcServer::new(&session_id).socket_path(),
+                socket_path: socket_path.expect("JSON spawn should publish an IPC endpoint"),
                 permission_mode: permission_mode.as_arg().to_string(),
                 safe_mode: safe,
             },
@@ -961,6 +966,34 @@ async fn spawn_run(
         println!("{session_id}");
     }
     Ok(())
+}
+
+async fn wait_for_spawned_socket_path(
+    sessions_dir: &Path,
+    session_id: &str,
+    child_pid: u32,
+) -> anyhow::Result<PathBuf> {
+    const PUBLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
+    let store = nca_runtime::session_store::SessionStore::new(sessions_dir);
+    let deadline = tokio::time::Instant::now() + PUBLISH_TIMEOUT;
+    loop {
+        if let Ok(session) = store.load(session_id).await
+            && session.meta.pid == Some(child_pid)
+            && let Some(socket_path) = session.meta.socket_path
+        {
+            return Ok(socket_path);
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "spawned session {session_id} did not publish its IPC endpoint within {} seconds",
+                PUBLISH_TIMEOUT.as_secs()
+            );
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 async fn list_sessions(
@@ -1216,10 +1249,7 @@ async fn cancel_session(
     }
 
     if let Some(pid) = session.meta.pid {
-        let _ = tokio::process::Command::new("kill")
-            .arg(pid.to_string())
-            .output()
-            .await;
+        terminate_process(pid).await?;
     }
 
     session.meta.status = SessionStatus::Cancelled;
@@ -1239,6 +1269,62 @@ async fn cancel_session(
         println!("Cancelled {session_id}");
     }
     Ok(())
+}
+
+/// Terminate a detached session using the native process-control utility.
+///
+/// The IPC shutdown above is the graceful path. This fallback is needed when
+/// the runtime is unresponsive, and must not invoke a Unix-only command on
+/// Windows.
+async fn terminate_process(pid: u32) -> anyhow::Result<()> {
+    if pid == 0 {
+        anyhow::bail!("invalid process id 0");
+    }
+    #[cfg(unix)]
+    if pid > i32::MAX as u32 {
+        anyhow::bail!("invalid process id {pid}");
+    }
+
+    #[cfg(unix)]
+    let output = tokio::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .output()
+        .await?;
+
+    #[cfg(windows)]
+    let output = tokio::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .output()
+        .await?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let detail = command_output_detail(&output.stdout, &output.stderr);
+    if process_was_already_gone(&detail) {
+        return Ok(());
+    }
+    if detail.is_empty() {
+        anyhow::bail!(
+            "failed to terminate process {pid} (exit status {})",
+            output.status
+        );
+    }
+    anyhow::bail!("failed to terminate process {pid}: {detail}");
+}
+
+fn command_output_detail(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(stdout);
+    let stderr = String::from_utf8_lossy(stderr);
+    format!("{stderr} {stdout}").trim().to_string()
+}
+
+fn process_was_already_gone(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("no such process")
+        || detail.contains("not found")
+        || detail.contains("no running instance of the task")
 }
 
 async fn print_log_file(
@@ -1908,5 +1994,41 @@ mod tests {
             }
             _ => panic!("expected run subcommand"),
         }
+    }
+
+    #[tokio::test]
+    async fn terminates_a_child_with_native_process_control() {
+        #[cfg(unix)]
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep should be available on Unix");
+
+        #[cfg(windows)]
+        let mut child = tokio::process::Command::new("cmd.exe")
+            .args(["/D", "/C", "ping 127.0.0.1 -n 31 >NUL"])
+            .spawn()
+            .expect("cmd.exe should be available on Windows");
+
+        terminate_process(child.id().expect("child should have a pid"))
+            .await
+            .expect("native process termination should succeed");
+        let status = child.wait().await.expect("child should be reaped");
+        assert!(!status.success());
+    }
+
+    #[tokio::test]
+    async fn terminate_process_reports_invalid_pid() {
+        let error = terminate_process(0)
+            .await
+            .expect_err("zero is not a valid process id");
+        assert!(error.to_string().contains("invalid process id 0"));
+    }
+
+    #[test]
+    fn recognizes_windows_taskkill_already_exited_wording() {
+        assert!(process_was_already_gone(
+            "ERROR: The process with PID 1234 could not be terminated.\nReason: There is no running instance of the task."
+        ));
     }
 }

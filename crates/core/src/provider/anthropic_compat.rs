@@ -59,17 +59,18 @@ pub fn spawn_anthropic_stream(
         let mut tool_name = String::new();
         let mut tool_input = String::new();
         let mut input_tokens: u64 = 0;
+        let mut produced_output = false;
 
         while let Some(item) = byte_stream.next().await {
             let chunk = match item {
                 Ok(chunk) => chunk,
                 Err(err) => {
                     let _ = tx
-                        .send(StreamChunk::TextDelta(format!(
-                            "\n[{provider_name} stream error: {err}]"
+                        .send(StreamChunk::Error(format!(
+                            "{provider_name} stream error: {err}"
                         )))
                         .await;
-                    break;
+                    return;
                 }
             };
 
@@ -125,6 +126,7 @@ pub fn spawn_anthropic_stream(
                                     && !text.is_empty()
                                 {
                                     let _ = tx.send(StreamChunk::TextDelta(text.to_string())).await;
+                                    produced_output = true;
                                 }
                             }
                             "input_json_delta" => {
@@ -136,7 +138,7 @@ pub fn spawn_anthropic_stream(
                         }
                     }
                     "content_block_stop" => {
-                        flush_anthropic_tool_call(
+                        produced_output |= flush_anthropic_tool_call(
                             &tx,
                             &mut tool_id,
                             &mut tool_name,
@@ -161,8 +163,17 @@ pub fn spawn_anthropic_stream(
             }
         }
 
-        flush_anthropic_tool_call(&tx, &mut tool_id, &mut tool_name, &mut tool_input).await;
-        let _ = tx.send(StreamChunk::Done).await;
+        produced_output |=
+            flush_anthropic_tool_call(&tx, &mut tool_id, &mut tool_name, &mut tool_input).await;
+        if produced_output {
+            let _ = tx.send(StreamChunk::Done).await;
+        } else {
+            let _ = tx
+                .send(StreamChunk::Error(format!(
+                    "{provider_name} provider returned an empty completion"
+                )))
+                .await;
+        }
     });
 
     rx
@@ -184,9 +195,9 @@ async fn flush_anthropic_tool_call(
     tool_id: &mut String,
     tool_name: &mut String,
     tool_input: &mut String,
-) {
+) -> bool {
     if tool_name.is_empty() {
-        return;
+        return false;
     }
 
     if let Ok(input) = serde_json::from_str(tool_input) {
@@ -197,11 +208,16 @@ async fn flush_anthropic_tool_call(
                 input,
             }))
             .await;
+        tool_id.clear();
+        tool_name.clear();
+        tool_input.clear();
+        return true;
     }
 
     tool_id.clear();
     tool_name.clear();
     tool_input.clear();
+    false
 }
 
 fn tool_content_string(content: &MessageContent) -> String {

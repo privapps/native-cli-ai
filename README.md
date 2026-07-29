@@ -195,7 +195,7 @@ Slash commands, the Ctrl+P command palette, autocomplete, and `/help` all come f
 | `/copy` | Copy the latest assistant response (TUI; also `Ctrl+Shift+C`). |
 | `/todos` | Show the session todo list. |
 | `/model` | Open the model picker (`/models` is an alias). |
-| `/connect` | Connect / switch provider, API key, or custom endpoint (`/provider`, `/apikey`, `/custom` are aliases). |
+| `/connect` | Connect / switch provider, API key, or custom endpoint; use `/provider`, `/apikey`, or `/custom` for related setup commands. |
 | `/status` | Session status and health (`/stats`, `/cost`, `/doctor` are aliases). |
 | `/config` | Config and editor settings (`/settings`, `/set-editor` are aliases). |
 | `/permissions` | Permission mode picker (`/permission-bypass` is an alias). |
@@ -259,8 +259,9 @@ See [Orchestration Contract](docs/orchestration.md) for the subprocess-facing su
 | `~/.local/share/ncacli/skills/` | User-level skill directory (legacy `~/.nca/skills/` still discovered). |
 | `~/.claude/skills/` | Imported Claude-style skill directory, if present. |
 | `<repo>/.nca/worktrees/<session-id>` | Worktree path for isolated child sessions. |
-| `$XDG_RUNTIME_DIR/nca/<session_id>.sock` | IPC socket path when `XDG_RUNTIME_DIR` is set. |
-| `/tmp/nca/<session_id>.sock` | IPC socket fallback when `XDG_RUNTIME_DIR` is not set. |
+| `$XDG_RUNTIME_DIR/nca/<session_id>.sock` | Unix IPC socket when `XDG_RUNTIME_DIR` is set. |
+| `/tmp/nca/<session_id>.sock` | Unix IPC socket fallback when `XDG_RUNTIME_DIR` is not set. |
+| `127.0.0.1:<ephemeral-port>` | Windows loopback TCP IPC endpoint, persisted in session metadata. |
 | `~/.local/share/ncacli/workspaces/<id>/cli-index.json` | Cached CLI index for agents and tooling. |
 | `.ncarc` | Project instructions file committed with the repo. |
 | `.nca/instructions.md` | Local instructions file. |
@@ -312,7 +313,7 @@ Typical environment variables:
 
 ### Custom Endpoints
 
-Use `/connect` in the TUI (or the command palette) to pick a provider, enter an API key, and optionally add a custom OpenAI-compatible or Anthropic-compatible endpoint. Legacy aliases `/provider`, `/apikey`, and `/custom` still resolve to the same flow.
+Use `/connect` in the TUI (or the command palette) and choose **Custom** to configure the single custom-provider slot. In an existing session, `/provider` → **Add custom provider…** opens the add/edit wizard, while `/provider custom` activates the configured slot. The `/custom` command remains available for scripts and existing configurations.
 
 ```
 /connect
@@ -367,7 +368,9 @@ The shipped app is still a **single binary** (`nca`). The TUI crate owns interac
 - Sessions are persisted as JSON snapshots plus JSONL event logs.
 - The runtime uses a `Supervisor` to own lifecycle, IPC, approvals, questions, event fanout, and persistence.
 - Child sessions can inherit parent context, record lineage in session metadata, and run inside separate git worktrees.
-- IPC uses newline-delimited JSON over Unix sockets so `attach`, approvals, status, and other controls share one runtime transport.
+- IPC uses newline-delimited JSON over Unix sockets or Windows loopback TCP so `attach`, approvals,
+  status, and other controls share one runtime transport. Clients treat the persisted endpoint as
+  opaque data and never derive a Windows port from the session ID.
 - `ContextManager` tracks token usage and auto-summarizes long conversations.
 
 In practice, that means you can start small, branch out when a task gets bigger, and still keep a clean trail of what happened.

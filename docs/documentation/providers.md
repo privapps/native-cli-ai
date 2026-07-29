@@ -6,7 +6,7 @@ nca supports five LLM provider backends. You can switch between them at any time
 
 | Provider | Default Model | API Style | Description |
 |----------|---------------|-----------|-------------|
-| **MiniMax** | `MiniMax-M2.7` | Anthropic-compatible | Primary provider. Uses the MiniMax Anthropic-compatible endpoint. |
+| **MiniMax** | `MiniMax-M2.5` | Anthropic-compatible | Primary provider. Uses the MiniMax Anthropic-compatible endpoint. |
 | **Anthropic** | `claude-3-7-sonnet-latest` | Native Anthropic | Direct Anthropic API for Claude models. |
 | **OpenAI** | `gpt-4o-mini` | OpenAI Chat | Standard OpenAI chat completions API. |
 | **OpenRouter** | `openai/gpt-4o-mini` | OpenAI-compatible | Aggregator providing access to 100+ models from multiple providers. |
@@ -32,7 +32,7 @@ default = "minimax"
 [provider.minimax]
 api_key = "your-key"
 base_url = "https://api.minimax.io/anthropic"
-model = "MiniMax-M2.7"
+model = "MiniMax-M2.5"
 temperature = 0.7
 ```
 
@@ -131,7 +131,7 @@ meta-llama/llama-3.1-70b-instruct
 
 ## Custom Provider
 
-Use the custom provider when you want `nca` to talk to a non-built-in endpoint such as a self-hosted gateway or a third-party OpenAI-compatible / Anthropic-compatible service.
+Use the single `Custom` provider slot when you want `nca` to talk to a non-built-in endpoint such as a self-hosted gateway or a third-party OpenAI-compatible / Anthropic-compatible service. The slot stores one endpoint, one compatibility choice, one API-key environment-variable name, and one model ID.
 
 ### Setup
 
@@ -147,7 +147,11 @@ model = "my-model"
 temperature = 0.7
 ```
 
-Environment variables:
+`base_url` must be an HTTP(S) origin, optionally written with a `/v1` suffix. `nca` normalizes either form to the origin and appends the protocol-specific request path. Credentials, query strings, fragments, and final request paths such as `/v1/models` are rejected.
+
+The default API-key environment-variable name is `CUSTOM_PROVIDER_API_KEY`, but it is editable in the TUI wizard and in TOML. Environment-variable names must be portable shell names such as `GATEWAY_API_KEY`.
+
+Environment overrides:
 
 ```bash
 export CUSTOM_PROVIDER_API_KEY="your-key"
@@ -156,9 +160,26 @@ export CUSTOM_PROVIDER_MODEL="my-model"
 export CUSTOM_PROVIDER_COMPATIBILITY="openai"
 ```
 
+API-key resolution uses an explicit `api_key` in `[provider.custom]` first, then the environment variable named by `api_key_env`. The TUI never pre-fills an existing secret. When editing, leaving the secret blank preserves the existing inline override (if any) or continues using the environment; entering a secret persists it as an inline override. Environment-resolved secrets are not written to TOML.
+
 ### Interactive Setup
 
-**TUI wizard** — run `/provider`, scroll to **"Add custom provider…"**, and follow the guided steps.
+There are two TUI entry points:
+
+- `/connect` → **Custom** opens configuration directly.
+- `/provider` → **Add custom provider…** opens the explicit add/edit wizard. The **Custom (BYO endpoint)** row activates the configured slot.
+- `/provider add-custom` opens the same explicit add/edit wizard from a command.
+
+`/provider custom` activates the configured custom slot. If the slot has no endpoint yet, the TUI opens setup instead. Selecting Custom from the model/provider picker follows the same recovery path.
+
+The wizard collects four fields:
+
+1. OpenAI-compatible or Anthropic-compatible protocol.
+2. Base URL.
+3. API-key environment-variable name and optional inline secret.
+4. Model ID.
+
+Model IDs are entered manually and remain usable even when model discovery is unavailable.
 
 **Slash command:**
 
@@ -167,11 +188,38 @@ export CUSTOM_PROVIDER_COMPATIBILITY="openai"
 /custom anthropic https://my-gateway.example your-key my-model
 ```
 
+The `/custom` command remains supported for scripts and existing users. Omitting the optional key keeps the existing credential source; it does not copy an environment-resolved secret into the config file.
+
+### Protocol behavior and probes
+
+OpenAI-compatible custom endpoints use:
+
+- `GET /v1/models` with `Authorization: Bearer …` for the setup probe.
+- `POST /v1/chat/completions` with Bearer authentication for chat.
+- Server-sent events (`stream = true`) and OpenAI tool-call shapes for streaming agent turns.
+
+Anthropic-compatible custom endpoints use:
+
+- A minimal `POST /v1/messages` probe with `x-api-key` and `anthropic-version: 2023-06-01`.
+- `POST /v1/messages` with the same headers for chat.
+- Server-sent events (`stream = true`) and Anthropic tool-use shapes for streaming agent turns.
+
+The TUI performs the cheap protocol-specific probe before activation. Malformed URLs, invalid environment-variable names, and missing credentials are blocking errors. Network, authentication, protocol, and endpoint failures offer **Retry**, **Save anyway**, or **Cancel**. **Save anyway** activates the manually configured provider without requiring model discovery. Probe errors are sanitized before display.
+
+Model discovery is best-effort: OpenAI-compatible endpoints use `/v1/models` with Bearer authentication, and Anthropic-compatible endpoints use the paginated `/v1/models` API with Anthropic headers. A failed discovery request does not prevent a manually entered model ID from being used.
+
+### Persistence
+
+- First-run onboarding saves the selected Custom provider fields, default-provider selection, and onboarding-completed flag to the global config (`~/.local/share/ncacli/config.toml`, subject to the product-home overrides).
+- In-session setup and provider activation save only the relevant Custom provider fields and default-provider selection to `.nca/config.local.toml` in the current workspace.
+- Persistence uses targeted, syntax-preserving TOML patches. Existing comments, unknown keys, and unrelated provider credentials are retained; missing files receive only the necessary sections.
+- Writes are atomic. Malformed or structurally unsafe TOML is left untouched and reported as a persistence warning. Runtime activation remains active if a later save fails.
+
 Notes:
 
-- `compatibility = "openai"` uses `/v1/chat/completions` and `GET /v1/models`
-- `compatibility = "anthropic"` uses `/v1/messages` with `x-api-key` header
-- After setup, use `/model <name>` to switch the configured custom model
+- `compatibility = "openai"` selects the OpenAI-compatible wire format.
+- `compatibility = "anthropic"` selects the Anthropic-compatible wire format.
+- After setup, use `/model <name>` to switch the active model ID.
 - Press `c` in the provider picker for a quick-reference help card
 
 ## Switching Providers
@@ -196,6 +244,7 @@ NCA_MODEL=gpt-4o nca
 /provider openai   # Switch default provider
 /provider custom   # Use the configured custom endpoint
 /provider          # TUI picker — select "Add custom provider…" to configure
+/provider add-custom # Open the custom endpoint wizard directly
 /custom openai https://sumopod.example your-key my-model
 /model gpt-4o      # Switch model
 /models            # Browse available models
@@ -214,11 +263,11 @@ nca ships with built-in model aliases for quick switching:
 
 | Alias | Resolves To |
 |-------|-------------|
-| `default` | `MiniMax-M2.7` |
-| `minimax` | `MiniMax-M2.7` |
-| `m2.7` | `MiniMax-M2.7` |
-| `coding` | `MiniMax-M2.7` |
-| `reasoning` | `MiniMax-M2.7` |
+| `default` | `MiniMax-M2.5` |
+| `minimax` | `MiniMax-M2.5` |
+| `m2.5` | `MiniMax-M2.5` |
+| `coding` | `MiniMax-M2.5` |
+| `reasoning` | `MiniMax-M2.5` |
 | `openai` | `gpt-4o-mini` |
 | `gpt4o` | `gpt-4o` |
 | `claude` | `claude-3-7-sonnet-latest` |
@@ -258,9 +307,9 @@ The default environment variable names are:
 | Anthropic | `ANTHROPIC_API_KEY` |
 | OpenAI | `OPENAI_API_KEY` |
 | OpenRouter | `OPENROUTER_API_KEY` |
-| Custom | `CUSTOM_PROVIDER_API_KEY` |
+| Custom | The editable `api_key_env` value; defaults to `CUSTOM_PROVIDER_API_KEY` |
 
-You can change the environment variable name via `api_key_env` in config.
+You can change the Custom environment variable name via `api_key_env` in config or through the TUI setup wizard.
 
 ## Extended Thinking
 

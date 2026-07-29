@@ -21,6 +21,14 @@ These commands are the supported orchestration-facing surfaces:
 
 `nca serve` exists for long-lived IPC-driven sessions but is treated as an internal command rather than part of the public orchestration contract.
 
+### IPC endpoint portability
+
+The `socket_path` field is the persisted IPC endpoint for compatibility with existing session
+metadata. On Unix it is a filesystem path such as `/tmp/nca/session-123.sock`; on Windows it is a
+loopback TCP address such as `127.0.0.1:43127`. Clients must use the value as opaque endpoint data
+and must not derive or reserve a port from the session ID. The runtime binds the endpoint before
+the session is published and retries operating-system-reported Windows port collisions.
+
 ## Event Stream Shape
 
 Machine event streams use the same envelope shape on stdout, in IPC, and in `.nca/sessions/<session-id>.events.jsonl`:
@@ -213,6 +221,6 @@ This subprocess contract is the first compatibility layer.
 
 Planned later layers:
 
-- formal local IPC API over the existing Unix socket
+- formal local IPC API over the existing platform-specific local transport
 - optional HTTP/SSE or A2A-style adapter on top of `runtime + common`
 - orchestrator-specific wrappers only after the generic contract is stable

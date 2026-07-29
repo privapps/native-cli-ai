@@ -248,6 +248,13 @@ impl AgentLoop {
                         .await;
                         tool_calls.push(call);
                     }
+                    StreamChunk::Error(message) => {
+                        self.emit(AgentEvent::Error {
+                            message: message.clone(),
+                        })
+                        .await;
+                        return Err(ProviderError::Other(message));
+                    }
                     StreamChunk::Usage {
                         input_tokens,
                         output_tokens,

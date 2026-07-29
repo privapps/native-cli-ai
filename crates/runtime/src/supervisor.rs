@@ -577,6 +577,9 @@ impl Supervisor {
                 nca_core::provider::StreamChunk::TextDelta(delta) => {
                     summary.push_str(&delta);
                 }
+                nca_core::provider::StreamChunk::Error(message) => {
+                    return Err(message);
+                }
                 nca_core::provider::StreamChunk::Done => break,
                 _ => {}
             }
@@ -1615,14 +1618,33 @@ pub async fn spawn_child_session(
 }
 
 fn is_pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+
     #[cfg(unix)]
     {
+        if pid > i32::MAX as u32 {
+            return false;
+        }
         unsafe { libc::kill(pid as i32, 0) == 0 }
     }
-    #[cfg(not(unix))]
+
+    #[cfg(windows)]
     {
-        let _ = pid;
-        false
+        let Ok(output) = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+        else {
+            return false;
+        };
+
+        if !output.status.success() {
+            return false;
+        }
+
+        let pid = format!(",\"{pid}\",");
+        String::from_utf8_lossy(&output.stdout).contains(&pid)
     }
 }
 
@@ -1940,5 +1962,11 @@ mod tests {
 
         assert!(!prompt.contains("## Recommended Skills"));
         assert!(!prompt.contains("invoke_skill before starting"));
+    }
+
+    #[test]
+    fn pid_liveness_uses_platform_process_control() {
+        assert!(is_pid_alive(std::process::id()));
+        assert!(!is_pid_alive(u32::MAX));
     }
 }

@@ -12,7 +12,9 @@
 //! lookups entirely.
 
 use crate::model_limits::ModelLimits;
-use nca_common::config::{NcaConfig, ProviderCompatibility, ProviderKind};
+use nca_common::config::{
+    NcaConfig, ProviderCompatibility, ProviderKind, normalize_custom_provider_base_url,
+};
 use serde::Deserialize;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -428,23 +430,28 @@ async fn fetch_custom_model_ids(client: &reqwest::Client, config: &NcaConfig) ->
         Some(k) => k,
         None => return Vec::new(),
     };
-    if config.provider.custom.base_url.trim().is_empty() {
-        return Vec::new();
-    }
+    let base_url = match custom_catalog_base_url(config) {
+        Some(base_url) => base_url,
+        None => return Vec::new(),
+    };
 
     let mut shadow = config.clone();
     match config.provider.custom.compatibility {
         ProviderCompatibility::OpenAi => {
             shadow.provider.openai.api_key = Some(key);
-            shadow.provider.openai.base_url = config.provider.custom.base_url.clone();
+            shadow.provider.openai.base_url = base_url.clone();
             fetch_openai_model_ids(client, &shadow).await
         }
         ProviderCompatibility::Anthropic => {
             shadow.provider.anthropic.api_key = Some(key);
-            shadow.provider.anthropic.base_url = config.provider.custom.base_url.clone();
+            shadow.provider.anthropic.base_url = base_url;
             fetch_anthropic_model_ids(client, &shadow).await
         }
     }
+}
+
+fn custom_catalog_base_url(config: &NcaConfig) -> Option<String> {
+    normalize_custom_provider_base_url(&config.provider.custom.base_url).ok()
 }
 
 async fn fetch_openrouter_model_ids(client: &reqwest::Client, config: &NcaConfig) -> Vec<String> {
@@ -629,6 +636,60 @@ async fn fetch_openai_model_ids(client: &reqwest::Client, config: &NcaConfig) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::thread::{self, JoinHandle};
+
+    fn spawn_model_fixtures(responses: Vec<(u16, String)>) -> (String, JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind model fixture");
+        let address = listener.local_addr().expect("model fixture address");
+        let server = thread::spawn(move || {
+            let mut requests = Vec::with_capacity(responses.len());
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().expect("accept model request");
+                let mut reader = BufReader::new(stream.try_clone().expect("clone model stream"));
+                let mut request = String::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).expect("read model request");
+                    request.push_str(&line);
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+
+                let reason = match status {
+                    200 => "OK",
+                    503 => "Service Unavailable",
+                    _ => "Fixture Response",
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write model response");
+                requests.push(request);
+            }
+            requests
+        });
+
+        (format!("http://{address}"), server)
+    }
+
+    fn spawn_model_fixture(status: u16, body: &str) -> (String, JoinHandle<String>) {
+        let (base_url, server) = spawn_model_fixtures(vec![(status, body.to_string())]);
+        let single_request = thread::spawn(move || {
+            server
+                .join()
+                .expect("model fixture thread")
+                .into_iter()
+                .next()
+                .expect("model fixture request")
+        });
+        (base_url, single_request)
+    }
 
     #[test]
     fn openrouter_pick_exact() {
@@ -666,5 +727,111 @@ mod tests {
         });
         assert_eq!(openai_context_from_catalog(&v, "gpt-4o"), Some(128_000));
         assert_eq!(openai_context_from_catalog(&v, "gpt-4o-mini"), None);
+    }
+
+    #[test]
+    fn custom_catalog_base_url_strips_optional_v1_suffix() {
+        let mut config = NcaConfig::default();
+        config.provider.custom.base_url = "https://gateway.example/v1/".into();
+
+        assert_eq!(
+            custom_catalog_base_url(&config).as_deref(),
+            Some("https://gateway.example")
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_openai_discovery_requests_v1_models_and_parses_ids() {
+        let (base_url, server) = spawn_model_fixture(
+            200,
+            r#"{"data":[{"id":"zeta-model"},{"id":"alpha-model"},{"object":"model"}]}"#,
+        );
+        let mut config = NcaConfig::default();
+        config.provider.default = ProviderKind::Custom;
+        config.provider.custom.base_url = base_url;
+        config.provider.custom.api_key = Some("custom-openai-key".into());
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAi;
+
+        let ids = fetch_provider_model_ids(&config).await;
+        let request = server.join().expect("model fixture thread");
+
+        assert_eq!(ids, vec!["alpha-model", "zeta-model"]);
+        assert!(request.starts_with("GET /v1/models HTTP/1.1\r\n"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer custom-openai-key\r\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_anthropic_discovery_requests_v1_models_and_parses_ids() {
+        let (base_url, server) = spawn_model_fixture(
+            200,
+            r#"{"data":[{"id":"claude-zeta"},{"id":"claude-alpha"}],"has_more":false}"#,
+        );
+        let mut config = NcaConfig::default();
+        config.provider.default = ProviderKind::Custom;
+        config.provider.custom.base_url = format!("{base_url}/");
+        config.provider.custom.api_key = Some("custom-anthropic-key".into());
+        config.provider.custom.compatibility = ProviderCompatibility::Anthropic;
+
+        let ids = fetch_provider_model_ids(&config).await;
+        let request = server.join().expect("model fixture thread");
+        let request_lower = request.to_ascii_lowercase();
+
+        assert_eq!(ids, vec!["claude-alpha", "claude-zeta"]);
+        assert!(request.starts_with("GET /v1/models?limit=100 HTTP/1.1\r\n"));
+        assert!(request_lower.contains("x-api-key: custom-anthropic-key\r\n"));
+        assert!(request_lower.contains("anthropic-version: 2023-06-01\r\n"));
+    }
+
+    #[tokio::test]
+    async fn custom_anthropic_discovery_follows_pagination() {
+        let (base_url, server) = spawn_model_fixtures(vec![
+            (
+                200,
+                r#"{"data":[{"id":"claude-alpha"}],"has_more":true}"#.into(),
+            ),
+            (
+                200,
+                r#"{"data":[{"id":"claude-zeta"}],"has_more":false}"#.into(),
+            ),
+        ]);
+        let mut config = NcaConfig::default();
+        config.provider.default = ProviderKind::Custom;
+        config.provider.custom.base_url = base_url;
+        config.provider.custom.api_key = Some("custom-anthropic-key".into());
+        config.provider.custom.compatibility = ProviderCompatibility::Anthropic;
+
+        let ids = fetch_provider_model_ids(&config).await;
+        let requests = server.join().expect("model fixture thread");
+
+        assert_eq!(ids, vec!["claude-alpha", "claude-zeta"]);
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("GET /v1/models?limit=100 HTTP/1.1\r\n"));
+        assert!(
+            requests[1].starts_with("GET /v1/models?limit=100&after_id=claude-alpha HTTP/1.1\r\n")
+        );
+        for request in requests {
+            let request_lower = request.to_ascii_lowercase();
+            assert!(request_lower.contains("x-api-key: custom-anthropic-key\r\n"));
+            assert!(request_lower.contains("anthropic-version: 2023-06-01\r\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_model_discovery_returns_empty_on_provider_failure() {
+        let (base_url, server) = spawn_model_fixture(503, r#"{"error":"unavailable"}"#);
+        let mut config = NcaConfig::default();
+        config.provider.default = ProviderKind::Custom;
+        config.provider.custom.base_url = base_url;
+        config.provider.custom.api_key = Some("custom-openai-key".into());
+
+        let ids = fetch_provider_model_ids(&config).await;
+        let request = server.join().expect("model fixture thread");
+
+        assert!(ids.is_empty());
+        assert!(request.starts_with("GET /v1/models HTTP/1.1\r\n"));
     }
 }

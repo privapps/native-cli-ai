@@ -1,5 +1,9 @@
 //! Transcript + status driven by `AgentEvent`.
 
+use super::custom_provider_flow::{
+    CustomProviderProbeOutcome, CustomProviderSetupFlow, CustomProviderSetupStage,
+    CustomProviderSetupTransition,
+};
 use super::overlay::{UiOverlay, UiOverlayKind};
 use nca_common::config::ProviderKind;
 use nca_common::event::{AgentEvent, BusyState, InteractiveQuestionPayload, QuestionSelection};
@@ -62,13 +66,14 @@ pub struct ApprovalRequest {
     pub input: String,
 }
 
-/// Steps for the in-TUI “add custom provider” wizard (`/provider` → Add custom provider…).
+/// Steps for the in-session custom-provider setup flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CustomProviderSetupStep {
     Compatibility,
     BaseUrl,
     ApiKey,
     Model,
+    Probe,
 }
 
 /// One row in the sidebar for a child / sub-agent session.
@@ -129,6 +134,8 @@ pub struct TuiSessionState {
     /// Latest context compaction diagnostics (if any).
     pub context_report: Option<ContextCompactionReport>,
     pub model: String,
+    /// Sanitized host label for the active custom provider, if selected.
+    pub custom_provider_host: Option<String>,
     pub agent_profile: String,
     pub permission_mode: String,
     pub input_tokens: u64,
@@ -145,6 +152,8 @@ pub struct TuiSessionState {
     pub slash_menu_index: usize,
     /// Active modal overlay (at most one).
     pub overlay: UiOverlay,
+    /// Pure custom-provider setup state shared with onboarding transitions.
+    pub custom_provider_setup_flow: Option<CustomProviderSetupFlow>,
     /// Approval request currently waiting for a local TUI answer.
     pub active_approval: Option<ApprovalRequest>,
     /// When set, the composer answers this question (see status hint).
@@ -219,6 +228,7 @@ impl TuiSessionState {
             todos: Vec::new(),
             context_report: None,
             model,
+            custom_provider_host: None,
             agent_profile,
             permission_mode,
             input_tokens: 0,
@@ -231,6 +241,7 @@ impl TuiSessionState {
             should_exit: false,
             slash_menu_index: 0,
             overlay: UiOverlay::None,
+            custom_provider_setup_flow: None,
             active_approval: None,
             active_question: None,
             current_branch: String::new(),
@@ -530,6 +541,110 @@ impl TuiSessionState {
         }
     }
 
+    pub fn custom_provider_setup_flow(&self) -> Option<&CustomProviderSetupFlow> {
+        self.custom_provider_setup_flow.as_ref()
+    }
+
+    pub fn custom_provider_setup_flow_mut(&mut self) -> Option<&mut CustomProviderSetupFlow> {
+        self.custom_provider_setup_flow.as_mut()
+    }
+
+    /// Apply a probe result through the shared custom-provider state machine and
+    /// mirror its stage into the surface-specific overlay.
+    pub fn apply_custom_provider_probe_outcome(
+        &mut self,
+        outcome: CustomProviderProbeOutcome,
+    ) -> CustomProviderSetupTransition {
+        let transition = self
+            .custom_provider_setup_flow
+            .as_mut()
+            .map(|flow| flow.apply_probe_outcome(outcome))
+            .unwrap_or_else(|| {
+                CustomProviderSetupTransition::Blocked(
+                    "custom provider setup is not initialized".into(),
+                )
+            });
+        self.sync_custom_provider_setup_from_flow();
+        transition
+    }
+
+    /// Copy the shared flow's public draft and stage into the surface-specific
+    /// overlay fields used by the renderer.
+    pub fn sync_custom_provider_setup_from_flow(&mut self) {
+        let Some(flow) = self.custom_provider_setup_flow.as_ref() else {
+            return;
+        };
+        let stage = flow.stage();
+        let draft = flow.draft().clone();
+        let (step, input, focus, probe_error) = match stage {
+            CustomProviderSetupStage::Compatibility => (
+                CustomProviderSetupStep::Compatibility,
+                String::new(),
+                true,
+                None,
+            ),
+            CustomProviderSetupStage::BaseUrl => (
+                CustomProviderSetupStep::BaseUrl,
+                draft.base_url.clone(),
+                true,
+                None,
+            ),
+            CustomProviderSetupStage::Credentials => (
+                CustomProviderSetupStep::ApiKey,
+                draft.api_key_env.clone(),
+                true,
+                None,
+            ),
+            CustomProviderSetupStage::Model => (
+                CustomProviderSetupStep::Model,
+                draft.model.clone(),
+                false,
+                None,
+            ),
+            CustomProviderSetupStage::Probing => (
+                CustomProviderSetupStep::Probe,
+                draft.model.clone(),
+                false,
+                None,
+            ),
+            CustomProviderSetupStage::ProbeFailed { message, .. } => (
+                CustomProviderSetupStep::Probe,
+                draft.model.clone(),
+                false,
+                Some(message),
+            ),
+            CustomProviderSetupStage::Complete | CustomProviderSetupStage::Cancelled => return,
+        };
+        if let UiOverlay::CustomProviderSetup {
+            step: overlay_step,
+            compat_index,
+            input: overlay_input,
+            base_url,
+            api_key,
+            api_key_env,
+            credential_env_focus,
+            model_hint,
+            probe_error: overlay_error,
+            probe_index,
+        } = &mut self.overlay
+        {
+            *overlay_step = step;
+            *compat_index = usize::from(matches!(
+                draft.compatibility,
+                nca_common::config::ProviderCompatibility::Anthropic
+            ));
+            *overlay_input = input;
+            *base_url = draft.base_url;
+            *api_key = draft.api_key.unwrap_or_default();
+            *api_key_env = draft.api_key_env;
+            *credential_env_focus = focus;
+            *model_hint = draft.model;
+            *overlay_error = probe_error;
+            *probe_index = 0;
+        }
+        self.mark_dirty();
+    }
+
     pub fn custom_setup_compat_index(&self) -> usize {
         match &self.overlay {
             UiOverlay::CustomProviderSetup { compat_index, .. } => *compat_index,
@@ -556,6 +671,68 @@ impl TuiSessionState {
             UiOverlay::CustomProviderSetup { api_key, .. } => api_key.as_str(),
             _ => "",
         }
+    }
+
+    pub fn custom_setup_api_key_env(&self) -> &str {
+        match &self.overlay {
+            UiOverlay::CustomProviderSetup { api_key_env, .. } => api_key_env.as_str(),
+            _ => "",
+        }
+    }
+
+    pub fn custom_setup_credential_env_focus(&self) -> bool {
+        match &self.overlay {
+            UiOverlay::CustomProviderSetup {
+                credential_env_focus,
+                ..
+            } => *credential_env_focus,
+            _ => false,
+        }
+    }
+
+    pub fn set_custom_setup_credential_env_focus(&mut self, focused: bool) {
+        let changed = if let UiOverlay::CustomProviderSetup {
+            credential_env_focus,
+            ..
+        } = &mut self.overlay
+        {
+            *credential_env_focus = focused;
+            true
+        } else {
+            false
+        };
+        if changed {
+            self.mark_dirty();
+        }
+    }
+
+    pub fn custom_provider_probe_error(&self) -> Option<&str> {
+        match &self.overlay {
+            UiOverlay::CustomProviderSetup { probe_error, .. } => probe_error.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub fn custom_provider_probe_action_count(&self) -> usize {
+        if self.custom_provider_probe_error().is_some() && self.custom_provider_probe_retryable() {
+            3
+        } else if self.custom_provider_probe_error().is_some() {
+            1
+        } else {
+            0
+        }
+    }
+
+    pub fn custom_provider_probe_retryable(&self) -> bool {
+        matches!(
+            self.custom_provider_setup_flow
+                .as_ref()
+                .map(|flow| flow.stage()),
+            Some(CustomProviderSetupStage::ProbeFailed {
+                retryable: true,
+                ..
+            })
+        )
     }
 
     pub fn custom_setup_model_hint(&self) -> &str {
@@ -757,6 +934,13 @@ impl TuiSessionState {
     pub fn custom_setup_api_key_mut(&mut self) -> Option<&mut String> {
         match &mut self.overlay {
             UiOverlay::CustomProviderSetup { api_key, .. } => Some(api_key),
+            _ => None,
+        }
+    }
+
+    pub fn custom_setup_api_key_env_mut(&mut self) -> Option<&mut String> {
+        match &mut self.overlay {
+            UiOverlay::CustomProviderSetup { api_key_env, .. } => Some(api_key_env),
             _ => None,
         }
     }
@@ -994,18 +1178,130 @@ impl TuiSessionState {
     }
 
     pub fn open_custom_provider_setup(&mut self, model_hint: impl Into<String>) {
+        self.open_custom_provider_setup_from_config(&nca_common::config::CustomProviderConfig {
+            model: model_hint.into(),
+            ..Default::default()
+        });
+    }
+
+    /// Open the session setup flow with public fields from the current custom
+    /// configuration. The stored secret is intentionally not copied into UI
+    /// state.
+    pub fn open_custom_provider_setup_from_config(
+        &mut self,
+        config: &nca_common::config::CustomProviderConfig,
+    ) {
+        self.custom_provider_setup_flow = Some(CustomProviderSetupFlow::new(config));
         self.set_overlay(UiOverlay::CustomProviderSetup {
             step: CustomProviderSetupStep::Compatibility,
-            compat_index: 0,
-            input: String::new(),
-            base_url: String::new(),
+            compat_index: if matches!(
+                config.compatibility,
+                nca_common::config::ProviderCompatibility::Anthropic
+            ) {
+                1
+            } else {
+                0
+            },
+            input: config.base_url.clone(),
+            base_url: config.base_url.clone(),
             api_key: String::new(),
-            model_hint: model_hint.into(),
+            api_key_env: config.api_key_env.clone(),
+            credential_env_focus: true,
+            model_hint: config.model.clone(),
+            probe_error: None,
+            probe_index: 0,
         });
+    }
+
+    /// Reopen setup with an unvalidated submission after a local validation
+    /// error. This keeps the user's public fields editable without copying a
+    /// secret into the UI state.
+    pub fn open_custom_provider_setup_for_values(
+        &mut self,
+        compatibility: nca_common::config::ProviderCompatibility,
+        base_url: impl Into<String>,
+        api_key_env: impl Into<String>,
+        model: impl Into<String>,
+        step: CustomProviderSetupStep,
+    ) {
+        let base_url = base_url.into();
+        let api_key_env = api_key_env.into();
+        let model = model.into();
+        let config = nca_common::config::CustomProviderConfig {
+            compatibility,
+            base_url: base_url.clone(),
+            api_key_env: api_key_env.clone(),
+            model: model.clone(),
+            ..Default::default()
+        };
+        let mut flow = CustomProviderSetupFlow::new(&config);
+        flow.resume_at(match step {
+            CustomProviderSetupStep::Compatibility => CustomProviderSetupStage::Compatibility,
+            CustomProviderSetupStep::BaseUrl => CustomProviderSetupStage::BaseUrl,
+            CustomProviderSetupStep::ApiKey => CustomProviderSetupStage::Credentials,
+            CustomProviderSetupStep::Model => CustomProviderSetupStage::Model,
+            CustomProviderSetupStep::Probe => CustomProviderSetupStage::Probing,
+        });
+        self.custom_provider_setup_flow = Some(flow);
+        let input = match step {
+            CustomProviderSetupStep::Compatibility => base_url.clone(),
+            CustomProviderSetupStep::BaseUrl => base_url.clone(),
+            CustomProviderSetupStep::ApiKey => api_key_env.clone(),
+            CustomProviderSetupStep::Model | CustomProviderSetupStep::Probe => model.clone(),
+        };
+        self.set_overlay(UiOverlay::CustomProviderSetup {
+            step,
+            compat_index: if matches!(
+                compatibility,
+                nca_common::config::ProviderCompatibility::Anthropic
+            ) {
+                1
+            } else {
+                0
+            },
+            input,
+            base_url,
+            api_key: String::new(),
+            api_key_env,
+            credential_env_focus: step == CustomProviderSetupStep::ApiKey,
+            model_hint: model,
+            probe_error: None,
+            probe_index: 0,
+        });
+    }
+
+    pub fn start_custom_provider_probe(&mut self) {
+        if let UiOverlay::CustomProviderSetup {
+            step,
+            probe_error,
+            probe_index,
+            ..
+        } = &mut self.overlay
+        {
+            *step = CustomProviderSetupStep::Probe;
+            *probe_error = None;
+            *probe_index = 0;
+            self.mark_dirty();
+        }
+    }
+
+    pub fn custom_provider_probe_index(&self) -> usize {
+        match &self.overlay {
+            UiOverlay::CustomProviderSetup { probe_index, .. } => *probe_index,
+            _ => 0,
+        }
+    }
+
+    pub fn custom_provider_probe_index_mut(&mut self) -> Option<&mut usize> {
+        match &mut self.overlay {
+            UiOverlay::CustomProviderSetup { probe_index, .. } => Some(probe_index),
+            _ => None,
+        }
     }
 
     pub fn close_custom_provider_setup(&mut self) {
         if self.custom_provider_setup_open() {
+            self.custom_provider_setup_flow = None;
             self.close_overlay();
         }
     }
@@ -1015,6 +1311,16 @@ impl TuiSessionState {
             self.busy = busy;
             self.mark_dirty();
         }
+    }
+
+    /// Update the status-bar identity without retaining credentials or paths.
+    pub fn set_active_provider(&mut self, provider: ProviderKind, base_url: &str) {
+        self.custom_provider_host = if provider == ProviderKind::Custom {
+            nca_common::config::custom_provider_host(base_url)
+        } else {
+            None
+        };
+        self.mark_dirty();
     }
 
     pub fn set_busy_state(&mut self, state: BusyState) {
@@ -1033,9 +1339,17 @@ impl TuiSessionState {
         self.mark_transcript_dirty();
     }
 
-    /// Newest committed assistant response, or non-empty streaming text when
-    /// nothing has been committed yet.
+    /// Newest assistant response, preferring non-empty in-progress text over
+    /// an older committed response.
     pub fn last_assistant_text(&self) -> Option<&str> {
+        if let Some(stream) = self
+            .streaming_assistant
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            return Some(stream);
+        }
+
         for block in self.blocks.iter().rev() {
             if let DisplayBlock::Assistant(text) = block {
                 let trimmed = text.trim();
@@ -1044,9 +1358,7 @@ impl TuiSessionState {
                 }
             }
         }
-        self.streaming_assistant
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
+        None
     }
 
     /// Seed or replace the todo list (e.g. from a resumed session snapshot).
@@ -1922,7 +2234,7 @@ mod tests {
     }
 
     #[test]
-    fn last_assistant_text_prefers_newest_committed() {
+    fn last_assistant_text_prefers_newer_stream_over_previous_response() {
         let mut st = TuiSessionState::new(
             "s".into(),
             "m".into(),
@@ -1932,12 +2244,19 @@ mod tests {
         );
         assert!(st.last_assistant_text().is_none());
 
-        st.blocks
-            .push(DisplayBlock::Assistant("first response".into()));
-        st.blocks
-            .push(DisplayBlock::Assistant("second response".into()));
-        st.streaming_assistant = Some("partial".into());
-        assert_eq!(st.last_assistant_text(), Some("second response"));
+        st.apply_event(&AgentEvent::MessageReceived {
+            role: "assistant".into(),
+            content: "previous response".into(),
+        });
+        st.apply_event(&AgentEvent::MessageReceived {
+            role: "user".into(),
+            content: "new request".into(),
+        });
+        st.apply_event(&AgentEvent::TokensStreamed {
+            delta: "new response in progress".into(),
+        });
+
+        assert_eq!(st.last_assistant_text(), Some("new response in progress"));
     }
 
     #[test]
@@ -2025,5 +2344,65 @@ mod tests {
             "expected throttled transcript invalidation, got {bumps} bumps"
         );
         assert!(st.state_version > start_tv + 100);
+    }
+
+    #[test]
+    fn editing_custom_provider_prefills_public_fields_but_not_secret() {
+        let mut st = TuiSessionState::new(
+            "s".into(),
+            "m".into(),
+            "@build".into(),
+            "default".into(),
+            PathBuf::from("/tmp"),
+        );
+        let mut config = nca_common::config::CustomProviderConfig::default();
+        config.compatibility = nca_common::config::ProviderCompatibility::Anthropic;
+        config.base_url = "https://gateway.example".into();
+        config.api_key_env = "GATEWAY_API_KEY".into();
+        config.api_key = Some("sk-secret-must-not-be-shown".into());
+        config.model = "gateway-model".into();
+
+        st.open_custom_provider_setup_from_config(&config);
+
+        assert!(st.custom_provider_setup_open());
+        assert_eq!(st.custom_setup_base_url(), "https://gateway.example");
+        assert_eq!(st.custom_setup_api_key_env(), "GATEWAY_API_KEY");
+        assert_eq!(st.custom_setup_model_hint(), "gateway-model");
+        assert!(st.custom_setup_api_key().is_empty());
+        assert!(!st.custom_setup_input().contains("sk-secret"));
+    }
+
+    #[test]
+    fn unconfigured_custom_picker_recovery_opens_setup_without_error_only() {
+        let mut st = TuiSessionState::new(
+            "s".into(),
+            "m".into(),
+            "@build".into(),
+            "default".into(),
+            PathBuf::from("/tmp"),
+        );
+
+        st.open_custom_provider_setup_from_config(
+            &nca_common::config::CustomProviderConfig::default(),
+        );
+
+        assert!(st.custom_provider_setup_open());
+        assert!(st.blocks.is_empty());
+    }
+
+    #[test]
+    fn active_custom_provider_status_contains_only_sanitized_host() {
+        let mut st = TuiSessionState::new(
+            "session".into(),
+            "model".into(),
+            "@build".into(),
+            "default".into(),
+            PathBuf::from("."),
+        );
+        st.set_active_provider(ProviderKind::Custom, "https://gateway.example/v1");
+        assert_eq!(st.custom_provider_host.as_deref(), Some("gateway.example"));
+
+        st.set_active_provider(ProviderKind::MiniMax, "https://api.minimaxi.chat");
+        assert!(st.custom_provider_host.is_none());
     }
 }

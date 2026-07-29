@@ -72,7 +72,11 @@ pub enum UiOverlay {
         input: String,
         base_url: String,
         api_key: String,
+        api_key_env: String,
+        credential_env_focus: bool,
         model_hint: String,
+        probe_error: Option<String>,
+        probe_index: usize,
     },
 }
 

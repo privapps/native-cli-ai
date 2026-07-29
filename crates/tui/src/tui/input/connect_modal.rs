@@ -11,6 +11,7 @@ use nca_common::config::ProviderKind;
 pub enum ConnectModalKeyResult {
     Handled,
     PromptApiKey(ProviderKind),
+    ConfigureCustom,
 }
 
 pub fn handle_connect_modal_key(
@@ -43,7 +44,11 @@ pub fn handle_connect_modal_key(
         (KeyCode::Enter, _) => {
             if let Some(p) = provider_at_selection(&rows, state.connect_menu_index()) {
                 state.close_connect_modal();
-                ConnectModalKeyResult::PromptApiKey(p)
+                if p == ProviderKind::Custom {
+                    ConnectModalKeyResult::ConfigureCustom
+                } else {
+                    ConnectModalKeyResult::PromptApiKey(p)
+                }
             } else {
                 ConnectModalKeyResult::Handled
             }
@@ -101,5 +106,32 @@ mod tests {
         st.open_connect_modal();
         handle_connect_modal_key(&mut st, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!st.connect_modal_open());
+    }
+
+    #[test]
+    fn selecting_custom_from_connect_opens_configuration_flow() {
+        let mut st = TuiSessionState::new(
+            "s".into(),
+            "m".into(),
+            "a".into(),
+            "default".into(),
+            PathBuf::from("/tmp"),
+        );
+        st.open_connect_modal();
+        st.connect_search_mut().unwrap().push_str("custom");
+
+        let result =
+            handle_connect_modal_key(&mut st, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(result, ConnectModalKeyResult::ConfigureCustom);
+        assert!(!st.connect_modal_open());
+
+        st.open_custom_provider_setup("gateway-model");
+        assert!(st.custom_provider_setup_open());
+        assert_eq!(
+            st.custom_provider_setup_step(),
+            crate::tui::state::CustomProviderSetupStep::Compatibility
+        );
+        assert!(st.custom_provider_setup_flow().is_some());
     }
 }

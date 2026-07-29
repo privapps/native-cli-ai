@@ -11,7 +11,8 @@ on:
         default: true
 
 # Tag pushes (v*) and manual dispatch build Windows / Linux / macOS binaries.
-# GitHub Releases are created only for version tags.
+# GitHub Releases are created only for pushed vMAJOR.MINOR.PATCH tags. Manual
+# dispatch is always a build-only dry run, regardless of the input value.
 permissions:
   contents: write
 
@@ -20,7 +21,53 @@ env:
   BINARY_NAME: nca
 
 jobs:
+  validate-release:
+    runs-on: ubuntu-latest
+    outputs:
+      should_publish: ${{ steps.release-context.outputs.should_publish }}
+      version: ${{ steps.release-context.outputs.version }}
+    steps:
+      - name: Validate release context
+        id: release-context
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "Manual dispatch is build-only (dry_run=${DRY_RUN:-true}); no GitHub Release will be created."
+            {
+              echo "should_publish=false"
+              echo "version="
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$EVENT_NAME" != "push" || "$REF" != refs/tags/* ]]; then
+            echo "This workflow execution is not a release tag; artifacts will not be published."
+            {
+              echo "should_publish=false"
+              echo "version="
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          tag="${REF#refs/tags/}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unsupported release tag '$tag'; expected vMAJOR.MINOR.PATCH." >&2
+            exit 1
+          fi
+
+          echo "Validated release tag: $tag"
+          {
+            echo "should_publish=true"
+            echo "version=${tag#v}"
+          } >> "$GITHUB_OUTPUT"
+
   ci-check:
+    needs: validate-release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -130,8 +177,14 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [validate-release, ci-check, build]
+    if: >-
+      always() &&
+      github.event_name == 'push' &&
+      needs.validate-release.result == 'success' &&
+      needs.validate-release.outputs.should_publish == 'true' &&
+      needs.ci-check.result == 'success' &&
+      needs.build.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -150,8 +203,13 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   update-install-script:
-    needs: release
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [validate-release, release]
+    if: >-
+      always() &&
+      github.event_name == 'push' &&
+      needs.validate-release.result == 'success' &&
+      needs.validate-release.outputs.should_publish == 'true' &&
+      needs.release.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -161,7 +219,9 @@ jobs:
 
       - name: Extract version
         id: version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+        env:
+          RELEASE_VERSION: ${{ needs.validate-release.outputs.version }}
+        run: echo "version=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Update install script version
         run: |

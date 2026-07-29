@@ -6,7 +6,7 @@ use super::StreamChunk;
 
 pub fn spawn_sse_server<F>(body: String, status: u16, assert_request: F) -> String
 where
-    F: FnOnce(&Request) + Send + 'static,
+    F: FnOnce(&mut Request) + Send + 'static,
 {
     let server = Server::http("127.0.0.1:0").expect("start mock server");
     let base_url = match server.server_addr() {
@@ -15,8 +15,8 @@ where
     };
 
     thread::spawn(move || {
-        let request = server.recv().expect("receive request");
-        assert_request(&request);
+        let mut request = server.recv().expect("receive request");
+        assert_request(&mut request);
         let response = Response::from_string(body)
             .with_status_code(StatusCode(status))
             .with_header(
@@ -32,7 +32,7 @@ where
 pub async fn collect_chunks(mut rx: tokio::sync::mpsc::Receiver<StreamChunk>) -> Vec<StreamChunk> {
     let mut chunks = Vec::new();
     while let Some(chunk) = rx.recv().await {
-        let done = matches!(chunk, StreamChunk::Done);
+        let done = matches!(chunk, StreamChunk::Done | StreamChunk::Error(_));
         chunks.push(chunk);
         if done {
             break;

@@ -9,12 +9,12 @@ use crate::tui::composer::{
     palette_selectable_indices, slash_panel_visible,
 };
 use crate::tui::connect_modal::{
-    ConnectRow, build_connect_rows, clamp_selection, provider_at_selection,
-    row_index_for_selection, selectable_row_indices,
+    ConnectRow, build_connect_rows, clamp_selection, row_index_for_selection,
 };
 use crate::tui::input::{
-    ApprovalAnswer, handle_approval_key, parse_tui_question_answer, render_branch_picker,
-    render_command_palette,
+    ApprovalAnswer, ConnectModalKeyResult, CustomProviderSetupKeyResult, handle_approval_key,
+    handle_connect_modal_key, handle_custom_provider_setup_key, parse_tui_question_answer,
+    render_branch_picker, render_command_palette,
 };
 use crate::tui::layout::{
     centered_rect, layout_chunks, layout_with_sidebar, rect_contains, sidebar_fit,
@@ -29,7 +29,7 @@ use crate::tui::transcript::{
 };
 use crossterm::{
     cursor::MoveToColumn,
-    event::{Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind, poll, read},
+    event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind, poll, read},
     execute,
 };
 use nca_common::config::{ProviderCompatibility, ProviderKind};
@@ -105,9 +105,14 @@ pub enum TuiCmd {
     ApplyCustomProviderSetup {
         compatibility: ProviderCompatibility,
         base_url: String,
-        api_key: String,
+        api_key_env: String,
+        api_key: Option<String>,
         model: String,
     },
+    /// Resolve a failed custom-provider probe.
+    CustomProviderProbeAction(crate::tui::input::CustomProviderProbeAction),
+    /// Open the in-session custom-provider setup flow from `/connect`.
+    ConfigureCustomProvider,
     /// Mark onboarding as complete and persist the flag.
     #[allow(dead_code)]
     CompleteOnboarding,
@@ -202,6 +207,60 @@ fn approval_shortcut_action(
         (KeyCode::Char('u'), KeyModifiers::CONTROL) => Some(ApprovalShortcutAction::AllowPattern),
         _ => None,
     }
+}
+
+/// Route the custom-provider overlays exactly as the production event loop does.
+///
+/// Keeping this seam in `app.rs` makes acceptance tests observe both overlay
+/// ownership and the command emitted to the runtime bridge. The lower-level
+/// input handlers remain responsible only for interpreting their key events.
+fn dispatch_custom_provider_key(
+    state: &mut TuiSessionState,
+    key: KeyEvent,
+    cmd_tx: &Sender<TuiCmd>,
+) -> bool {
+    if state.connect_modal_open() {
+        match handle_connect_modal_key(state, key) {
+            ConnectModalKeyResult::PromptApiKey(provider) => {
+                let _ = cmd_tx.try_send(TuiCmd::PromptApiKey(provider, true));
+            }
+            ConnectModalKeyResult::ConfigureCustom => {
+                let _ = cmd_tx.try_send(TuiCmd::ConfigureCustomProvider);
+            }
+            ConnectModalKeyResult::Handled => {}
+        }
+        return true;
+    }
+
+    if state.custom_provider_setup_open() {
+        match handle_custom_provider_setup_key(state, key) {
+            CustomProviderSetupKeyResult::InvalidInput(error) => {
+                state.push_error(format!("[custom] {error}"));
+            }
+            CustomProviderSetupKeyResult::Submit(submission) => {
+                state.start_custom_provider_probe();
+                let _ = cmd_tx.try_send(TuiCmd::ApplyCustomProviderSetup {
+                    compatibility: submission.compatibility,
+                    base_url: submission.base_url,
+                    api_key_env: submission.api_key_env,
+                    api_key: submission.api_key,
+                    model: submission.model,
+                });
+            }
+            CustomProviderSetupKeyResult::ProbeAction(action) => {
+                if matches!(action, crate::tui::input::CustomProviderProbeAction::Cancel) {
+                    state.close_custom_provider_setup();
+                }
+                let _ = cmd_tx.try_send(TuiCmd::CustomProviderProbeAction(action));
+            }
+            CustomProviderSetupKeyResult::Handled
+            | CustomProviderSetupKeyResult::ContinueWithPreservedCredential
+            | CustomProviderSetupKeyResult::ContinueWithInlineCredential => {}
+        }
+        return true;
+    }
+
+    false
 }
 
 /// `question_answer_tx`: when `Some`, answers are sent there so they unblock `ask_question` while
@@ -694,6 +753,16 @@ pub fn run_blocking(
                 }
                 status_spans.push(Span::raw(" │ "));
                 status_spans.push(time_span);
+                if let Some(host) = &g.custom_provider_host {
+                    status_spans.insert(
+                        5,
+                        Span::styled(
+                            format!("Custom · {host}"),
+                            Style::default().fg(theme::USER),
+                        ),
+                    );
+                    status_spans.insert(6, Span::raw(" │ "));
+                }
                 let status = Line::from(status_spans);
                 let bar = Paragraph::new(status).style(Style::default().bg(theme::SURFACE));
                 frame.render_widget(bar, status_rect);
@@ -976,6 +1045,7 @@ pub fn run_blocking(
                         CustomProviderSetupStep::BaseUrl => "Step 2/4 — Base URL",
                         CustomProviderSetupStep::ApiKey => "Step 3/4 — API key",
                         CustomProviderSetupStep::Model => "Step 4/4 — Model id",
+                        CustomProviderSetupStep::Probe => "Check endpoint",
                     };
                     let mut lines: Vec<Line> = vec![
                         Line::from(Span::styled(
@@ -1021,16 +1091,30 @@ pub fn run_blocking(
                         }
                         CustomProviderSetupStep::ApiKey => {
                             lines.push(Line::from(Span::styled(
-                                " Paste your secret key for this endpoint.",
+                                " API-key environment variable (Tab toggles secret):",
                                 Style::default().fg(theme::MUTED),
                             )));
                             lines.push(Line::default());
-                            let masked = if g.custom_setup_input().is_empty() {
+                            let env = if g.custom_setup_credential_env_focus() {
+                                g.custom_setup_input()
+                            } else {
+                                g.custom_setup_api_key_env()
+                            };
+                            lines.push(Line::from(Span::styled(
+                                format!(" env: {env}"),
+                                Style::default().fg(theme::TEXT),
+                            )));
+                            let masked = if g.custom_setup_credential_env_focus()
+                                || g.custom_setup_input().is_empty()
+                            {
                                 String::new()
                             } else {
                                 "*".repeat(g.custom_setup_input().chars().count().min(48))
                             };
-                            lines.push(Line::from(Span::styled(masked, Style::default().fg(theme::TEXT))));
+                            lines.push(Line::from(Span::styled(
+                                format!(" secret: {masked}"),
+                                Style::default().fg(theme::TEXT),
+                            )));
                         }
                         CustomProviderSetupStep::Model => {
                             lines.push(Line::from(Span::styled(
@@ -1043,6 +1127,38 @@ pub fn run_blocking(
                                 Style::default().fg(theme::TEXT),
                             )));
                         }
+                        CustomProviderSetupStep::Probe => {
+                            if let Some(error) = g.custom_provider_probe_error() {
+                                lines.push(Line::from(Span::styled(
+                                    format!(" Probe failed: {error}"),
+                                    Style::default().fg(theme::WARN),
+                                )));
+                                let labels = if g.custom_provider_probe_retryable() {
+                                    ["Retry", "Save anyway", "Cancel"].as_slice()
+                                } else {
+                                    ["Cancel"].as_slice()
+                                };
+                                for (idx, label) in labels.iter().enumerate() {
+                                    let style = if idx == g.custom_provider_probe_index() {
+                                        Style::default()
+                                            .fg(Color::Black)
+                                            .bg(theme::USER)
+                                            .add_modifier(Modifier::BOLD)
+                                    } else {
+                                        Style::default().fg(theme::TEXT)
+                                    };
+                                    lines.push(Line::from(Span::styled(
+                                        format!(" {label}"),
+                                        style,
+                                    )));
+                                }
+                            } else {
+                                lines.push(Line::from(Span::styled(
+                                    " Checking endpoint…",
+                                    Style::default().fg(theme::MUTED),
+                                )));
+                            }
+                        }
                     }
                     lines.push(Line::default());
                     lines.push(Line::from(Span::styled(
@@ -1050,7 +1166,11 @@ pub fn run_blocking(
                             CustomProviderSetupStep::Compatibility => {
                                 " Enter confirm · Up/Down · Esc cancel "
                             }
-                            _ => " Enter confirm · Esc cancel · Backspace edit ",
+                            CustomProviderSetupStep::Probe if g.custom_provider_probe_error().is_none() => {
+                                " Checking endpoint · Esc cancel "
+                            }
+                            CustomProviderSetupStep::Probe => " Enter choose · Up/Down · Esc cancel ",
+                            _ => " Enter confirm · Tab next field · Esc cancel · Backspace edit ",
                         },
                         Style::default().fg(theme::MUTED),
                     )));
@@ -2038,55 +2158,8 @@ pub fn run_blocking(
                         continue;
                     }
 
-                    // Connect provider (OpenCode-style `/connect`).
-                    if g.connect_modal_open() {
-                        let rows = build_connect_rows(g.connect_search());
-                        let n_sel = selectable_row_indices(&rows).len();
-                        match (key.code, key.modifiers) {
-                            (KeyCode::Esc, _) => {
-                                if !g.onboarding_mode {
-                                    g.close_connect_modal();
-                                }
-                            }
-                            (KeyCode::Up, _) => {
-                                if n_sel > 0 {
-                                    *g.connect_menu_index_mut().unwrap() =
-                                        g.connect_menu_index().saturating_sub(1).min(n_sel - 1);
-                                }
-                            }
-                            (KeyCode::Down, _) => {
-                                if n_sel > 0 {
-                                    *g.connect_menu_index_mut().unwrap() =
-                                        (g.connect_menu_index() + 1).min(n_sel - 1);
-                                }
-                            }
-                            (KeyCode::Enter, _) => {
-                                if let Some(p) =
-                                    provider_at_selection(&rows, g.connect_menu_index())
-                                {
-                                    g.close_connect_modal();
-                                    drop(g);
-                                    let _ = cmd_tx.try_send(TuiCmd::PromptApiKey(p, true));
-                                }
-                            }
-                            (KeyCode::Backspace, _) => {
-                                g.connect_search_mut().unwrap().pop();
-                                *g.connect_menu_index_mut().unwrap() = 0;
-                                *g.connect_modal_scroll_mut().unwrap() = 0;
-                                let rows2 = build_connect_rows(g.connect_search());
-                                *g.connect_menu_index_mut().unwrap() =
-                                    clamp_selection(g.connect_menu_index(), &rows2);
-                            }
-                            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                                g.connect_search_mut().unwrap().push(c);
-                                *g.connect_menu_index_mut().unwrap() = 0;
-                                *g.connect_modal_scroll_mut().unwrap() = 0;
-                                let rows2 = build_connect_rows(g.connect_search());
-                                *g.connect_menu_index_mut().unwrap() =
-                                    clamp_selection(g.connect_menu_index(), &rows2);
-                            }
-                            _ => {}
-                        }
+                    // Connect provider (OpenCode-style `/connect`) and custom setup.
+                    if dispatch_custom_provider_key(&mut g, key, &cmd_tx) {
                         continue;
                     }
 
@@ -2136,112 +2209,6 @@ pub fn run_blocking(
                                 if g.onboarding_mode {
                                     g.validation_status = None; // Clear stale error on new input
                                 }
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-
-                    if g.custom_provider_setup_open() {
-                        match (key.code, key.modifiers) {
-                            (KeyCode::Esc, _) => {
-                                g.close_custom_provider_setup();
-                            }
-                            (KeyCode::Enter, _) => match g.custom_provider_setup_step() {
-                                CustomProviderSetupStep::Compatibility => {
-                                    *g.custom_provider_setup_step_mut().unwrap() =
-                                        CustomProviderSetupStep::BaseUrl;
-                                    g.custom_setup_input_mut().unwrap().clear();
-                                }
-                                CustomProviderSetupStep::BaseUrl => {
-                                    let t = g.custom_setup_input().trim();
-                                    if t.is_empty() {
-                                        g.push_error(
-                                                "[custom] enter a base URL (e.g. https://api.example.com)"
-                                                    .into(),
-                                            );
-                                    } else {
-                                        *g.custom_setup_base_url_mut().unwrap() = t.to_string();
-                                        g.custom_setup_input_mut().unwrap().clear();
-                                        *g.custom_provider_setup_step_mut().unwrap() =
-                                            CustomProviderSetupStep::ApiKey;
-                                    }
-                                }
-                                CustomProviderSetupStep::ApiKey => {
-                                    let t = g.custom_setup_input().trim();
-                                    if t.is_empty() {
-                                        g.push_error("[custom] API key is required".into());
-                                    } else {
-                                        *g.custom_setup_api_key_mut().unwrap() = t.to_string();
-                                        *g.custom_setup_input_mut().unwrap() =
-                                            g.custom_setup_model_hint().to_string();
-                                        if g.custom_setup_input().trim().is_empty() {
-                                            *g.custom_setup_input_mut().unwrap() =
-                                                "custom-model".into();
-                                        }
-                                        *g.custom_provider_setup_step_mut().unwrap() =
-                                            CustomProviderSetupStep::Model;
-                                    }
-                                }
-                                CustomProviderSetupStep::Model => {
-                                    let t = g.custom_setup_input().trim();
-                                    let model = if t.is_empty() {
-                                        "custom-model".to_string()
-                                    } else {
-                                        t.to_string()
-                                    };
-                                    let compatibility =
-                                        if *g.custom_setup_compat_index_mut().unwrap() == 0 {
-                                            ProviderCompatibility::OpenAi
-                                        } else {
-                                            ProviderCompatibility::Anthropic
-                                        };
-                                    let base_url = g.custom_setup_base_url().to_string();
-                                    let api_key = g.custom_setup_api_key().to_string();
-                                    g.close_custom_provider_setup();
-                                    drop(g);
-                                    let _ = cmd_tx.try_send(TuiCmd::ApplyCustomProviderSetup {
-                                        compatibility,
-                                        base_url,
-                                        api_key,
-                                        model,
-                                    });
-                                }
-                            },
-                            (KeyCode::Up, _)
-                                if matches!(
-                                    g.custom_provider_setup_step(),
-                                    CustomProviderSetupStep::Compatibility
-                                ) =>
-                            {
-                                *g.custom_setup_compat_index_mut().unwrap() =
-                                    g.custom_setup_compat_index().saturating_sub(1);
-                            }
-                            (KeyCode::Down, _)
-                                if matches!(
-                                    g.custom_provider_setup_step(),
-                                    CustomProviderSetupStep::Compatibility
-                                ) =>
-                            {
-                                if g.custom_setup_compat_index() < 1 {
-                                    *g.custom_setup_compat_index_mut().unwrap() += 1;
-                                }
-                            }
-                            (KeyCode::Backspace, _)
-                                if !matches!(
-                                    g.custom_provider_setup_step(),
-                                    CustomProviderSetupStep::Compatibility
-                                ) =>
-                            {
-                                g.custom_setup_input_mut().unwrap().pop();
-                            }
-                            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT)
-                                if !matches!(
-                                    g.custom_provider_setup_step(),
-                                    CustomProviderSetupStep::Compatibility
-                                ) =>
-                            {
-                                g.custom_setup_input_mut().unwrap().push(c);
                             }
                             _ => {}
                         }
@@ -2298,9 +2265,9 @@ pub fn run_blocking(
                                 if g.provider_picker_include_add_row()
                                     && *g.provider_picker_index_mut().unwrap() == n_builtin
                                 {
-                                    let hint = g.model.clone();
                                     g.close_provider_picker();
-                                    g.open_custom_provider_setup(hint);
+                                    drop(g);
+                                    let _ = cmd_tx.try_send(TuiCmd::ConfigureCustomProvider);
                                     continue;
                                 }
                                 let p =
@@ -3022,15 +2989,209 @@ mod approval_parse_tests {
     use super::{
         ApprovalShortcutAction, PrimaryInputMode, TuiCmd, apply_selected_at_completion,
         approval_shortcut_action, branch_picker_enter_command, composer_line,
-        delete_completed_at_mention, escape_cancels_active_turn, filter_slash_entries,
-        filtered_branch_indices, load_slash_entries, primary_input_mode,
+        delete_completed_at_mention, dispatch_custom_provider_key, escape_cancels_active_turn,
+        filter_slash_entries, filtered_branch_indices, load_slash_entries, primary_input_mode,
     };
     use crate::tui::composer::completed_at_mention_range_before_cursor;
-    use crate::tui::state::TuiSessionState;
+    use crate::tui::state::{CustomProviderSetupStep, TuiSessionState};
     use crate::tui::transcript::parse_approval_verdict;
-    use crossterm::event::{KeyCode, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use nca_common::config::CustomProviderConfig;
     use nca_common::event::BusyState;
     use std::path::PathBuf;
+    use tokio::sync::mpsc;
+
+    fn state() -> TuiSessionState {
+        TuiSessionState::new(
+            "session".into(),
+            "model".into(),
+            "@build".into(),
+            "AcceptEdits".into(),
+            PathBuf::from("/tmp"),
+        )
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn type_text(state: &mut TuiSessionState, tx: &mpsc::Sender<TuiCmd>, text: &str) {
+        for c in text.chars() {
+            assert!(dispatch_custom_provider_key(
+                state,
+                key(KeyCode::Char(c)),
+                tx
+            ));
+        }
+    }
+
+    fn clear_input(state: &mut TuiSessionState, tx: &mpsc::Sender<TuiCmd>) {
+        let count = state.custom_setup_input().chars().count();
+        for _ in 0..count {
+            assert!(dispatch_custom_provider_key(
+                state,
+                key(KeyCode::Backspace),
+                tx
+            ));
+        }
+    }
+
+    #[test]
+    fn production_event_loop_routes_onboarding_custom_selection() {
+        let mut state = state();
+        state.onboarding_mode = true;
+        state.open_connect_modal();
+        state.connect_search_mut().unwrap().push_str("custom");
+        let (tx, mut rx) = mpsc::channel(1);
+
+        assert!(dispatch_custom_provider_key(
+            &mut state,
+            key(KeyCode::Enter),
+            &tx
+        ));
+        assert!(!state.connect_modal_open());
+        assert!(matches!(rx.try_recv(), Ok(TuiCmd::ConfigureCustomProvider)));
+    }
+
+    #[test]
+    fn production_event_loop_routes_connect_custom_selection() {
+        let mut state = state();
+        state.open_connect_modal();
+        state.connect_search_mut().unwrap().push_str("custom");
+        let (tx, mut rx) = mpsc::channel(1);
+
+        assert!(dispatch_custom_provider_key(
+            &mut state,
+            key(KeyCode::Enter),
+            &tx
+        ));
+        assert!(matches!(rx.try_recv(), Ok(TuiCmd::ConfigureCustomProvider)));
+    }
+
+    #[test]
+    fn production_event_loop_routes_unconfigured_custom_setup_to_probe() {
+        let mut state = state();
+        state.open_custom_provider_setup("gateway-model");
+        let (tx, mut rx) = mpsc::channel(1);
+
+        assert!(dispatch_custom_provider_key(
+            &mut state,
+            key(KeyCode::Enter),
+            &tx
+        ));
+        assert_eq!(
+            state.custom_provider_setup_step(),
+            CustomProviderSetupStep::BaseUrl
+        );
+        type_text(&mut state, &tx, "https://gateway.example/v1");
+        assert!(dispatch_custom_provider_key(
+            &mut state,
+            key(KeyCode::Enter),
+            &tx
+        ));
+        clear_input(&mut state, &tx);
+        type_text(&mut state, &tx, "GATEWAY_API_KEY");
+        assert!(dispatch_custom_provider_key(
+            &mut state,
+            key(KeyCode::Tab),
+            &tx
+        ));
+        type_text(&mut state, &tx, "inline-secret");
+        assert!(dispatch_custom_provider_key(
+            &mut state,
+            key(KeyCode::Enter),
+            &tx
+        ));
+        assert_eq!(
+            state.custom_provider_setup_step(),
+            CustomProviderSetupStep::Model
+        );
+        assert!(dispatch_custom_provider_key(
+            &mut state,
+            key(KeyCode::Enter),
+            &tx
+        ));
+
+        assert_eq!(
+            state.custom_provider_setup_step(),
+            CustomProviderSetupStep::Probe
+        );
+        let command = rx.try_recv().expect("custom setup should emit a command");
+        assert!(matches!(
+            command,
+            TuiCmd::ApplyCustomProviderSetup {
+                base_url,
+                api_key_env,
+                api_key: Some(api_key),
+                model,
+                ..
+            } if base_url == "https://gateway.example"
+                && api_key_env == "GATEWAY_API_KEY"
+                && api_key == "inline-secret"
+                && model == "gateway-model"
+        ));
+    }
+
+    #[test]
+    fn production_event_loop_routes_configured_custom_edit_and_preserves_secret() {
+        let mut state = state();
+        state.open_custom_provider_setup_from_config(&CustomProviderConfig {
+            base_url: "https://configured.example/v1".into(),
+            api_key_env: "CONFIGURED_API_KEY".into(),
+            api_key: Some("existing-secret".into()),
+            model: "configured-model".into(),
+            ..Default::default()
+        });
+        let (tx, mut rx) = mpsc::channel(1);
+
+        assert_eq!(state.custom_setup_input(), "https://configured.example/v1");
+        assert!(state.custom_setup_api_key().is_empty());
+        assert!(dispatch_custom_provider_key(
+            &mut state,
+            key(KeyCode::Enter),
+            &tx
+        ));
+        clear_input(&mut state, &tx);
+        type_text(&mut state, &tx, "https://configured.example");
+        assert!(dispatch_custom_provider_key(
+            &mut state,
+            key(KeyCode::Enter),
+            &tx
+        ));
+        assert!(dispatch_custom_provider_key(
+            &mut state,
+            key(KeyCode::Enter),
+            &tx
+        ));
+        assert!(dispatch_custom_provider_key(
+            &mut state,
+            key(KeyCode::Enter),
+            &tx
+        ));
+        assert!(dispatch_custom_provider_key(
+            &mut state,
+            key(KeyCode::Enter),
+            &tx
+        ));
+
+        let command = rx.try_recv().expect("custom setup should emit a command");
+        assert!(matches!(
+            command,
+            TuiCmd::ApplyCustomProviderSetup {
+                base_url,
+                api_key_env,
+                api_key: None,
+                model,
+                ..
+            } if base_url == "https://configured.example"
+                && api_key_env == "CONFIGURED_API_KEY"
+                && model == "configured-model"
+        ));
+        assert_eq!(
+            state.custom_provider_setup_step(),
+            CustomProviderSetupStep::Probe
+        );
+    }
 
     #[test]
     fn parses_yes_with_punctuation_and_synonyms() {

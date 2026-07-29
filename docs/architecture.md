@@ -50,7 +50,7 @@ native-cli-ai/
 │   │       ├── lib.rs
 │   │       ├── pty.rs          # PtyManager: spawn, read, write, resize
 │   │       ├── process.rs      # SandboxedProcess: workspace-confined execution
-│   │       ├── ipc.rs          # IpcServer / IpcClient over Unix socket
+│   │       ├── ipc.rs          # IpcServer / IpcClient over Unix socket or Windows TCP
 │   │       ├── tmux.rs         # TmuxAdapter (Phase 3)
 │   │       └── session_store.rs # Persist / load sessions to disk
 │   │
@@ -118,7 +118,8 @@ flowchart LR
 - **`runtime::supervisor`**: Session lifecycle manager used by the CLI (`nca serve`, attach, spawn, etc.). Builds a `HarnessSnapshot` and refreshes the system prompt on create/resume/config and each turn.
 - **`runtime::session_store`**: Persist and load session JSON under `~/.local/share/ncacli/workspaces/<id>/sessions/`.
 - **`runtime::worktree`**: Isolated git worktree creation, cleanup, and merge per agent run.
-- **`runtime::bash_tool`**: PTY-backed bash execution, registered by the supervisor.
+- **`runtime::bash_tool`**: bounded shell-backed command execution, registered by the supervisor.
+  `runtime::pty::PtyManager` additionally provides portable interactive PTY sessions.
 
 ---
 
@@ -197,17 +198,23 @@ This keeps the current architecture simple: ripgrep remains the matcher, while t
 
 ## IPC and Event Bus
 
-The runtime exposes a Unix domain socket at `$XDG_RUNTIME_DIR/nca/<session-id>.sock` (or `/tmp/nca/` as fallback). Running sessions persist status, PID, and socket path in session metadata.
+The runtime exposes one newline-delimited JSON endpoint per session. Unix uses a domain socket at
+`$XDG_RUNTIME_DIR/nca/<session-id>.sock` (or the system temporary directory as fallback). Windows
+uses a loopback TCP endpoint selected by the operating system, with collision-safe allocation.
+Running sessions persist the actual endpoint in session metadata, so attach, cancel, and serve do
+not need to reconstruct a port from the session ID.
 
 ### Protocol
 
-- **Transport**: Unix stream socket, newline-delimited JSON.
+- **Transport**: Unix domain stream socket on Unix; loopback TCP on Windows. Both use newline-delimited JSON.
 - **Direction**: The runtime is the server. The CLI (e.g. `nca attach`) connects as a client.
 - **Messages**: Every `AgentEvent` from `common::event` is wrapped in `EventEnvelope` and serialized to all connected clients. Persisted logs and live IPC use the same machine-readable shape.
+- **Endpoint publication**: The server binds before publishing session metadata. Windows endpoints are
+  allocated with an ephemeral loopback port and are retried if the OS reports a bind collision.
 
 ```mermaid
 flowchart LR
-  CliProcess[cli] -->|"connect"| Socket["Unix socket"]
+  CliProcess[cli] -->|"connect"| Socket["Unix socket / loopback TCP"]
   Socket --> RuntimeServer[runtime::IpcServer]
   RuntimeServer -->|"broadcast events"| CliProcess
   CliProcess -->|"send commands"| RuntimeServer
@@ -257,12 +264,13 @@ pub enum AgentCommand {
 
 ### Sandboxed Bash
 
-`runtime::pty::PtyManager` wraps command execution to:
+`runtime::pty::PtyManager` provides both bounded shell-backed command execution and
+platform-native interactive PTY sessions. Its command-execution path:
 
-1. Spawn a shell in a PTY confined to the workspace root (via `chdir`).
+1. Spawn the platform's configured command shell confined to the workspace root (via `chdir`); interactive callers use `portable-pty` for a real PTY.
 2. Capture stdout/stderr as structured output.
 3. Enforce a timeout (default 30s, configurable).
-4. Kill the process on cancellation or timeout.
+4. Terminate the process using platform-native process APIs on cancellation or timeout.
 
 ### Permission Check Flow
 
