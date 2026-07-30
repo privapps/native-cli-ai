@@ -6,12 +6,440 @@ use nca_common::config::{
 };
 use nca_common::message::Message;
 use nca_common::tool::ToolDefinition;
+use reqwest::RequestBuilder;
 use reqwest::header::HeaderValue;
+use serde_json::Value;
 use std::time::Duration;
 
 use super::anthropic_compat::{anthropic_request_body, spawn_anthropic_stream};
 use super::openai_compat::{openai_request_body, spawn_openai_stream};
 use super::{Provider, ProviderError, StreamChunk};
+
+trait CustomProtocolAdapter: Sync {
+    fn protocol_name(&self) -> &'static str;
+
+    fn validate_api_key(&self, api_key: &str) -> Result<(), ProviderError>;
+
+    fn probe_request(
+        &self,
+        client: &reqwest::Client,
+        base_url: &str,
+        config: &CustomProviderConfig,
+        api_key: &str,
+    ) -> Result<RequestBuilder, ProviderError>;
+
+    fn validate_probe_response(&self, body: &str) -> Result<(), String>;
+
+    fn chat_request(
+        &self,
+        client: &reqwest::Client,
+        base_url: &str,
+        body: Value,
+        api_key: &str,
+    ) -> Result<RequestBuilder, ProviderError>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn chat_body(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        model: &str,
+        max_tokens: u32,
+        temperature: f32,
+        reasoning_effort: &str,
+        workspace_root: &Path,
+    ) -> Result<Value, ProviderError>;
+
+    fn spawn_stream(&self, response: reqwest::Response)
+    -> tokio::sync::mpsc::Receiver<StreamChunk>;
+
+    fn models_request(
+        &self,
+        client: &reqwest::Client,
+        base_url: &str,
+        api_key: &str,
+        cursor: Option<&str>,
+    ) -> Result<RequestBuilder, ProviderError>;
+
+    fn parse_models_page(&self, body: &str) -> Result<CustomModelsPage, String>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomModelCatalogEntry {
+    pub id: String,
+    pub context_window: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomModelsPage {
+    pub models: Vec<CustomModelCatalogEntry>,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustomCapabilityAdapter {
+    OpenAi,
+    Anthropic,
+}
+
+impl CustomCapabilityAdapter {
+    pub fn from_compatibility(compatibility: ProviderCompatibility) -> Self {
+        match compatibility {
+            ProviderCompatibility::OpenAi => Self::OpenAi,
+            ProviderCompatibility::Anthropic => Self::Anthropic,
+        }
+    }
+
+    fn protocol_adapter(self) -> &'static dyn CustomProtocolAdapter {
+        match self {
+            Self::OpenAi => &OPENAI_CUSTOM_ADAPTER,
+            Self::Anthropic => &ANTHROPIC_CUSTOM_ADAPTER,
+        }
+    }
+
+    pub fn models_request(
+        self,
+        client: &reqwest::Client,
+        base_url: &str,
+        api_key: &str,
+        cursor: Option<&str>,
+    ) -> Result<RequestBuilder, ProviderError> {
+        self.protocol_adapter()
+            .models_request(client, base_url, api_key, cursor)
+    }
+
+    pub fn parse_models_page(self, body: &str) -> Result<CustomModelsPage, String> {
+        self.protocol_adapter().parse_models_page(body)
+    }
+}
+
+struct OpenAiCustomAdapter;
+
+static OPENAI_CUSTOM_ADAPTER: OpenAiCustomAdapter = OpenAiCustomAdapter;
+
+impl CustomProtocolAdapter for OpenAiCustomAdapter {
+    fn protocol_name(&self) -> &'static str {
+        "OpenAI-compatible"
+    }
+
+    fn validate_api_key(&self, api_key: &str) -> Result<(), ProviderError> {
+        HeaderValue::from_str(&format!("Bearer {api_key}"))
+            .map(|_| ())
+            .map_err(|error| {
+                ProviderError::Configuration(sanitize_provider_error(
+                    &format!("failed to build Custom provider authorization header: {error}"),
+                    api_key,
+                ))
+            })
+    }
+
+    fn probe_request(
+        &self,
+        client: &reqwest::Client,
+        base_url: &str,
+        _config: &CustomProviderConfig,
+        api_key: &str,
+    ) -> Result<RequestBuilder, ProviderError> {
+        self.validate_api_key(api_key)?;
+        Ok(client
+            .get(custom_provider_endpoint(base_url, "models"))
+            .bearer_auth(api_key))
+    }
+
+    fn validate_probe_response(&self, body: &str) -> Result<(), String> {
+        let value: Value = serde_json::from_str(body)
+            .map_err(|error| format!("response is not valid JSON ({error})"))?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| "response must be a JSON object".to_string())?;
+        let data = object
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "response must contain a data array".to_string())?;
+
+        for (index, model) in data.iter().enumerate() {
+            if !model.is_object() {
+                return Err(format!("data[{index}] must be a JSON object"));
+            }
+            if model.get("id").and_then(Value::as_str).is_none() {
+                return Err(format!("data[{index}] must contain a string id"));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn chat_request(
+        &self,
+        client: &reqwest::Client,
+        base_url: &str,
+        body: Value,
+        api_key: &str,
+    ) -> Result<RequestBuilder, ProviderError> {
+        self.validate_api_key(api_key)?;
+        Ok(client
+            .post(custom_provider_endpoint(base_url, "chat/completions"))
+            .bearer_auth(api_key)
+            .json(&body))
+    }
+
+    fn chat_body(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        model: &str,
+        max_tokens: u32,
+        temperature: f32,
+        reasoning_effort: &str,
+        workspace_root: &Path,
+    ) -> Result<Value, ProviderError> {
+        openai_request_body(
+            messages,
+            tools,
+            model,
+            max_tokens,
+            temperature,
+            reasoning_effort,
+            workspace_root,
+        )
+    }
+
+    fn spawn_stream(
+        &self,
+        response: reqwest::Response,
+    ) -> tokio::sync::mpsc::Receiver<StreamChunk> {
+        spawn_openai_stream(response, "custom")
+    }
+
+    fn models_request(
+        &self,
+        client: &reqwest::Client,
+        base_url: &str,
+        api_key: &str,
+        _cursor: Option<&str>,
+    ) -> Result<RequestBuilder, ProviderError> {
+        self.validate_api_key(api_key)?;
+        Ok(client
+            .get(custom_provider_endpoint(base_url, "models"))
+            .bearer_auth(api_key))
+    }
+
+    fn parse_models_page(&self, body: &str) -> Result<CustomModelsPage, String> {
+        let value: Value = serde_json::from_str(body)
+            .map_err(|error| format!("response is not valid JSON ({error})"))?;
+        let data = value
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "response must contain a data array".to_string())?;
+        let models: Vec<CustomModelCatalogEntry> = data
+            .iter()
+            .filter_map(|model| {
+                let object = model.as_object()?;
+                let id = object
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty())?;
+                Some(CustomModelCatalogEntry {
+                    id: id.to_string(),
+                    context_window: object.get("context_window").and_then(Value::as_u64),
+                })
+            })
+            .collect();
+        Ok(CustomModelsPage {
+            models,
+            has_more: false,
+            next_cursor: None,
+        })
+    }
+}
+
+struct AnthropicCustomAdapter;
+
+static ANTHROPIC_CUSTOM_ADAPTER: AnthropicCustomAdapter = AnthropicCustomAdapter;
+
+impl CustomProtocolAdapter for AnthropicCustomAdapter {
+    fn protocol_name(&self) -> &'static str {
+        "Anthropic-compatible"
+    }
+
+    fn validate_api_key(&self, api_key: &str) -> Result<(), ProviderError> {
+        HeaderValue::from_str(api_key).map(|_| ()).map_err(|error| {
+            ProviderError::Configuration(sanitize_provider_error(
+                &format!("failed to build Custom provider x-api-key header: {error}"),
+                api_key,
+            ))
+        })
+    }
+
+    fn probe_request(
+        &self,
+        client: &reqwest::Client,
+        base_url: &str,
+        config: &CustomProviderConfig,
+        api_key: &str,
+    ) -> Result<RequestBuilder, ProviderError> {
+        self.validate_api_key(api_key)?;
+        Ok(client
+            .post(custom_provider_endpoint(base_url, "messages"))
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&serde_json::json!({
+                "model": config.model,
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "ping"}],
+            })))
+    }
+
+    fn validate_probe_response(&self, body: &str) -> Result<(), String> {
+        let value: Value = serde_json::from_str(body)
+            .map_err(|error| format!("response is not valid JSON ({error})"))?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| "response must be a JSON object".to_string())?;
+
+        if object.get("id").and_then(Value::as_str).is_none() {
+            return Err("response must contain a string id".to_string());
+        }
+        if object.get("type").and_then(Value::as_str) != Some("message") {
+            return Err("response type must be message".to_string());
+        }
+        if object.get("role").and_then(Value::as_str) != Some("assistant") {
+            return Err("response role must be assistant".to_string());
+        }
+        if object.get("model").and_then(Value::as_str).is_none() {
+            return Err("response must contain a string model".to_string());
+        }
+        if !object.get("content").is_some_and(Value::is_array) {
+            return Err("response must contain a content array".to_string());
+        }
+        if !object
+            .get("stop_reason")
+            .is_some_and(|value| value.is_null() || value.is_string())
+        {
+            return Err("response must contain a nullable stop_reason".to_string());
+        }
+        if !object
+            .get("stop_sequence")
+            .is_some_and(|value| value.is_null() || value.is_string())
+        {
+            return Err("response must contain a nullable stop_sequence".to_string());
+        }
+
+        let usage = object
+            .get("usage")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "response must contain a usage object".to_string())?;
+        if usage.get("input_tokens").and_then(Value::as_u64).is_none()
+            || usage.get("output_tokens").and_then(Value::as_u64).is_none()
+        {
+            return Err("usage must contain numeric input_tokens and output_tokens".to_string());
+        }
+
+        Ok(())
+    }
+
+    fn chat_request(
+        &self,
+        client: &reqwest::Client,
+        base_url: &str,
+        body: Value,
+        api_key: &str,
+    ) -> Result<RequestBuilder, ProviderError> {
+        self.validate_api_key(api_key)?;
+        Ok(client
+            .post(custom_provider_endpoint(base_url, "messages"))
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&body))
+    }
+
+    fn chat_body(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        model: &str,
+        max_tokens: u32,
+        temperature: f32,
+        _reasoning_effort: &str,
+        workspace_root: &Path,
+    ) -> Result<Value, ProviderError> {
+        anthropic_request_body(
+            messages,
+            tools,
+            model,
+            max_tokens,
+            temperature,
+            workspace_root,
+        )
+    }
+
+    fn spawn_stream(
+        &self,
+        response: reqwest::Response,
+    ) -> tokio::sync::mpsc::Receiver<StreamChunk> {
+        spawn_anthropic_stream(response, "custom")
+    }
+
+    fn models_request(
+        &self,
+        client: &reqwest::Client,
+        base_url: &str,
+        api_key: &str,
+        cursor: Option<&str>,
+    ) -> Result<RequestBuilder, ProviderError> {
+        self.validate_api_key(api_key)?;
+        let mut url = format!("{}?limit=100", custom_provider_endpoint(base_url, "models"));
+        if let Some(cursor) = cursor {
+            url.push_str("&after_id=");
+            url.push_str(cursor);
+        }
+        Ok(client
+            .get(url)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01"))
+    }
+
+    fn parse_models_page(&self, body: &str) -> Result<CustomModelsPage, String> {
+        let value: Value = serde_json::from_str(body)
+            .map_err(|error| format!("response is not valid JSON ({error})"))?;
+        let data = value
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "response must contain a data array".to_string())?;
+        let models: Vec<CustomModelCatalogEntry> = data
+            .iter()
+            .filter_map(|model| {
+                let object = model.as_object()?;
+                let id = object
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty())?;
+                Some(CustomModelCatalogEntry {
+                    id: id.to_string(),
+                    context_window: object.get("max_input_tokens").and_then(Value::as_u64),
+                })
+            })
+            .collect();
+        let has_more = value
+            .get("has_more")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let next_cursor = models.last().map(|model| model.id.clone());
+        Ok(CustomModelsPage {
+            models,
+            has_more,
+            next_cursor,
+        })
+    }
+}
+
+fn custom_adapter(compatibility: ProviderCompatibility) -> &'static dyn CustomProtocolAdapter {
+    match compatibility {
+        ProviderCompatibility::OpenAi => &OPENAI_CUSTOM_ADAPTER,
+        ProviderCompatibility::Anthropic => &ANTHROPIC_CUSTOM_ADAPTER,
+    }
+}
 
 pub struct CustomProvider {
     client: reqwest::Client,
@@ -38,22 +466,7 @@ impl CustomProvider {
             ));
         }
 
-        match custom.compatibility {
-            ProviderCompatibility::OpenAi => {
-                HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|err| {
-                    ProviderError::Configuration(format!(
-                        "failed to build Custom provider authorization header: {err}"
-                    ))
-                })?;
-            }
-            ProviderCompatibility::Anthropic => {
-                HeaderValue::from_str(&api_key).map_err(|err| {
-                    ProviderError::Configuration(format!(
-                        "failed to build Custom provider x-api-key header: {err}"
-                    ))
-                })?;
-            }
-        }
+        custom_adapter(custom.compatibility).validate_api_key(&api_key)?;
 
         let client = reqwest::Client::builder().build().map_err(|err| {
             ProviderError::Configuration(format!("failed to build HTTP client: {err}"))
@@ -65,17 +478,6 @@ impl CustomProvider {
             max_tokens: config.model.max_tokens,
             reasoning_effort: config.model.reasoning_effort.clone(),
         })
-    }
-
-    fn endpoint(&self) -> String {
-        match self.config.compatibility {
-            ProviderCompatibility::OpenAi => {
-                custom_provider_endpoint(&self.config.base_url, "chat/completions")
-            }
-            ProviderCompatibility::Anthropic => {
-                custom_provider_endpoint(&self.config.base_url, "messages")
-            }
-        }
     }
 }
 
@@ -99,39 +501,41 @@ pub async fn probe_custom_provider(config: &CustomProviderConfig) -> Result<(), 
         .map_err(|error| {
             ProviderError::Configuration(format!("failed to build probe client: {error}"))
         })?;
-    let response = match config.compatibility {
-        ProviderCompatibility::OpenAi => {
-            client
-                .get(custom_provider_endpoint(&base_url, "models"))
-                .bearer_auth(&api_key)
-                .send()
-                .await
-        }
-        ProviderCompatibility::Anthropic => {
-            client
-                .post(custom_provider_endpoint(&base_url, "messages"))
-                .header("x-api-key", &api_key)
-                .header("anthropic-version", "2023-06-01")
-                .json(&serde_json::json!({
-                    "model": config.model,
-                    "max_tokens": 1,
-                    "messages": [{"role": "user", "content": "ping"}],
-                }))
-                .send()
-                .await
-        }
-    }
-    .map_err(|error| {
-        ProviderError::RequestFailed(sanitize_provider_error(&error.to_string(), &api_key))
-    })?;
-
-    if response.status().is_success() {
-        return Ok(());
-    }
+    let adapter = custom_adapter(config.compatibility);
+    let response = adapter
+        .probe_request(&client, &base_url, config, &api_key)?
+        .send()
+        .await
+        .map_err(|error| request_failed(&error.to_string(), &api_key))?;
 
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| request_failed(&error.to_string(), &api_key))?;
+    if status.is_success() {
+        return adapter.validate_probe_response(&body).map_err(|reason| {
+            malformed_probe_error(adapter.protocol_name(), &body, reason, &api_key)
+        });
+    }
+
     Err(map_custom_provider_error(status, body, &api_key))
+}
+
+fn request_failed(message: &str, api_key: &str) -> ProviderError {
+    ProviderError::RequestFailed(sanitize_provider_error(message, api_key))
+}
+
+fn malformed_probe_error(
+    protocol: &str,
+    body: &str,
+    reason: String,
+    api_key: &str,
+) -> ProviderError {
+    let body = sanitize_provider_error(body, api_key);
+    ProviderError::RequestFailed(format!(
+        "custom {protocol} probe returned a malformed successful response: {reason}; body: {body}"
+    ))
 }
 
 fn map_custom_provider_error(
@@ -180,64 +584,32 @@ impl Provider for CustomProvider {
             model.to_string()
         };
 
-        match self.config.compatibility {
-            ProviderCompatibility::OpenAi => {
-                let body = openai_request_body(
-                    messages,
-                    tools,
-                    &model,
-                    self.max_tokens,
-                    self.config.temperature,
-                    &self.reasoning_effort,
-                    workspace_root,
-                )?;
+        let adapter = custom_adapter(self.config.compatibility);
+        let body = adapter.chat_body(
+            messages,
+            tools,
+            &model,
+            self.max_tokens,
+            self.config.temperature,
+            &self.reasoning_effort,
+            workspace_root,
+        )?;
+        let response = adapter
+            .chat_request(&self.client, &self.config.base_url, body, &api_key)?
+            .send()
+            .await
+            .map_err(|error| request_failed(&error.to_string(), &api_key))?;
 
-                let response = self
-                    .client
-                    .post(self.endpoint())
-                    .bearer_auth(&api_key)
-                    .json(&body)
-                    .send()
-                    .await
-                    .map_err(|err| ProviderError::RequestFailed(err.to_string()))?;
-
-                let status = response.status();
-                if !status.is_success() {
-                    let body_text = response.text().await.unwrap_or_default();
-                    return Err(map_custom_provider_error(status, body_text, &api_key));
-                }
-
-                Ok(spawn_openai_stream(response, "custom"))
-            }
-            ProviderCompatibility::Anthropic => {
-                let body = anthropic_request_body(
-                    messages,
-                    tools,
-                    &model,
-                    self.max_tokens,
-                    self.config.temperature,
-                    workspace_root,
-                )?;
-
-                let response = self
-                    .client
-                    .post(self.endpoint())
-                    .header("x-api-key", &api_key)
-                    .header("anthropic-version", "2023-06-01")
-                    .json(&body)
-                    .send()
-                    .await
-                    .map_err(|err| ProviderError::RequestFailed(err.to_string()))?;
-
-                let status = response.status();
-                if !status.is_success() {
-                    let body_text = response.text().await.unwrap_or_default();
-                    return Err(map_custom_provider_error(status, body_text, &api_key));
-                }
-
-                Ok(spawn_anthropic_stream(response, "custom"))
-            }
+        let status = response.status();
+        if !status.is_success() {
+            let body_text = response
+                .text()
+                .await
+                .map_err(|error| request_failed(&error.to_string(), &api_key))?;
+            return Err(map_custom_provider_error(status, body_text, &api_key));
         }
+
+        Ok(adapter.spawn_stream(response))
     }
 }
 
@@ -269,8 +641,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openai_probe_accepts_an_empty_model_collection() {
+        let (base_url, request_rx) = spawn_probe_server(200, r#"{"data":[]}"#);
+        let config = custom_config(ProviderCompatibility::OpenAi, &base_url, "probe-secret");
+
+        probe_custom_provider(&config)
+            .await
+            .expect("empty model collection is a valid probe response");
+
+        let request = request_rx.recv().expect("probe request");
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.url, "/v1/models");
+    }
+
+    #[tokio::test]
     async fn anthropic_probe_preserves_versioned_path_prefix_and_sends_required_headers() {
-        let (base_url, request_rx) = spawn_probe_server(200, r#"{"id":"msg_1"}"#);
+        let (base_url, request_rx) = spawn_probe_server(200, valid_anthropic_probe_response());
         let prefixed_base_url = format!("{base_url}/zen/v1");
         let config = custom_config(
             ProviderCompatibility::Anthropic,
@@ -289,6 +675,43 @@ mod tests {
         assert_eq!(request.anthropic_version.as_deref(), Some("2023-06-01"));
         assert!(request.body.contains("\"messages\""));
         assert!(request.body.contains("\"max_tokens\""));
+    }
+
+    #[tokio::test]
+    async fn successful_probe_bodies_must_match_the_selected_protocol() {
+        let cases = [
+            (
+                ProviderCompatibility::OpenAi,
+                "<html>gateway probe-secret failure</html>",
+            ),
+            (ProviderCompatibility::OpenAi, r#"{"data":"not-an-array"}"#),
+            (ProviderCompatibility::OpenAi, r#"{"data":"#),
+            (ProviderCompatibility::OpenAi, r#"{"type":"message"}"#),
+            (
+                ProviderCompatibility::Anthropic,
+                "<html>gateway probe-secret failure</html>",
+            ),
+            (ProviderCompatibility::Anthropic, r#"{"type":"message"#),
+            (ProviderCompatibility::Anthropic, r#"{"type":"message"}"#),
+            (ProviderCompatibility::Anthropic, r#"{"data":[]}"#),
+        ];
+
+        for (compatibility, response_body) in cases {
+            let (base_url, request_rx) = spawn_probe_server(200, response_body);
+            let config = custom_config(compatibility, &base_url, "probe-secret");
+            let error = probe_custom_provider(&config)
+                .await
+                .expect_err("malformed successful response is rejected");
+            let message = error.to_string();
+
+            assert!(
+                matches!(&error, ProviderError::RequestFailed(_)),
+                "expected retryable failure, got {error:?}"
+            );
+            assert!(message.contains("malformed successful response"));
+            assert!(!message.contains("probe-secret"));
+            let _ = request_rx.recv().expect("probe request");
+        }
     }
 
     #[tokio::test]
@@ -388,6 +811,19 @@ mod tests {
             temperature: 0.7,
             compatibility,
         }
+    }
+
+    fn valid_anthropic_probe_response() -> &'static str {
+        r#"{
+            "id":"msg_1",
+            "type":"message",
+            "role":"assistant",
+            "model":"gateway-model",
+            "content":[{"type":"text","text":"pong"}],
+            "stop_reason":"end_turn",
+            "stop_sequence":null,
+            "usage":{"input_tokens":1,"output_tokens":1}
+        }"#
     }
 
     #[derive(Debug)]

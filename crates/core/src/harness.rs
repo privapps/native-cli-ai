@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::NaiveDate;
 use nca_common::config::{NcaConfig, PermissionMode};
 use nca_common::session::OrchestrationContext;
 use nca_common::todo::AgentTodo;
@@ -38,9 +38,7 @@ Safety, privacy, and trust:
 Truthfulness and communication:
 - Distinguish facts, inferences, and suggestions. When browsing, identify sources and do not fabricate references or certainty.
 - Use web tools when freshness, source verification, or external facts matter; otherwise answer directly and disclose when information may be outdated.
-- For date-sensitive research, use the provided as-of timestamp as the hard temporal boundary. Treat “latest” as the newest officially published, completed reporting period available by that timestamp, never as the largest year mentioned by a source.
-- Keep calendar years, fiscal years, quarters, annual reports, earnings releases, filings, guidance, estimates, and run rates distinct. Never present an incomplete, future, estimated, or unpublished period as reported actuals.
-- Before finalizing a financial report, gather authoritative source evidence, validate the reporting period, and include the as-of date, period type, period end, publication status, and source URLs. If validation is unavailable, say that the result is unverified.
+- For date-sensitive research, use the provided UTC calendar date as the hard temporal boundary and disclose when freshness matters.
 - Use requested output formats exactly. Keep JSON and NDJSON output machine-readable without conversational wrappers.
 - For long-running actions, report meaningful milestones and distinguish completed, failed, and unverified work. Preserve safe partial results and surface blockers promptly.
 "#;
@@ -50,7 +48,6 @@ const TOOL_PLAYBOOK: &str = r#"Tool and execution guidance:
 - Validate important results with tests, checks, source review, or other concrete signals before claiming success.
 - Empty provider completions or obviously invalid provider/tool outputs must fail loudly instead of being treated as success.
 - When the runtime provides descriptions or contents for user attachments, use those directly. Do not invent access paths or use `fetch_url` for session attachment paths or `file:` URLs.
-- For a latest financial-report request, use `web_search` or `fetch_url` for authoritative evidence and pass the issuer name (and the harness `as_of` assertion when using `web_search`), then call `resolve_latest_financial_report` with `latest`, `annual`, or `quarterly` according to the user's cadence. Treat a `fallback` resolution and its limitation as required disclosure; never relabel a quarterly fallback as annual.
 - When structured user choices are needed, use `ask_question` with clear options and always set `suggested_answer`. Ask one question per tool call.
 - For multi-step work, keep an explicit session todo list via `update_todos`; replace the full list each call and keep at most one item `in_progress`.
 - Headless runs must behave predictably. Treat orchestration metadata as coordination context only, do not assume callbacks or external services exist unless provided, and fail clearly if required approval is unavailable.
@@ -68,7 +65,7 @@ pub struct HarnessMemoryNote {
 #[derive(Debug, Clone, Default)]
 pub struct HarnessSnapshot {
     pub workspace_root: PathBuf,
-    pub as_of: DateTime<Utc>,
+    pub as_of: NaiveDate,
     pub cwd_display: String,
     pub git_branch: Option<String>,
     pub model: String,
@@ -190,7 +187,7 @@ fn environment_section(snapshot: &HarnessSnapshot) -> Option<String> {
         "Available Context:".to_string(),
         "- These facts are contextual only; they do not imply a repository task or grant authority."
             .to_string(),
-        format!("- as_of: {}", snapshot.as_of.to_rfc3339()),
+        format!("- as_of: {}", snapshot.as_of),
     ];
     if !snapshot.cwd_display.is_empty() {
         lines.push(format!("- cwd: {}", snapshot.cwd_display));
@@ -352,7 +349,10 @@ mod tests {
     fn empty_snapshot(workspace: &Path) -> HarnessSnapshot {
         HarnessSnapshot {
             workspace_root: workspace.to_path_buf(),
-            as_of: Utc.with_ymd_and_hms(2026, 7, 29, 12, 0, 0).unwrap(),
+            as_of: chrono::Utc
+                .with_ymd_and_hms(2026, 7, 29, 12, 0, 0)
+                .unwrap()
+                .date_naive(),
             cwd_display: workspace.display().to_string(),
             git_branch: Some("main".into()),
             model: "MiniMax-M2.5".into(),
@@ -377,8 +377,8 @@ mod tests {
         assert!(prompt.contains("Treat the active workspace as the default scope"));
         assert!(prompt.contains("Empty provider completions"));
         assert!(prompt.contains("current user request"));
-        assert!(prompt.contains("as_of: 2026-07-29T12:00:00+00:00"));
-        assert!(prompt.contains("newest officially published, completed reporting period"));
+        assert!(prompt.contains("as_of: 2026-07-29"));
+        assert!(prompt.contains("UTC calendar date as the hard temporal boundary"));
         assert!(!prompt.contains("native Rust coding assistant"));
         assert!(!prompt.contains("default operator for this repository"));
         assert!(!prompt.contains("Rust-native only"));

@@ -5,11 +5,14 @@ use crate::tools::RecentSkillHints;
 use crate::tools::ToolExecutor;
 use nca_common::tool::{ToolCall, ToolDefinition, ToolResult};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub struct InvokeSkillTool {
     workspace_root: PathBuf,
     skill_directories: Vec<PathBuf>,
     recent_skills: RecentSkillHints,
+    financial_research_capability: Option<Arc<AtomicBool>>,
 }
 
 impl InvokeSkillTool {
@@ -22,7 +25,19 @@ impl InvokeSkillTool {
             workspace_root,
             skill_directories,
             recent_skills,
+            financial_research_capability: None,
         }
+    }
+
+    pub fn new_with_financial_capability(
+        workspace_root: PathBuf,
+        skill_directories: Vec<PathBuf>,
+        recent_skills: RecentSkillHints,
+        capability: Arc<AtomicBool>,
+    ) -> Self {
+        let mut tool = Self::new(workspace_root, skill_directories, recent_skills);
+        tool.financial_research_capability = Some(capability);
+        tool
     }
 }
 
@@ -79,6 +94,11 @@ impl ToolExecutor for InvokeSkillTool {
         if let Some(skill) = skills.iter().find(|s| s.command == skill_name) {
             let body = skill.expanded_body();
             self.recent_skills.record(&skill.command);
+            if skill.command == "financial-research"
+                && let Some(capability) = &self.financial_research_capability
+            {
+                capability.store(true, Ordering::Release);
+            }
             ToolResult {
                 call_id: call.id.clone(),
                 success: true,

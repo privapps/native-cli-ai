@@ -1123,6 +1123,62 @@ impl ProviderConfig {
         }
     }
 
+    /// Resolve the common settings used by provider capability consumers.
+    ///
+    /// The resolved credential is intentionally kept out of `Debug` output;
+    /// callers should use `credential_present` when they only need readiness.
+    pub fn active_settings(&self) -> ResolvedProviderSettings {
+        self.settings_for(self.default)
+    }
+
+    pub fn settings_for(&self, provider: ProviderKind) -> ResolvedProviderSettings {
+        let (model, base_url, api_key_env, credential, compatibility) = match provider {
+            ProviderKind::MiniMax => (
+                self.minimax.model.clone(),
+                self.minimax.base_url.clone(),
+                self.minimax.api_key_env.clone(),
+                self.minimax.resolve_api_key(),
+                None,
+            ),
+            ProviderKind::OpenRouter => (
+                self.openrouter.model.clone(),
+                self.openrouter.base_url.clone(),
+                self.openrouter.api_key_env.clone(),
+                self.openrouter.resolve_api_key(),
+                None,
+            ),
+            ProviderKind::Anthropic => (
+                self.anthropic.model.clone(),
+                self.anthropic.base_url.clone(),
+                self.anthropic.api_key_env.clone(),
+                self.anthropic.resolve_api_key(),
+                Some(ProviderCompatibility::Anthropic),
+            ),
+            ProviderKind::OpenAi => (
+                self.openai.model.clone(),
+                self.openai.base_url.clone(),
+                self.openai.api_key_env.clone(),
+                self.openai.resolve_api_key(),
+                Some(ProviderCompatibility::OpenAi),
+            ),
+            ProviderKind::Custom => (
+                self.custom.model.clone(),
+                self.custom.base_url.clone(),
+                self.custom.api_key_env.clone(),
+                self.custom.resolve_api_key(),
+                Some(self.custom.compatibility),
+            ),
+        };
+        ResolvedProviderSettings {
+            provider,
+            compatibility,
+            model,
+            base_url,
+            api_key_env,
+            credential,
+        }
+    }
+
     pub fn set_model_for_default(&mut self, model: impl Into<String>) {
         self.set_model_for(self.default, model);
     }
@@ -1187,6 +1243,43 @@ impl ProviderConfig {
     }
 }
 
+#[derive(Clone)]
+pub struct ResolvedProviderSettings {
+    pub provider: ProviderKind,
+    pub compatibility: Option<ProviderCompatibility>,
+    pub model: String,
+    pub base_url: String,
+    pub api_key_env: String,
+    pub credential: Option<String>,
+}
+
+impl ResolvedProviderSettings {
+    pub fn credential_present(&self) -> bool {
+        self.credential
+            .as_deref()
+            .is_some_and(|credential| !credential.is_empty())
+    }
+
+    pub fn credential(&self) -> Option<&str> {
+        self.credential
+            .as_deref()
+            .filter(|credential| !credential.is_empty())
+    }
+
+    pub fn can_query_catalog(&self) -> bool {
+        self.provider == ProviderKind::OpenRouter || self.credential_present()
+    }
+
+    /// Return the URL form shared by provider capability lookups.
+    pub fn normalized_base_url(&self) -> Option<String> {
+        if self.provider == ProviderKind::Custom {
+            normalize_custom_provider_base_url(&self.base_url).ok()
+        } else {
+            Some(self.base_url.trim_end_matches('/').to_string())
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderKind {
@@ -1205,6 +1298,57 @@ impl ProviderKind {
         ProviderKind::OpenRouter,
         ProviderKind::Custom,
     ];
+
+    /// Compile-time checklist for provider settings and model capabilities.
+    ///
+    /// This exhaustive match is intentionally kept at the shared provider
+    /// seam: adding a provider requires declaring how every capability is
+    /// wired before the workspace can compile.
+    pub const fn capability_support(self) -> ProviderCapabilitySupport {
+        match self {
+            Self::MiniMax => ProviderCapabilitySupport {
+                provider: Self::MiniMax,
+                settings: true,
+                model_catalog: true,
+                context_window: true,
+            },
+            Self::OpenAi => ProviderCapabilitySupport {
+                provider: Self::OpenAi,
+                settings: true,
+                model_catalog: true,
+                context_window: true,
+            },
+            Self::Anthropic => ProviderCapabilitySupport {
+                provider: Self::Anthropic,
+                settings: true,
+                model_catalog: true,
+                context_window: true,
+            },
+            Self::OpenRouter => ProviderCapabilitySupport {
+                provider: Self::OpenRouter,
+                settings: true,
+                model_catalog: true,
+                context_window: true,
+            },
+            Self::Custom => ProviderCapabilitySupport {
+                provider: Self::Custom,
+                settings: true,
+                model_catalog: true,
+                context_window: true,
+            },
+        }
+    }
+
+    pub const fn is(self, other: Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::MiniMax, Self::MiniMax)
+                | (Self::OpenAi, Self::OpenAi)
+                | (Self::Anthropic, Self::Anthropic)
+                | (Self::OpenRouter, Self::OpenRouter)
+                | (Self::Custom, Self::Custom)
+        )
+    }
 
     /// Parse user/CLI input (slash commands, TUI pickers).
     pub fn from_cli_name(value: &str) -> Option<Self> {
@@ -1245,6 +1389,14 @@ impl ProviderKind {
             .into_iter()
             .find(|k| k.display_name().eq_ignore_ascii_case(t))
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderCapabilitySupport {
+    pub provider: ProviderKind,
+    pub settings: bool,
+    pub model_catalog: bool,
+    pub context_window: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -2326,6 +2478,7 @@ fn resolve_api_key_value(inline: &Option<String>, env_name: &str) -> Option<Stri
 
 fn default_skill_directories() -> Vec<PathBuf> {
     let mut dirs = vec![
+        PathBuf::from("skills"),
         PathBuf::from(".nca/skills"),
         PathBuf::from(".claude/skills"),
     ];
@@ -2339,6 +2492,7 @@ fn default_skill_directories() -> Vec<PathBuf> {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 

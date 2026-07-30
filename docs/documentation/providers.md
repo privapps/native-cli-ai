@@ -211,6 +211,14 @@ The TUI performs the cheap protocol-specific probe before activation. Malformed 
 
 Model discovery is best-effort: OpenAI-compatible endpoints use `<base path>/models` with Bearer authentication, and Anthropic-compatible endpoints use the paginated `<base path>/models` API with Anthropic headers. A failed discovery request does not prevent a manually entered model ID from being used.
 
+Provider capabilities are dispatched through one runtime seam. Settings access (selected model,
+base URL, API-key environment name, and credential presence) is centralized, while model catalogs
+and context-window lookups use protocol-aware capability adapters. Custom OpenAI and Anthropic
+compatibilities select their matching adapter, preserving path prefixes and authentication. Cache
+identity includes provider, normalized endpoint, compatibility, model where relevant, and a
+non-reversible credential tag; raw credentials are never logged or cached. Remote failures and
+missing credentials retain the static context-limit or empty-catalog fallback.
+
 ### Persistence
 
 - First-run onboarding saves the selected Custom provider fields, default-provider selection, and onboarding-completed flag to the global config (`~/.local/share/ncacli/config.toml`, subject to the product-home overrides).

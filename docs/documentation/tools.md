@@ -19,6 +19,7 @@ These tools are always available, including in [safe mode](./permissions.md).
 | `fetch_url` | Fetch and extract text content from a URL, retaining source and publication metadata |
 | `resolve_latest_financial_report` | Resolve the newest eligible observed result for an issuer and cadence, with explicit fallback status and limitations |
 | `validate_financial_report` | Validate a reported financial-period candidate against the current as-of boundary and observed official evidence |
+| `write_validated_financial_report` | Persist a report only when the current turn has a validated official report and complete verification metadata |
 
 ### Write Tools
 
@@ -129,9 +130,9 @@ Search the public web and return titles, URLs, snippets, and provenance metadata
 - `limit` (int, optional) — Number of results (1–10, default from config)
 - `domains` (array of strings, optional) — Domains to add as search hints, such as an issuer investor-relations site or `sec.gov`
 - `issuer` (string, optional) — Issuer name to bind inferred report metadata to the requested company
-- `as_of` (RFC3339 string, optional) — Must match the runtime research boundary when supplied
+- `as_of` is supplied by the runtime turn context and is not a caller-controlled field
 
-**Behavior:** HTTP GET to DuckDuckGo HTML search. Results are returned as JSON with the query, research `as_of` timestamp, retrieval timestamp, URL, source authority, available publication timestamp, inferred report metadata when the result exposes it, and an `eligible_as_of` flag. Unknown publication or report metadata remains `null`; it is never inferred from search order. The upstream search response is not assumed to support an exact timestamp filter; the resolver applies the hard boundary deterministically.
+**Behavior:** HTTP GET to DuckDuckGo HTML search. Results are returned as JSON with the query, date-only UTC turn `as_of`, retrieval timestamp, URL, source authority, available publication metadata, and an `eligible_as_of` flag. Unknown metadata remains `null`; the upstream search response is not assumed to support an exact date filter.
 
 ---
 
@@ -143,21 +144,23 @@ Fetch and normalize the text content of a URL while preserving provenance.
 - `url` (string, required) — The URL to fetch
 - `issuer` (string, optional) — Issuer name to require in the fetched evidence for financial-report resolution
 
-**Behavior:** Makes an HTTP GET request, records the final URL, response status, retrieval timestamp, HTTP `Date` header when present, source authority, and common publication/report metadata, then strips HTML to text content and truncates to `max_fetch_chars` (default 25,000 characters). The result is JSON containing `source` metadata and normalized `content`; missing metadata remains `null`. When `issuer` is supplied, metadata is recorded only if the normalized page visibly names that issuer.
+**Behavior:** Makes an HTTP GET request, records the final URL, response status, retrieval timestamp, HTTP `Date` header when present, source authority, and common publication/report metadata, then strips HTML to text content and truncates to `max_fetch_chars` (default 25,000 characters). The result is JSON containing `source` metadata and normalized `content`; `source.as_of` is the immutable date-only UTC boundary for the current turn, and `source.eligible_as_of` is `true` only when the observed publication date is on or before that date. Missing metadata remains `null`. When `issuer` is supplied, metadata is recorded only if the normalized page visibly names that issuer.
 
 ---
 
 ### `validate_financial_report`
 
-Validates a financial report candidate against the current per-turn `as_of` timestamp and evidence recorded by `web_search` or `fetch_url`. The candidate must name its issuer, report type, reporting calendar, period end, status, publication URL, and publication date; observed evidence must also expose matching period metadata. Validation succeeds only when the period has ended, the source was observed as an official investor-relations or regulatory source, the publication date is known and no later than `as_of`, and the status is `reported` or `filed`. Guidance, estimates, future periods, secondary-only sources, undated sources, and sources with unknown period metadata fail explicitly.
+Validates a financial report candidate against the current per-turn date-only `as_of` and evidence recorded by `web_search` or `fetch_url`. The candidate must name its issuer, report type, reporting calendar, period end, status, publication URL, and publication date; observed evidence must also expose matching period metadata. Validation succeeds only when the period has ended, the source was observed as an official investor-relations or regulatory source, the publication date's UTC calendar date is no later than `as_of`, and the status is `reported` or `filed`. Guidance, estimates, future periods, secondary-only sources, undated sources, and sources with unknown period metadata fail explicitly.
 
-Use the returned verified record when composing a financial report. Include the `as_of` timestamp, fiscal/calendar interpretation, period end, report status, publication date, source retrieval timestamp, and official source URL in the final output.
+Use the returned verified record when composing a financial report. Include the date-only `as_of`, fiscal/calendar interpretation, period end, report status, publication date, source retrieval timestamp, and official source URL in the final output.
 
 ### `resolve_latest_financial_report`
 
 Resolves the newest eligible result already observed by `web_search` or `fetch_url`. The required `issuer` identifies the report being requested and `cadence` is `latest`, `annual`, or `quarterly`. Results are ranked by completed period end, then publication time, then source authority; a year token or search-result order is not used.
 
 An `annual` request uses the newest eligible annual result when one exists. If a newer observed annual period is future, unpublished, or otherwise ineligible, an older annual is returned as a `fallback` with a limitation. If no eligible annual result is available but a verified quarter is available, the tool returns `status: "fallback"`, the quarterly record, and a limitation explaining that it must not be treated as annual. A `latest` request selects the newest eligible result regardless of cadence and still reports its actual type. An unavailable result is returned explicitly with `status: "unavailable"` and a limitation rather than fabricating a report. Conflicting official evidence is retained in `conflicts` and the selected source is deterministic.
+
+When a financial-looking final response cannot satisfy the verification metadata requirements, nca annotates structured JSON with `verification_status: "unverified"` and a `verification_warning`; it does not silently promote the response to verified. The fallback or unavailable limitation remains part of the structured resolution.
 
 ---
 
@@ -169,7 +172,7 @@ Create or overwrite a file inside the workspace.
 - `path` (string, required) — File path relative to workspace
 - `content` (string, required) — File contents
 
-**Behavior:** Creates parent directories if needed. Path must resolve within workspace. Content that looks like a financial report is written only after it passes the current research context's period, as-of, and observed-official-source checks; otherwise the tool fails before changing the filesystem.
+**Behavior:** Creates parent directories if needed. Path must resolve within workspace. Generic `write_file` does not inspect or classify content. Use `write_validated_financial_report` for financial output; it requires a validated report from the current research turn and refuses before changing the filesystem when verification is absent.
 
 ---
 

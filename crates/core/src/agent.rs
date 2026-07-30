@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::NaiveDate;
 use futures_util::future::join_all;
 use nca_common::config::SmartCompactionMode;
 use nca_common::event::{AgentEvent, BusyState};
@@ -702,7 +702,7 @@ impl AgentLoop {
         Some(self.event_tx.clone())
     }
 
-    pub fn begin_research_turn(&self, as_of: DateTime<Utc>) {
+    pub fn begin_research_turn(&self, as_of: NaiveDate) {
         self.research_context.begin_turn(as_of);
     }
 

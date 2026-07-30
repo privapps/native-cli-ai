@@ -602,4 +602,37 @@ mod tests {
         };
         render_human_event(&ev);
     }
+
+    #[test]
+    fn ndjson_preserves_structured_financial_verification_metadata() {
+        let content = serde_json::json!({
+            "as_of": "2026-07-29",
+            "verification_status": "unverified",
+            "verification_warning": "financial result is not verified"
+        })
+        .to_string();
+        let envelope = EventEnvelope::new(
+            7,
+            AgentEvent::MessageReceived {
+                role: "assistant".into(),
+                content,
+            },
+        );
+
+        let line = serde_json::to_string(&envelope).expect("NDJSON event");
+        let value: serde_json::Value = serde_json::from_str(&line).expect("valid NDJSON");
+        let content: serde_json::Value =
+            serde_json::from_str(value["event"]["content"].as_str().unwrap())
+                .expect("structured content");
+        assert_eq!(content["as_of"], "2026-07-29");
+        assert_eq!(content["verification_status"], "unverified");
+    }
+
+    #[test]
+    fn human_render_accepts_unverified_financial_response() {
+        render_human_event(&AgentEvent::MessageReceived {
+            role: "assistant".into(),
+            content: "{\"as_of\":\"2026-07-29\",\"verification_status\":\"unverified\",\"verification_warning\":\"source publication date is unknown\"}".into(),
+        });
+    }
 }

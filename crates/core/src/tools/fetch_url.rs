@@ -50,7 +50,7 @@ impl ToolExecutor for FetchUrlTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "fetch_url".into(),
-            description: "Fetch and normalize the text content of a URL, preserving source and publication metadata for date-sensitive research".into(),
+            description: "Fetch and normalize URL content while preserving source and publication metadata for evidence-based research".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -164,13 +164,14 @@ impl ToolExecutor for FetchUrlTool {
             output: serde_json::to_string_pretty(&json!({
                 "source": {
                     "url": final_url,
+                    "as_of": self.context.as_of(),
                     "response_status": status.as_u16(),
                     "retrieved_at": retrieved_at,
                     "http_date": http_date,
                     "published_at": published_at,
                     "report_metadata": report_metadata,
                     "source_authority": authority,
-                    "eligible_as_of": published_at.map(|date| date <= self.context.as_of()),
+                    "eligible_as_of": published_at.map(|date| date.date_naive() <= self.context.as_of()),
                 },
                 "content": normalized
                     .chars()

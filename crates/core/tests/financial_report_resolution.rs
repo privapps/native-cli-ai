@@ -35,7 +35,7 @@ impl Provider for ScriptedProvider {
                 messages[0]
                     .content
                     .to_summary_text()
-                    .contains("as_of: 2026-07-29T12:00:00+00:00")
+                    .contains("as_of: 2026-07-29")
             );
         }
 
@@ -67,7 +67,7 @@ impl Provider for ScriptedProvider {
                 .expect("resolver JSON");
                 let report = &resolution["selected"];
                 vec![StreamChunk::TextDelta(format!(
-                    "# Microsoft Financial Results\n\nAs of: 2026-07-29T12:00:00Z\n\nIssuer: Microsoft\nReporting calendar: fiscal\nReport type: quarterly\nPeriod end: 2026-03-31\nPublication status: reported\nPublication date: {}\nSource retrieved at: {}\n\nFY2026 Q3 revenue was reported.\n\nSource: {}\n\nThe requested annual report was not available, so this quarterly fallback is shown instead.",
+                    "# Microsoft Financial Results\n\nAs of: 2026-07-29\n\nIssuer: Microsoft\nReporting calendar: fiscal\nReport type: quarterly\nPeriod end: 2026-03-31\nPublication status: reported\nPublication date: {}\nSource retrieved at: {}\n\nFY2026 Q3 revenue was reported.\n\nSource: {}\n\nThe requested annual report was not available, so this quarterly fallback is shown instead.",
                     report["candidate"]["publication_date"],
                     report["source_retrieved_at"],
                     report["candidate"]["publication_url"],
@@ -130,12 +130,13 @@ async fn fake_clock_agent_turn_resolves_a_verified_quarterly_fallback() {
     tools.register(Box::new(ResolveLatestFinancialReportTool::new(
         context.clone(),
     )));
+    tools.enable_financial_research();
 
     let as_of = Utc.with_ymd_and_hms(2026, 7, 29, 12, 0, 0).unwrap();
     let workspace = tempfile::tempdir().expect("workspace");
     let snapshot = HarnessSnapshot {
         workspace_root: workspace.path().to_path_buf(),
-        as_of,
+        as_of: as_of.date_naive(),
         cwd_display: workspace.path().display().to_string(),
         model: "test-model".into(),
         permission_mode: "default".into(),
@@ -158,7 +159,7 @@ async fn fake_clock_agent_turn_resolves_a_verified_quarterly_fallback() {
         None,
     );
     agent.set_system_prompt(build_system_prompt(&config, &snapshot, None));
-    agent.begin_research_turn(as_of);
+    agent.begin_research_turn(as_of.date_naive());
 
     let output = agent
         .run_turn(

@@ -41,7 +41,7 @@ impl ToolExecutor for WebSearchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "web_search".into(),
-            description: "Search the public web and return dated, source-attributed titles, URLs, and snippets. Use this before validating a financial report.".into(),
+            description: "Search the public web and return source-attributed titles, URLs, snippets, and available publication metadata".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -56,10 +56,6 @@ impl ToolExecutor for WebSearchTool {
                         "type": "string",
                         "description": "Optional issuer name; provide this for financial-report resolution so result metadata is tied to the named issuer"
                     },
-                    "as_of": {
-                        "type": "string",
-                        "description": "Optional RFC3339 as-of assertion; it must match the runtime research boundary"
-                    }
                 },
                 "required": ["query"]
             }),
@@ -81,25 +77,6 @@ impl ToolExecutor for WebSearchTool {
                 output: String::new(),
                 error: Some("query is required".into()),
             };
-        }
-
-        if let Some(requested_as_of) = call.input["as_of"].as_str() {
-            let Some(requested_as_of) = parse_publication_date(requested_as_of) else {
-                return ToolResult {
-                    call_id: call.id.clone(),
-                    success: false,
-                    output: String::new(),
-                    error: Some("as_of must be an RFC3339 timestamp or YYYY-MM-DD date".into()),
-                };
-            };
-            if requested_as_of != self.context.as_of() {
-                return ToolResult {
-                    call_id: call.id.clone(),
-                    success: false,
-                    output: String::new(),
-                    error: Some("as_of must match the runtime research boundary".into()),
-                };
-            }
         }
 
         let query = add_domain_hints(query, &call.input["domains"]);
@@ -174,7 +151,7 @@ impl ToolExecutor for WebSearchTool {
                     "retrieved_at": retrieved_at,
                     "source_authority": authority,
                     "report_metadata": report_metadata,
-                    "eligible_as_of": row.published_at.map(|date| date <= as_of),
+                    "eligible_as_of": row.published_at.map(|date| date.date_naive() <= as_of),
                 })
             })
             .collect::<Vec<_>>();

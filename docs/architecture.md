@@ -121,6 +121,16 @@ flowchart LR
 - **`runtime::bash_tool`**: bounded shell-backed command execution, registered by the supervisor.
   `runtime::pty::PtyManager` additionally provides portable interactive PTY sessions.
 
+### Evidence-bounded financial research
+
+Each agent turn owns one immutable UTC calendar-date `as_of`. The harness, generic web evidence,
+financial validation, cadence resolution, and structured output all consume that same value; source
+retrieval and publication timestamps remain detailed provenance. The financial workflow is opt-in
+through the `financial-research` skill. Generic web tools collect source-attributed evidence, while
+the financial resolver owns issuer, period, authority, status, conflict, and fallback rules.
+Generic `write_file` stays domain-neutral; `write_validated_financial_report` is the validation-aware
+persistence path.
+
 ---
 
 ## Agent Loop

@@ -13,9 +13,10 @@
 
 use crate::model_limits::ModelLimits;
 use nca_common::config::{
-    NcaConfig, ProviderCompatibility, ProviderKind, custom_provider_endpoint,
-    normalize_custom_provider_base_url,
+    NcaConfig, ProviderCapabilitySupport, ProviderCompatibility, ProviderKind,
+    ResolvedProviderSettings, custom_provider_endpoint,
 };
+use nca_core::provider::custom::{CustomCapabilityAdapter, CustomModelCatalogEntry};
 use serde::Deserialize;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -23,6 +24,26 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const HTTP_TIMEOUT_SECS: u64 = 12;
+
+const PROVIDER_CAPABILITY_CHECKLIST: [ProviderCapabilitySupport; ProviderKind::ALL.len()] = [
+    ProviderKind::MiniMax.capability_support(),
+    ProviderKind::OpenAi.capability_support(),
+    ProviderKind::Anthropic.capability_support(),
+    ProviderKind::OpenRouter.capability_support(),
+    ProviderKind::Custom.capability_support(),
+];
+
+const _: () = {
+    let mut index = 0;
+    while index < PROVIDER_CAPABILITY_CHECKLIST.len() {
+        let support = PROVIDER_CAPABILITY_CHECKLIST[index];
+        assert!(support.provider.is(ProviderKind::ALL[index]));
+        assert!(support.settings);
+        assert!(support.model_catalog);
+        assert!(support.context_window);
+        index += 1;
+    }
+};
 
 fn catalog_cache_ttl() -> Duration {
     std::env::var("NCA_CONTEXT_API_CACHE_TTL_SECS")
@@ -43,10 +64,178 @@ fn cache_stale(fetched_at: Instant, ttl: Duration) -> bool {
     fetched_at.elapsed() >= ttl
 }
 
-// --- OpenRouter ---
+/// Cache identity deliberately contains provider and protocol identity in
+/// addition to endpoint and credential identity. The credential itself never
+/// enters a cache key, log field, or diagnostic.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CapabilityCacheKey {
+    provider: ProviderKind,
+    endpoint: String,
+    compatibility: Option<ProviderCompatibility>,
+    model: Option<String>,
+    credential_tag: Option<u64>,
+}
+
+fn catalog_endpoint(settings: &ResolvedProviderSettings) -> Option<String> {
+    settings
+        .normalized_base_url()
+        .map(|base| custom_provider_endpoint(&base, "models"))
+}
+
+fn cache_key(
+    settings: &ResolvedProviderSettings,
+    model: Option<&str>,
+) -> Option<CapabilityCacheKey> {
+    Some(CapabilityCacheKey {
+        provider: settings.provider,
+        endpoint: catalog_endpoint(settings)?,
+        compatibility: settings.compatibility,
+        model: model.map(str::to_owned),
+        credential_tag: settings.credential().map(api_key_tag),
+    })
+}
+
+enum ProviderCapabilityAdapter {
+    MiniMax {
+        settings: ResolvedProviderSettings,
+    },
+    OpenRouter {
+        settings: ResolvedProviderSettings,
+    },
+    OpenAi {
+        settings: ResolvedProviderSettings,
+    },
+    Anthropic {
+        settings: ResolvedProviderSettings,
+    },
+    Custom {
+        settings: ResolvedProviderSettings,
+        protocol: CustomCapabilityAdapter,
+    },
+}
+
+impl ProviderCapabilityAdapter {
+    /// The only provider/compatibility dispatch point for model capabilities.
+    fn from_config(config: &NcaConfig) -> Self {
+        let settings = config.provider.active_settings();
+        match settings.provider {
+            ProviderKind::MiniMax => Self::MiniMax { settings },
+            ProviderKind::OpenRouter => Self::OpenRouter { settings },
+            ProviderKind::OpenAi => Self::OpenAi { settings },
+            ProviderKind::Anthropic => Self::Anthropic { settings },
+            ProviderKind::Custom => Self::Custom {
+                protocol: CustomCapabilityAdapter::from_compatibility(
+                    settings
+                        .compatibility
+                        .expect("custom provider compatibility is always configured"),
+                ),
+                settings,
+            },
+        }
+    }
+
+    fn settings(&self) -> &ResolvedProviderSettings {
+        match self {
+            Self::MiniMax { settings }
+            | Self::OpenRouter { settings }
+            | Self::OpenAi { settings }
+            | Self::Anthropic { settings }
+            | Self::Custom { settings, .. } => settings,
+        }
+    }
+
+    async fn context_window(&self, client: &reqwest::Client, model: &str) -> Option<usize> {
+        let settings = self.settings();
+        if matches!(self, Self::MiniMax { .. }) {
+            return None;
+        }
+        if !settings.can_query_catalog() {
+            tracing::debug!(
+                provider = %settings.provider.display_name(),
+                credential_env = %settings.api_key_env,
+                configured_model = %settings.model,
+                "context API: provider credential is not configured"
+            );
+            return None;
+        }
+
+        let key = cache_key(settings, Some(model))?;
+        let ttl = catalog_cache_ttl();
+        if let Some(context_window) = cached_context_window(&key, ttl) {
+            return context_window;
+        }
+
+        let context_window = match self {
+            Self::MiniMax { .. } => None,
+            Self::OpenRouter { settings } => {
+                let catalog = fetch_openrouter_catalog(client, settings).await?;
+                pick_openrouter(catalog.as_ref(), model)
+                    .and_then(|model| model.context_length)
+                    .map(|value| value as usize)
+            }
+            Self::OpenAi { settings } => {
+                let catalog = fetch_openai_catalog(client, settings).await?;
+                openai_context_from_catalog(catalog.as_ref(), model)
+            }
+            Self::Anthropic { settings } => {
+                let catalog = fetch_anthropic_catalog(client, settings).await?;
+                pick_anthropic(catalog.as_ref(), model)
+                    .and_then(|model| model.max_input_tokens)
+                    .map(|value| value as usize)
+            }
+            Self::Custom { settings, protocol } => {
+                let catalog = fetch_custom_catalog(client, settings, *protocol).await?;
+                pick_custom(catalog.as_ref(), model, *protocol)
+                    .and_then(|model| model.context_window)
+                    .map(|value| value as usize)
+            }
+        };
+        store_context_window(key, context_window);
+        context_window
+    }
+
+    async fn model_ids(&self, client: &reqwest::Client) -> Vec<String> {
+        match self {
+            Self::MiniMax { .. } => vec!["MiniMax-M2.5".into(), "MiniMax-M2.7".into()],
+            Self::OpenRouter { settings } => fetch_openrouter_catalog(client, settings)
+                .await
+                .map(|models| sorted_ids(models.iter().map(|model| model.id.clone())))
+                .unwrap_or_default(),
+            Self::OpenAi { settings } => fetch_openai_catalog(client, settings)
+                .await
+                .map(|catalog| {
+                    catalog
+                        .get("data")
+                        .and_then(|data| data.as_array())
+                        .map(|models| {
+                            sorted_ids(models.iter().filter_map(|model| {
+                                model
+                                    .get("id")
+                                    .and_then(|value| value.as_str())
+                                    .map(str::to_owned)
+                            }))
+                        })
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default(),
+            Self::Anthropic { settings } => fetch_anthropic_catalog(client, settings)
+                .await
+                .map(|models| sorted_ids(models.iter().map(|model| model.id.clone())))
+                .unwrap_or_default(),
+            Self::Custom { settings, protocol } => {
+                fetch_custom_catalog(client, settings, *protocol)
+                    .await
+                    .map(|models| sorted_ids(models.iter().map(|model| model.id.clone())))
+                    .unwrap_or_default()
+            }
+        }
+    }
+}
+
+// --- Catalog caches ---
 
 struct OpenRouterCatalogEntry {
-    url: String,
+    key: CapabilityCacheKey,
     fetched_at: Instant,
     models: Arc<Vec<OpenRouterModel>>,
 }
@@ -59,7 +248,7 @@ fn openrouter_catalog_cache() -> &'static Mutex<Option<OpenRouterCatalogEntry>> 
 // --- Anthropic ---
 
 struct AnthropicCatalogEntry {
-    cache_key: String,
+    key: CapabilityCacheKey,
     fetched_at: Instant,
     models: Arc<Vec<AnthropicModel>>,
 }
@@ -72,7 +261,7 @@ fn anthropic_catalog_cache() -> &'static Mutex<Option<AnthropicCatalogEntry>> {
 // --- OpenAI ---
 
 struct OpenAiCatalogEntry {
-    cache_key: String,
+    key: CapabilityCacheKey,
     fetched_at: Instant,
     value: Arc<serde_json::Value>,
 }
@@ -80,6 +269,55 @@ struct OpenAiCatalogEntry {
 fn openai_catalog_cache() -> &'static Mutex<Option<OpenAiCatalogEntry>> {
     static CELL: OnceLock<Mutex<Option<OpenAiCatalogEntry>>> = OnceLock::new();
     CELL.get_or_init(|| Mutex::new(None))
+}
+
+// --- Custom protocol catalogs ---
+
+struct CustomCatalogEntry {
+    key: CapabilityCacheKey,
+    fetched_at: Instant,
+    models: Arc<Vec<CustomModelCatalogEntry>>,
+}
+
+fn custom_catalog_cache() -> &'static Mutex<Option<CustomCatalogEntry>> {
+    static CELL: OnceLock<Mutex<Option<CustomCatalogEntry>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+struct ContextCacheEntry {
+    key: CapabilityCacheKey,
+    fetched_at: Instant,
+    context_window: Option<usize>,
+}
+
+fn context_cache() -> &'static Mutex<Vec<ContextCacheEntry>> {
+    static CELL: OnceLock<Mutex<Vec<ContextCacheEntry>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn cached_context_window(key: &CapabilityCacheKey, ttl: Duration) -> Option<Option<usize>> {
+    let guard = context_cache().lock().ok()?;
+    guard
+        .iter()
+        .find(|entry| entry.key == *key && !cache_stale(entry.fetched_at, ttl))
+        .map(|entry| entry.context_window)
+}
+
+fn store_context_window(key: CapabilityCacheKey, context_window: Option<usize>) {
+    if let Ok(mut guard) = context_cache().lock() {
+        guard.retain(|entry| entry.key != key);
+        guard.push(ContextCacheEntry {
+            key,
+            fetched_at: Instant::now(),
+            context_window,
+        });
+    }
+}
+
+fn sorted_ids(ids: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut ids: Vec<String> = ids.into_iter().collect();
+    ids.sort();
+    ids
 }
 
 pub async fn resolve_model_limits(config: &NcaConfig, model: &str) -> ModelLimits {
@@ -103,55 +341,8 @@ pub async fn resolve_model_limits(config: &NcaConfig, model: &str) -> ModelLimit
         }
     };
 
-    let from_api = match config.provider.default {
-        ProviderKind::OpenRouter => {
-            let base = config.provider.openrouter.base_url.trim_end_matches('/');
-            let url = custom_provider_endpoint(base, "models");
-            let key = config.provider.openrouter.resolve_api_key();
-            fetch_openrouter_context(&client, &url, model, key.as_deref()).await
-        }
-        ProviderKind::Anthropic => {
-            let key = match config.provider.anthropic.resolve_api_key() {
-                Some(k) => k,
-                None => {
-                    tracing::debug!("context API: anthropic selected but no API key");
-                    return static_limits;
-                }
-            };
-            let base = config.provider.anthropic.base_url.trim_end_matches('/');
-            fetch_anthropic_context(&client, base, &key, model).await
-        }
-        ProviderKind::OpenAi => {
-            let key = match config.provider.openai.resolve_api_key() {
-                Some(k) => k,
-                None => {
-                    tracing::debug!("context API: openai selected but no API key");
-                    return static_limits;
-                }
-            };
-            let base = config.provider.openai.base_url.trim_end_matches('/');
-            fetch_openai_context(&client, base, &key, model).await
-        }
-        ProviderKind::Custom => {
-            let key = match config.provider.custom.resolve_api_key() {
-                Some(k) => k,
-                None => {
-                    tracing::debug!("context API: custom selected but no API key");
-                    return static_limits;
-                }
-            };
-            let base = config.provider.custom.base_url.trim_end_matches('/');
-            match config.provider.custom.compatibility {
-                ProviderCompatibility::OpenAi => {
-                    fetch_openai_context(&client, base, &key, model).await
-                }
-                ProviderCompatibility::Anthropic => {
-                    fetch_anthropic_context(&client, base, &key, model).await
-                }
-            }
-        }
-        ProviderKind::MiniMax => None,
-    };
+    let capability = ProviderCapabilityAdapter::from_config(config);
+    let from_api = capability.context_window(&client, model).await;
 
     match from_api {
         Some(cw) if cw > 0 => {
@@ -191,28 +382,26 @@ struct OpenRouterModel {
     context_length: Option<u64>,
 }
 
-async fn fetch_openrouter_context(
+async fn fetch_openrouter_catalog(
     client: &reqwest::Client,
-    url: &str,
-    model: &str,
-    api_key: Option<&str>,
-) -> Option<usize> {
+    settings: &ResolvedProviderSettings,
+) -> Option<Arc<Vec<OpenRouterModel>>> {
+    let key = cache_key(settings, None)?;
     let ttl = catalog_cache_ttl();
     {
         let guard = openrouter_catalog_cache().lock().ok()?;
         if let Some(entry) = guard.as_ref()
-            && entry.url == url
+            && entry.key == key
             && !cache_stale(entry.fetched_at, ttl)
         {
-            tracing::debug!(url = %url, "openrouter models catalog cache hit");
-            return pick_openrouter(entry.models.as_ref(), model)
-                .and_then(|m| m.context_length)
-                .map(|n| n as usize);
+            tracing::debug!("openrouter models catalog cache hit");
+            return Some(Arc::clone(&entry.models));
         }
     }
 
-    let mut req = client.get(url);
-    if let Some(k) = api_key.filter(|s| !s.is_empty()) {
+    let url = catalog_endpoint(settings)?;
+    let mut req = client.get(&url);
+    if let Some(k) = settings.credential() {
         req = req.bearer_auth(k);
     }
     let resp = req.send().await.ok()?;
@@ -225,15 +414,13 @@ async fn fetch_openrouter_context(
     {
         if let Ok(mut guard) = openrouter_catalog_cache().lock() {
             *guard = Some(OpenRouterCatalogEntry {
-                url: url.to_string(),
+                key,
                 fetched_at: Instant::now(),
                 models: Arc::clone(&models),
             });
         }
     }
-    pick_openrouter(models.as_ref(), model)
-        .and_then(|m| m.context_length)
-        .map(|n| n as usize)
+    Some(models)
 }
 
 fn pick_openrouter<'a>(models: &'a [OpenRouterModel], wanted: &str) -> Option<&'a OpenRouterModel> {
@@ -266,32 +453,30 @@ struct AnthropicModel {
     max_tokens: Option<u64>,
 }
 
-async fn fetch_anthropic_context(
+async fn fetch_anthropic_catalog(
     client: &reqwest::Client,
-    base: &str,
-    api_key: &str,
-    model: &str,
-) -> Option<usize> {
+    settings: &ResolvedProviderSettings,
+) -> Option<Arc<Vec<AnthropicModel>>> {
+    let key = cache_key(settings, None)?;
+    let api_key = settings.credential()?;
     let ttl = catalog_cache_ttl();
-    let cache_key = format!("anthropic|{}|{:x}", base, api_key_tag(api_key));
     {
         let guard = anthropic_catalog_cache().lock().ok()?;
         if let Some(entry) = guard.as_ref()
-            && entry.cache_key == cache_key
+            && entry.key == key
             && !cache_stale(entry.fetched_at, ttl)
         {
             tracing::debug!("anthropic models catalog cache hit");
-            return pick_anthropic(entry.models.as_ref(), model)
-                .and_then(|m| m.max_input_tokens)
-                .map(|n| n as usize);
+            return Some(Arc::clone(&entry.models));
         }
     }
 
+    let endpoint = catalog_endpoint(settings)?;
     let mut all: Vec<AnthropicModel> = Vec::new();
     let mut after_id: Option<String> = None;
 
     loop {
-        let mut url = format!("{}?limit=100", custom_provider_endpoint(base, "models"));
+        let mut url = format!("{endpoint}?limit=100");
         if let Some(ref id) = after_id {
             url.push_str("&after_id=");
             url.push_str(id);
@@ -328,15 +513,13 @@ async fn fetch_anthropic_context(
     {
         if let Ok(mut guard) = anthropic_catalog_cache().lock() {
             *guard = Some(AnthropicCatalogEntry {
-                cache_key,
+                key,
                 fetched_at: Instant::now(),
                 models: Arc::clone(&models),
             });
         }
     }
-    pick_anthropic(models.as_ref(), model)
-        .and_then(|m| m.max_input_tokens)
-        .map(|n| n as usize)
+    Some(models)
 }
 
 fn pick_anthropic<'a>(models: &'a [AnthropicModel], wanted: &str) -> Option<&'a AnthropicModel> {
@@ -365,26 +548,25 @@ fn openai_context_from_catalog(value: &serde_json::Value, model: &str) -> Option
     None
 }
 
-async fn fetch_openai_context(
+async fn fetch_openai_catalog(
     client: &reqwest::Client,
-    base: &str,
-    api_key: &str,
-    model: &str,
-) -> Option<usize> {
+    settings: &ResolvedProviderSettings,
+) -> Option<Arc<serde_json::Value>> {
+    let key = cache_key(settings, None)?;
+    let api_key = settings.credential()?;
     let ttl = catalog_cache_ttl();
-    let cache_key = format!("openai|{}|{:x}", base, api_key_tag(api_key));
     {
         let guard = openai_catalog_cache().lock().ok()?;
         if let Some(entry) = guard.as_ref()
-            && entry.cache_key == cache_key
+            && entry.key == key
             && !cache_stale(entry.fetched_at, ttl)
         {
             tracing::debug!("openai models catalog cache hit");
-            return openai_context_from_catalog(entry.value.as_ref(), model);
+            return Some(Arc::clone(&entry.value));
         }
     }
 
-    let url = custom_provider_endpoint(base, "models");
+    let url = catalog_endpoint(settings)?;
     let resp = client.get(&url).bearer_auth(api_key).send().await.ok()?;
     if !resp.status().is_success() {
         tracing::debug!(status = %resp.status(), url = %url, "openai models request failed");
@@ -395,13 +577,96 @@ async fn fetch_openai_context(
     {
         if let Ok(mut guard) = openai_catalog_cache().lock() {
             *guard = Some(OpenAiCatalogEntry {
-                cache_key,
+                key,
                 fetched_at: Instant::now(),
                 value: Arc::clone(&value),
             });
         }
     }
-    openai_context_from_catalog(value.as_ref(), model)
+    Some(value)
+}
+
+async fn fetch_custom_catalog(
+    client: &reqwest::Client,
+    settings: &ResolvedProviderSettings,
+    protocol: CustomCapabilityAdapter,
+) -> Option<Arc<Vec<CustomModelCatalogEntry>>> {
+    let key = cache_key(settings, None)?;
+    let api_key = settings.credential()?;
+    let ttl = catalog_cache_ttl();
+    {
+        let guard = custom_catalog_cache().lock().ok()?;
+        if let Some(entry) = guard.as_ref()
+            && entry.key == key
+            && !cache_stale(entry.fetched_at, ttl)
+        {
+            tracing::debug!("custom models catalog cache hit");
+            return Some(Arc::clone(&entry.models));
+        }
+    }
+
+    let base_url = settings.normalized_base_url()?;
+    let mut all = Vec::new();
+    let mut cursor = None;
+
+    loop {
+        let response = protocol
+            .models_request(client, &base_url, api_key, cursor.as_deref())
+            .ok()?
+            .send()
+            .await
+            .ok()?;
+        let status = response.status();
+        if !status.is_success() {
+            tracing::debug!(status = %status, "custom models request failed");
+            return None;
+        }
+        let body = response.text().await.ok()?;
+        let page = protocol.parse_models_page(&body).ok()?;
+        all.extend(page.models);
+        if !page.has_more {
+            break;
+        }
+        let next_cursor = page.next_cursor?;
+        if cursor.as_deref() == Some(next_cursor.as_str()) {
+            tracing::debug!("custom models pagination cursor did not advance");
+            return None;
+        }
+        cursor = Some(next_cursor);
+    }
+
+    let models = Arc::new(all);
+    if let Ok(mut guard) = custom_catalog_cache().lock() {
+        *guard = Some(CustomCatalogEntry {
+            key,
+            fetched_at: Instant::now(),
+            models: Arc::clone(&models),
+        });
+    }
+    Some(models)
+}
+
+fn pick_custom<'a>(
+    models: &'a [CustomModelCatalogEntry],
+    wanted: &str,
+    protocol: CustomCapabilityAdapter,
+) -> Option<&'a CustomModelCatalogEntry> {
+    let wanted = wanted.to_lowercase();
+    models
+        .iter()
+        .find(|model| model.id.to_lowercase() == wanted)
+        .or_else(|| {
+            if protocol == CustomCapabilityAdapter::Anthropic {
+                models.iter().find(|model| {
+                    let id = model.id.to_lowercase();
+                    id.starts_with(&wanted)
+                        && (id.len() == wanted.len()
+                            || id.as_bytes().get(wanted.len()) == Some(&b'-'))
+                })
+            } else {
+                None
+            }
+        })
 }
 
 /// Fetch available model IDs from the active provider's API.
@@ -417,221 +682,9 @@ pub async fn fetch_provider_model_ids(config: &NcaConfig) -> Vec<String> {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
-    match config.provider.default {
-        ProviderKind::OpenRouter => fetch_openrouter_model_ids(&client, config).await,
-        ProviderKind::Anthropic => fetch_anthropic_model_ids(&client, config).await,
-        ProviderKind::OpenAi => fetch_openai_model_ids(&client, config).await,
-        ProviderKind::Custom => fetch_custom_model_ids(&client, config).await,
-        ProviderKind::MiniMax => vec!["MiniMax-M2.5".into(), "MiniMax-M2.7".into()],
-    }
-}
-
-async fn fetch_custom_model_ids(client: &reqwest::Client, config: &NcaConfig) -> Vec<String> {
-    let key = match config.provider.custom.resolve_api_key() {
-        Some(k) => k,
-        None => return Vec::new(),
-    };
-    let base_url = match custom_catalog_base_url(config) {
-        Some(base_url) => base_url,
-        None => return Vec::new(),
-    };
-
-    let mut shadow = config.clone();
-    match config.provider.custom.compatibility {
-        ProviderCompatibility::OpenAi => {
-            shadow.provider.openai.api_key = Some(key);
-            shadow.provider.openai.base_url = base_url.clone();
-            fetch_openai_model_ids(client, &shadow).await
-        }
-        ProviderCompatibility::Anthropic => {
-            shadow.provider.anthropic.api_key = Some(key);
-            shadow.provider.anthropic.base_url = base_url;
-            fetch_anthropic_model_ids(client, &shadow).await
-        }
-    }
-}
-
-fn custom_catalog_base_url(config: &NcaConfig) -> Option<String> {
-    normalize_custom_provider_base_url(&config.provider.custom.base_url).ok()
-}
-
-async fn fetch_openrouter_model_ids(client: &reqwest::Client, config: &NcaConfig) -> Vec<String> {
-    let base = config.provider.openrouter.base_url.trim_end_matches('/');
-    let url = custom_provider_endpoint(base, "models");
-    let key = config.provider.openrouter.resolve_api_key();
-    let ttl = catalog_cache_ttl();
-
-    // Check cache first
-    {
-        let guard = openrouter_catalog_cache().lock().ok();
-        if let Some(Some(entry)) = guard.as_ref().map(|g| g.as_ref())
-            && entry.url == url
-            && !cache_stale(entry.fetched_at, ttl)
-        {
-            let mut ids: Vec<String> = entry.models.iter().map(|m| m.id.clone()).collect();
-            ids.sort();
-            return ids;
-        }
-    }
-
-    let mut req = client.get(&url);
-    if let Some(k) = key.as_deref().filter(|s| !s.is_empty()) {
-        req = req.bearer_auth(k);
-    }
-    let resp = match req.send().await {
-        Ok(r) if r.status().is_success() => r,
-        _ => return Vec::new(),
-    };
-    let body: OpenRouterModelsResponse = match resp.json().await {
-        Ok(b) => b,
-        Err(_) => return Vec::new(),
-    };
-    let models = Arc::new(body.data);
-    let mut ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
-    ids.sort();
-    {
-        if let Ok(mut guard) = openrouter_catalog_cache().lock() {
-            *guard = Some(OpenRouterCatalogEntry {
-                url,
-                fetched_at: Instant::now(),
-                models,
-            });
-        }
-    }
-    ids
-}
-
-async fn fetch_anthropic_model_ids(client: &reqwest::Client, config: &NcaConfig) -> Vec<String> {
-    let key = match config.provider.anthropic.resolve_api_key() {
-        Some(k) => k,
-        None => return Vec::new(),
-    };
-    let base = config.provider.anthropic.base_url.trim_end_matches('/');
-    let ttl = catalog_cache_ttl();
-    let cache_key = format!("anthropic|{}|{:x}", base, api_key_tag(&key));
-
-    {
-        let guard = anthropic_catalog_cache().lock().ok();
-        if let Some(Some(entry)) = guard.as_ref().map(|g| g.as_ref())
-            && entry.cache_key == cache_key
-            && !cache_stale(entry.fetched_at, ttl)
-        {
-            let mut ids: Vec<String> = entry.models.iter().map(|m| m.id.clone()).collect();
-            ids.sort();
-            return ids;
-        }
-    }
-
-    let mut all: Vec<AnthropicModel> = Vec::new();
-    let mut after_id: Option<String> = None;
-    let mut completed = true;
-    loop {
-        let mut url = format!("{}?limit=100", custom_provider_endpoint(base, "models"));
-        if let Some(ref id) = after_id {
-            url.push_str("&after_id=");
-            url.push_str(id);
-        }
-        let resp = match client
-            .get(&url)
-            .header("x-api-key", &key)
-            .header("anthropic-version", "2023-06-01")
-            .send()
-            .await
-        {
-            Ok(r) if r.status().is_success() => r,
-            _ => {
-                completed = false;
-                break;
-            }
-        };
-        let page: AnthropicModelsPage = match resp.json().await {
-            Ok(p) => p,
-            Err(_) => {
-                completed = false;
-                break;
-            }
-        };
-        if page.data.is_empty() {
-            break;
-        }
-        let cursor = page.data.last().map(|m| m.id.clone());
-        all.extend(page.data);
-        if !page.has_more {
-            break;
-        }
-        after_id = cursor;
-    }
-
-    if !completed && all.is_empty() {
-        return Vec::new();
-    }
-
-    let models = Arc::new(all);
-    let mut ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
-    ids.sort();
-    if completed && let Ok(mut guard) = anthropic_catalog_cache().lock() {
-        *guard = Some(AnthropicCatalogEntry {
-            cache_key,
-            fetched_at: Instant::now(),
-            models,
-        });
-    }
-    ids
-}
-
-async fn fetch_openai_model_ids(client: &reqwest::Client, config: &NcaConfig) -> Vec<String> {
-    let key = match config.provider.openai.resolve_api_key() {
-        Some(k) => k,
-        None => return Vec::new(),
-    };
-    let base = config.provider.openai.base_url.trim_end_matches('/');
-    let ttl = catalog_cache_ttl();
-    let cache_key = format!("openai|{}|{:x}", base, api_key_tag(&key));
-
-    {
-        let guard = openai_catalog_cache().lock().ok();
-        if let Some(Some(entry)) = guard.as_ref().map(|g| g.as_ref())
-            && entry.cache_key == cache_key
-            && !cache_stale(entry.fetched_at, ttl)
-            && let Some(arr) = entry.value.get("data").and_then(|d| d.as_array())
-        {
-            let mut ids: Vec<String> = arr
-                .iter()
-                .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(String::from))
-                .collect();
-            ids.sort();
-            return ids;
-        }
-    }
-
-    let url = custom_provider_endpoint(base, "models");
-    let resp = match client.get(&url).bearer_auth(&key).send().await {
-        Ok(r) if r.status().is_success() => r,
-        _ => return Vec::new(),
-    };
-    let v: serde_json::Value = match resp.json().await {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    let value = Arc::new(v);
-    let mut ids = Vec::new();
-    if let Some(arr) = value.get("data").and_then(|d| d.as_array()) {
-        ids = arr
-            .iter()
-            .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(String::from))
-            .collect();
-        ids.sort();
-    }
-    {
-        if let Ok(mut guard) = openai_catalog_cache().lock() {
-            *guard = Some(OpenAiCatalogEntry {
-                cache_key,
-                fetched_at: Instant::now(),
-                value,
-            });
-        }
-    }
-    ids
+    ProviderCapabilityAdapter::from_config(config)
+        .model_ids(&client)
+        .await
 }
 
 #[cfg(test)]
@@ -733,12 +786,216 @@ mod tests {
     #[test]
     fn custom_catalog_base_url_preserves_optional_v1_suffix() {
         let mut config = NcaConfig::default();
+        config.provider.default = ProviderKind::Custom;
         config.provider.custom.base_url = "https://gateway.example/v1/".into();
 
         assert_eq!(
-            custom_catalog_base_url(&config).as_deref(),
+            config
+                .provider
+                .active_settings()
+                .normalized_base_url()
+                .as_deref(),
             Some("https://gateway.example/v1")
         );
+    }
+
+    #[test]
+    fn provider_settings_cache_identity_redacts_credentials_and_keeps_protocol() {
+        let mut config = NcaConfig::default();
+        config.provider.default = ProviderKind::Custom;
+        config.provider.custom.base_url = "https://gateway.example/tenant/v1".into();
+        config.provider.custom.api_key = Some("custom-secret-value".into());
+        config.provider.custom.api_key_env = "CUSTOM_TEST_KEY".into();
+        config.provider.custom.compatibility = ProviderCompatibility::Anthropic;
+
+        let settings = config.provider.active_settings();
+        assert_eq!(settings.model, "custom-model");
+        assert_eq!(settings.api_key_env, "CUSTOM_TEST_KEY");
+        assert!(settings.credential_present());
+
+        let key = cache_key(&settings, Some("claude-model")).unwrap();
+        let rendered = format!("{key:?}");
+        assert!(!rendered.contains("custom-secret-value"));
+        assert_eq!(key.provider, ProviderKind::Custom);
+        assert_eq!(key.compatibility, Some(ProviderCompatibility::Anthropic));
+        assert_eq!(key.model.as_deref(), Some("claude-model"));
+        assert_eq!(key.credential_tag, Some(api_key_tag("custom-secret-value")));
+        assert!(key.endpoint.ends_with("/tenant/v1/models"));
+    }
+
+    #[test]
+    fn cache_identity_changes_for_endpoint_and_model() {
+        let mut config = NcaConfig::default();
+        config.provider.default = ProviderKind::Custom;
+        config.provider.custom.base_url = "https://gateway.example/one/v1".into();
+        config.provider.custom.api_key = Some("cache-key".into());
+
+        let first = config.provider.active_settings();
+        let first_key = cache_key(&first, Some("model-a")).unwrap();
+        let model_key = cache_key(&first, Some("model-b")).unwrap();
+
+        config.provider.custom.compatibility = ProviderCompatibility::Anthropic;
+        let compatibility_key =
+            cache_key(&config.provider.active_settings(), Some("model-a")).unwrap();
+
+        config.provider.custom.base_url = "https://gateway.example/two/v1".into();
+        let endpoint_key = cache_key(&config.provider.active_settings(), Some("model-a")).unwrap();
+
+        assert_ne!(first_key, model_key);
+        assert_ne!(first_key, compatibility_key);
+        assert_ne!(first_key, endpoint_key);
+    }
+
+    #[test]
+    fn capability_dispatch_covers_native_and_custom_protocol_variants() {
+        let mut config = NcaConfig::default();
+
+        config.provider.default = ProviderKind::MiniMax;
+        assert!(matches!(
+            ProviderCapabilityAdapter::from_config(&config),
+            ProviderCapabilityAdapter::MiniMax { .. }
+        ));
+
+        config.provider.default = ProviderKind::OpenRouter;
+        assert!(matches!(
+            ProviderCapabilityAdapter::from_config(&config),
+            ProviderCapabilityAdapter::OpenRouter { .. }
+        ));
+
+        config.provider.default = ProviderKind::OpenAi;
+        assert!(matches!(
+            ProviderCapabilityAdapter::from_config(&config),
+            ProviderCapabilityAdapter::OpenAi { .. }
+        ));
+
+        config.provider.default = ProviderKind::Anthropic;
+        assert!(matches!(
+            ProviderCapabilityAdapter::from_config(&config),
+            ProviderCapabilityAdapter::Anthropic { .. }
+        ));
+
+        config.provider.default = ProviderKind::Custom;
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAi;
+        assert!(matches!(
+            ProviderCapabilityAdapter::from_config(&config),
+            ProviderCapabilityAdapter::Custom { settings, protocol }
+                if settings.provider == ProviderKind::Custom
+                    && protocol == CustomCapabilityAdapter::OpenAi
+        ));
+        config.provider.custom.compatibility = ProviderCompatibility::Anthropic;
+        assert!(matches!(
+            ProviderCapabilityAdapter::from_config(&config),
+            ProviderCapabilityAdapter::Custom { settings, protocol }
+                if settings.provider == ProviderKind::Custom
+                    && protocol == CustomCapabilityAdapter::Anthropic
+        ));
+    }
+
+    #[tokio::test]
+    async fn minimax_catalog_remains_static() {
+        let mut config = NcaConfig::default();
+        config.provider.default = ProviderKind::MiniMax;
+
+        assert_eq!(
+            fetch_provider_model_ids(&config).await,
+            vec!["MiniMax-M2.5", "MiniMax-M2.7"]
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_openai_context_lookup_uses_capability_adapter() {
+        let (base_url, server) =
+            spawn_model_fixture(200, r#"{"data":[{"id":"gpt-4o","context_window":123456}]}"#);
+        let mut config = NcaConfig::default();
+        config.provider.default = ProviderKind::Custom;
+        config.provider.custom.base_url = format!("{base_url}/tenant/v1/");
+        config.provider.custom.api_key = Some("custom-openai-context-key".into());
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAi;
+
+        let limits = resolve_model_limits(&config, "gpt-4o").await;
+        let request = server.join().expect("model fixture thread");
+
+        assert_eq!(limits.context_window, 123_456);
+        assert!(request.starts_with("GET /tenant/v1/models HTTP/1.1\r\n"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer custom-openai-context-key\r\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_anthropic_context_lookup_uses_capability_adapter() {
+        let (base_url, server) = spawn_model_fixture(
+            200,
+            r#"{"data":[{"id":"claude-custom","max_input_tokens":234567}],"has_more":false}"#,
+        );
+        let mut config = NcaConfig::default();
+        config.provider.default = ProviderKind::Custom;
+        config.provider.custom.base_url = format!("{base_url}/tenant/v1/");
+        config.provider.custom.api_key = Some("custom-anthropic-context-key".into());
+        config.provider.custom.compatibility = ProviderCompatibility::Anthropic;
+
+        let limits = resolve_model_limits(&config, "claude-custom").await;
+        let request = server.join().expect("model fixture thread");
+        let request_lower = request.to_ascii_lowercase();
+
+        assert_eq!(limits.context_window, 234_567);
+        assert!(request.starts_with("GET /tenant/v1/models?limit=100 HTTP/1.1\r\n"));
+        assert!(request_lower.contains("x-api-key: custom-anthropic-context-key\r\n"));
+        assert!(request_lower.contains("anthropic-version: 2023-06-01\r\n"));
+    }
+
+    #[tokio::test]
+    async fn cache_identity_separates_provider_and_credential() {
+        let (base_url, server) = spawn_model_fixtures(vec![
+            (
+                200,
+                r#"{"data":[{"id":"shared-model","context_window":1000}]}"#.into(),
+            ),
+            (
+                200,
+                r#"{"data":[{"id":"shared-model","context_window":2000}]}"#.into(),
+            ),
+            (
+                200,
+                r#"{"data":[{"id":"shared-model","context_window":3000}]}"#.into(),
+            ),
+        ]);
+
+        let mut custom = NcaConfig::default();
+        custom.provider.default = ProviderKind::Custom;
+        custom.provider.custom.base_url = base_url.clone();
+        custom.provider.custom.api_key = Some("shared-key".into());
+        custom.provider.custom.compatibility = ProviderCompatibility::OpenAi;
+
+        let mut openai = NcaConfig::default();
+        openai.provider.default = ProviderKind::OpenAi;
+        openai.provider.openai.base_url = base_url;
+        openai.provider.openai.api_key = Some("shared-key".into());
+
+        assert_eq!(
+            resolve_model_limits(&custom, "shared-model")
+                .await
+                .context_window,
+            1000
+        );
+        assert_eq!(
+            resolve_model_limits(&openai, "shared-model")
+                .await
+                .context_window,
+            2000
+        );
+        openai.provider.openai.api_key = Some("different-key".into());
+        assert_eq!(
+            resolve_model_limits(&openai, "shared-model")
+                .await
+                .context_window,
+            3000
+        );
+
+        let requests = server.join().expect("model fixture thread");
+        assert_eq!(requests.len(), 3);
     }
 
     #[tokio::test]

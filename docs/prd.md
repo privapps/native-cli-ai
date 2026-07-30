@@ -84,6 +84,7 @@ Sessions are persisted to disk. `nca --resume` picks up the last session with fu
 - MiniMax-first provider path with direct API integration
 - Tool loop: read file, write file, list directory, code search (ripgrep), bash execution
 - Web research tools: `web_search`, `fetch_url`
+- Opt-in financial research with date-bounded evidence, issuer/period validation, explicit verification states, and labelled cadence fallbacks
 - Rich edit tools: patch/edit/move/copy/delete/validation
 - Git helpers and fast local symbol query support
 - Layered harness loading from built-in + `.ncarc` + `.nca/instructions.md`
@@ -107,6 +108,11 @@ Sessions are persisted to disk. `nca --resume` picks up the last session with fu
 - Image/vision input (Phase 4)
 - Plugin/extension system (Phase 4)
 - Remote/SSH agent execution (Future)
+
+Financial research is evidence-bounded rather than investment advice. It uses one runtime-owned
+UTC calendar date per turn, prefers official issuer or regulatory sources, and keeps unverified or
+conflicting results visible. The `financial-research` skill enables the specialized workflow;
+ordinary prompts, generic web research, and generic file writes remain domain-neutral.
 
 ---
 

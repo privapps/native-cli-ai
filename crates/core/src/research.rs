@@ -218,7 +218,7 @@ pub struct FinancialReportCandidate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidatedFinancialReport {
     pub candidate: FinancialReportCandidate,
-    pub as_of: DateTime<Utc>,
+    pub as_of: NaiveDate,
     pub source_authority: SourceAuthority,
     pub source_retrieved_at: DateTime<Utc>,
     pub source_http_date: Option<DateTime<Utc>>,
@@ -236,7 +236,7 @@ pub enum ResolutionStatus {
 pub struct FinancialReportResolution {
     pub issuer: String,
     pub requested_cadence: ReportCadence,
-    pub as_of: DateTime<Utc>,
+    pub as_of: NaiveDate,
     pub status: ResolutionStatus,
     pub selected: Option<ValidatedFinancialReport>,
     pub limitation: Option<String>,
@@ -252,10 +252,10 @@ pub enum ReportValidationError {
         period_end: NaiveDate,
         as_of: NaiveDate,
     },
-    #[error("source publication date {publication_date} is after the as-of time {as_of}")]
+    #[error("source publication date {publication_date} is after the as-of date {as_of}")]
     PublicationInFuture {
-        publication_date: DateTime<Utc>,
-        as_of: DateTime<Utc>,
+        publication_date: NaiveDate,
+        as_of: NaiveDate,
     },
     #[error("source URL was not observed during this research turn")]
     SourceNotObserved,
@@ -285,7 +285,8 @@ pub enum ReportValidationError {
 
 #[derive(Debug, Clone)]
 struct ResearchState {
-    as_of: DateTime<Utc>,
+    as_of: NaiveDate,
+    observations: Vec<EvidenceRecord>,
     evidence: Vec<EvidenceRecord>,
     validated_report: Option<ValidatedFinancialReport>,
     resolution: Option<FinancialReportResolution>,
@@ -297,11 +298,28 @@ pub struct ResearchContext {
     state: Arc<Mutex<ResearchState>>,
 }
 
+pub trait IntoTurnDate {
+    fn into_turn_date(self) -> NaiveDate;
+}
+
+impl IntoTurnDate for NaiveDate {
+    fn into_turn_date(self) -> NaiveDate {
+        self
+    }
+}
+
+impl IntoTurnDate for DateTime<Utc> {
+    fn into_turn_date(self) -> NaiveDate {
+        self.date_naive()
+    }
+}
+
 impl ResearchContext {
-    pub fn new(as_of: DateTime<Utc>) -> Self {
+    pub fn new<T: IntoTurnDate>(as_of: T) -> Self {
         Self {
             state: Arc::new(Mutex::new(ResearchState {
-                as_of,
+                as_of: as_of.into_turn_date(),
+                observations: Vec::new(),
                 evidence: Vec::new(),
                 validated_report: None,
                 resolution: None,
@@ -310,9 +328,10 @@ impl ResearchContext {
         }
     }
 
-    pub fn begin_turn(&self, as_of: DateTime<Utc>) {
+    pub fn begin_turn(&self, as_of: NaiveDate) {
         if let Ok(mut state) = self.state.lock() {
             state.as_of = as_of;
+            state.observations.clear();
             state.evidence.clear();
             state.validated_report = None;
             state.resolution = None;
@@ -320,11 +339,11 @@ impl ResearchContext {
         }
     }
 
-    pub fn as_of(&self) -> DateTime<Utc> {
+    pub fn as_of(&self) -> NaiveDate {
         self.state
             .lock()
             .map(|state| state.as_of)
-            .unwrap_or_else(|_| Utc::now())
+            .unwrap_or_else(|_| Utc::now().date_naive())
     }
 
     pub fn record_evidence(&self, mut evidence: EvidenceRecord) {
@@ -332,6 +351,7 @@ impl ResearchContext {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
+        state.observations.push(evidence.clone());
         if let Some(index) = state
             .evidence
             .iter()
@@ -377,6 +397,15 @@ impl ResearchContext {
             .unwrap_or_default()
     }
 
+    /// Return every source observation, including repeated or conflicting
+    /// observations that were merged into the normalized evidence view.
+    pub fn observations(&self) -> Vec<EvidenceRecord> {
+        self.state
+            .lock()
+            .map(|state| state.observations.clone())
+            .unwrap_or_default()
+    }
+
     pub fn validate_candidate(
         &self,
         mut candidate: FinancialReportCandidate,
@@ -392,15 +421,15 @@ impl ResearchContext {
                 candidate.status.as_str().into(),
             ));
         }
-        if candidate.period_end > as_of.date_naive() {
+        if candidate.period_end > as_of {
             return Err(ReportValidationError::PeriodInFuture {
                 period_end: candidate.period_end,
-                as_of: as_of.date_naive(),
+                as_of,
             });
         }
-        if candidate.publication_date > as_of {
+        if candidate.publication_date.date_naive() > as_of {
             return Err(ReportValidationError::PublicationInFuture {
-                publication_date: candidate.publication_date,
+                publication_date: candidate.publication_date.date_naive(),
                 as_of,
             });
         }
@@ -507,7 +536,7 @@ impl ResearchContext {
             status = ResolutionStatus::Fallback;
             limitation = Some(format!(
                 "The newest observed annual period was not eligible as of {}; the newest eligible prior annual result is shown as a fallback.",
-                as_of.to_rfc3339()
+                as_of
             ));
         }
 
@@ -518,7 +547,7 @@ impl ResearchContext {
                 status = ResolutionStatus::Fallback;
                 limitation = Some(format!(
                     "No eligible annual report was observed as of {}; the newest eligible quarterly result is shown as a fallback and must not be treated as annual.",
-                    as_of.to_rfc3339()
+                    as_of
                 ));
             }
             fallback
@@ -530,15 +559,14 @@ impl ResearchContext {
             limitation = Some(match requested_cadence {
                 ReportCadence::Annual => format!(
                     "No eligible annual or quarterly result was observed as of {}.",
-                    as_of.to_rfc3339()
+                    as_of
                 ),
-                ReportCadence::Quarterly => format!(
-                    "No eligible quarterly result was observed as of {}.",
-                    as_of.to_rfc3339()
-                ),
+                ReportCadence::Quarterly => {
+                    format!("No eligible quarterly result was observed as of {}.", as_of)
+                }
                 ReportCadence::Latest => format!(
                     "No eligible official reported result was observed as of {}.",
-                    as_of.to_rfc3339()
+                    as_of
                 ),
             });
         }
@@ -594,8 +622,8 @@ impl ResearchContext {
                 let calendar = metadata.calendar?;
                 let status = metadata.status?;
                 if !status.is_eligible()
-                    || period_end > as_of.date_naive()
-                    || publication_date > as_of
+                    || period_end > as_of
+                    || publication_date.date_naive() > as_of
                     || !requested_cadence.accepts(report_type)
                 {
                     return None;
@@ -640,10 +668,10 @@ impl ResearchContext {
                 return false;
             }
             let status_eligible = metadata.status.is_some_and(ReportStatus::is_eligible);
-            let period_completed = period_end <= state.as_of.date_naive();
+            let period_completed = period_end <= state.as_of;
             let publication_available = evidence
                 .published_at
-                .is_some_and(|published_at| published_at <= state.as_of);
+                .is_some_and(|published_at| published_at.date_naive() <= state.as_of);
             !(status_eligible && period_completed && publication_available)
         })
     }
@@ -1096,10 +1124,8 @@ pub fn looks_like_financial_report(output: &str) -> bool {
     financial_metric && (report_language || structured_report_metadata || period_token)
 }
 
-fn contains_as_of(output: &str, as_of: DateTime<Utc>) -> bool {
-    let date = as_of.date_naive().to_string();
-    let timestamp = as_of.to_rfc3339();
-    let zulu_timestamp = as_of.to_rfc3339_opts(SecondsFormat::Secs, true);
+fn contains_as_of(output: &str, as_of: NaiveDate) -> bool {
+    let date = as_of.to_string();
     output.lines().any(|line| {
         let lower = line.to_ascii_lowercase();
         (lower.contains("as of")
@@ -1107,7 +1133,6 @@ fn contains_as_of(output: &str, as_of: DateTime<Utc>) -> bool {
             || lower.contains("as_of")
             || lower.contains("as-of:"))
             && line.contains(&date)
-            && (line.contains(&timestamp) || line.contains(&zulu_timestamp))
     })
 }
 
@@ -1195,7 +1220,7 @@ mod tests {
     #[test]
     fn rejects_a_source_published_after_the_as_of_time() {
         let context = ResearchContext::new(as_of());
-        let publication_date = as_of() + chrono::Duration::hours(1);
+        let publication_date = as_of() + chrono::Duration::days(1);
         let report = candidate(publication_date);
         context.record_evidence(evidence(&report.publication_url, Some(publication_date)));
 

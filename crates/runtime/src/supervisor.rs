@@ -5,7 +5,7 @@ use crate::memory_store::{MemoryNote, MemoryState, MemoryStore};
 use crate::model_limits_api;
 use crate::pty::PtyManager;
 use crate::session_store::SessionStore;
-use chrono::{DateTime, Utc};
+use chrono::{NaiveDate, Utc};
 use nca_common::config::{
     NcaConfig, PermissionMode, resolve_last_session_path, resolve_memory_path, resolve_sessions_dir,
 };
@@ -199,10 +199,11 @@ impl Supervisor {
             event_tx.clone(),
             todos.clone(),
         )));
-        tools.register(Box::new(InvokeSkillTool::new(
+        tools.register(Box::new(InvokeSkillTool::new_with_financial_capability(
             workspace_root.clone(),
             config.harness.skill_directories.clone(),
             recent_skills,
+            tools.financial_research_capability(),
         )));
         let session_id = cfg.session_id.unwrap_or_else(generate_session_id);
         let session_store = SessionStore::new(resolve_sessions_dir(&config, &workspace_root));
@@ -358,7 +359,8 @@ impl Supervisor {
     }
 
     pub async fn run_turn(&mut self, prompt: &str) -> Result<String, ProviderError> {
-        self.run_turn_with_images_at(prompt, &[], Utc::now()).await
+        self.run_turn_with_images_at(prompt, &[], Utc::now().date_naive())
+            .await
     }
 
     /// Run one turn against an explicit temporal boundary.
@@ -369,7 +371,7 @@ impl Supervisor {
     pub async fn run_turn_at(
         &mut self,
         prompt: &str,
-        as_of: DateTime<Utc>,
+        as_of: NaiveDate,
     ) -> Result<String, ProviderError> {
         self.run_turn_with_images_at(prompt, &[], as_of).await
     }
@@ -380,7 +382,7 @@ impl Supervisor {
         prompt: &str,
         attachments: &[nca_common::message::ImageAttachment],
     ) -> Result<String, ProviderError> {
-        self.run_turn_with_images_at(prompt, attachments, Utc::now())
+        self.run_turn_with_images_at(prompt, attachments, Utc::now().date_naive())
             .await
     }
 
@@ -389,7 +391,7 @@ impl Supervisor {
         &mut self,
         prompt: &str,
         attachments: &[nca_common::message::ImageAttachment],
-        as_of: DateTime<Utc>,
+        as_of: NaiveDate,
     ) -> Result<String, ProviderError> {
         if !attachments.is_empty()
             && !nca_common::model_caps::model_accepts_native_images(
@@ -759,10 +761,10 @@ impl Supervisor {
 
     /// Build a harness snapshot from current workspace, config, memory, and todos.
     pub fn build_harness_snapshot(&self) -> HarnessSnapshot {
-        self.build_harness_snapshot_at(Utc::now())
+        self.build_harness_snapshot_at(Utc::now().date_naive())
     }
 
-    fn build_harness_snapshot_at(&self, as_of: DateTime<Utc>) -> HarnessSnapshot {
+    fn build_harness_snapshot_at(&self, as_of: NaiveDate) -> HarnessSnapshot {
         let todos = self
             .todos
             .lock()
@@ -783,12 +785,12 @@ impl Supervisor {
 
     /// Rebuild the agent system prompt from the current harness snapshot.
     pub fn refresh_system_prompt(&mut self) {
-        let as_of = Utc::now();
+        let as_of = Utc::now().date_naive();
         self.agent.begin_research_turn(as_of);
         self.refresh_system_prompt_at(as_of);
     }
 
-    fn refresh_system_prompt_at(&mut self, as_of: DateTime<Utc>) {
+    fn refresh_system_prompt_at(&mut self, as_of: NaiveDate) {
         let snapshot = self.build_harness_snapshot_at(as_of);
         let prompt = build_system_prompt(&self.config, &snapshot, self.orchestration.as_ref());
         self.agent.set_system_prompt(prompt);
@@ -1833,7 +1835,6 @@ mod tests {
 
         let home = tempfile::tempdir().expect("product home");
         unsafe { std::env::set_var("NCA_HOME", home.path()) };
-        unsafe { std::env::set_var("NCA_SKIP_CONTEXT_API", "1") };
         let workspace = tempfile::tempdir().expect("workspace");
         let mut config = nca_common::config::NcaConfig::default();
         config.provider.default = ProviderKind::Custom;
@@ -1857,7 +1858,10 @@ mod tests {
         .await
         .expect("create supervisor");
 
-        let as_of = Utc.with_ymd_and_hms(2026, 7, 29, 12, 0, 0).unwrap();
+        let as_of = Utc
+            .with_ymd_and_hms(2026, 7, 29, 12, 0, 0)
+            .unwrap()
+            .date_naive();
         let output = supervisor
             .run_turn_at("say hello", as_of)
             .await
@@ -1866,11 +1870,10 @@ mod tests {
         let request_body = body_rx
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("provider body");
-        assert!(request_body.contains("as_of: 2026-07-29T12:00:00+00:00"));
+        assert!(request_body.contains("as_of: 2026-07-29"));
 
         supervisor.finish(EndReason::Completed).await;
         unsafe { std::env::remove_var("NCA_HOME") };
-        unsafe { std::env::remove_var("NCA_SKIP_CONTEXT_API") };
     }
 
     #[tokio::test]

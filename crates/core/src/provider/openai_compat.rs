@@ -1,3 +1,5 @@
+#![allow(clippy::items_after_test_module)]
+
 use std::path::Path;
 
 use base64::{Engine, engine::general_purpose::STANDARD as B64};

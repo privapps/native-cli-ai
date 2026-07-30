@@ -349,6 +349,7 @@ pub fn handle_custom_provider_setup_key(
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use crate::tui::state::TuiSessionState;
