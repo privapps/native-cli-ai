@@ -5,7 +5,7 @@ use crate::memory_store::{MemoryNote, MemoryState, MemoryStore};
 use crate::model_limits_api;
 use crate::pty::PtyManager;
 use crate::session_store::SessionStore;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use nca_common::config::{
     NcaConfig, PermissionMode, resolve_last_session_path, resolve_memory_path, resolve_sessions_dir,
 };
@@ -358,7 +358,20 @@ impl Supervisor {
     }
 
     pub async fn run_turn(&mut self, prompt: &str) -> Result<String, ProviderError> {
-        self.run_turn_with_images(prompt, &[]).await
+        self.run_turn_with_images_at(prompt, &[], Utc::now()).await
+    }
+
+    /// Run one turn against an explicit temporal boundary.
+    ///
+    /// Production callers should normally use [`run_turn`]. This seam keeps
+    /// date-sensitive research deterministic for replay, regression fixtures,
+    /// and callers that already own a trusted clock.
+    pub async fn run_turn_at(
+        &mut self,
+        prompt: &str,
+        as_of: DateTime<Utc>,
+    ) -> Result<String, ProviderError> {
+        self.run_turn_with_images_at(prompt, &[], as_of).await
     }
 
     /// Like [`run_turn`], but attaches on-disk images (paths relative to workspace) for vision models.
@@ -366,6 +379,17 @@ impl Supervisor {
         &mut self,
         prompt: &str,
         attachments: &[nca_common::message::ImageAttachment],
+    ) -> Result<String, ProviderError> {
+        self.run_turn_with_images_at(prompt, attachments, Utc::now())
+            .await
+    }
+
+    /// Like [`run_turn_at`], but attaches on-disk images (paths relative to workspace).
+    pub async fn run_turn_with_images_at(
+        &mut self,
+        prompt: &str,
+        attachments: &[nca_common::message::ImageAttachment],
+        as_of: DateTime<Utc>,
     ) -> Result<String, ProviderError> {
         if !attachments.is_empty()
             && !nca_common::model_caps::model_accepts_native_images(
@@ -381,7 +405,8 @@ impl Supervisor {
         }
 
         // Refresh dynamic harness (env / todos / memory) before every turn.
-        self.refresh_system_prompt();
+        self.agent.begin_research_turn(as_of);
+        self.refresh_system_prompt_at(as_of);
 
         // Check context before running turn
         self.maybe_compact_context().await;
@@ -734,6 +759,10 @@ impl Supervisor {
 
     /// Build a harness snapshot from current workspace, config, memory, and todos.
     pub fn build_harness_snapshot(&self) -> HarnessSnapshot {
+        self.build_harness_snapshot_at(Utc::now())
+    }
+
+    fn build_harness_snapshot_at(&self, as_of: DateTime<Utc>) -> HarnessSnapshot {
         let todos = self
             .todos
             .lock()
@@ -741,6 +770,7 @@ impl Supervisor {
             .unwrap_or_default();
         HarnessSnapshot {
             workspace_root: self.workspace_root.clone(),
+            as_of,
             cwd_display: self.workspace_root.display().to_string(),
             git_branch: detect_git_branch(&self.workspace_root),
             model: self.model.clone(),
@@ -753,7 +783,13 @@ impl Supervisor {
 
     /// Rebuild the agent system prompt from the current harness snapshot.
     pub fn refresh_system_prompt(&mut self) {
-        let snapshot = self.build_harness_snapshot();
+        let as_of = Utc::now();
+        self.agent.begin_research_turn(as_of);
+        self.refresh_system_prompt_at(as_of);
+    }
+
+    fn refresh_system_prompt_at(&mut self, as_of: DateTime<Utc>) {
+        let snapshot = self.build_harness_snapshot_at(as_of);
         let prompt = build_system_prompt(&self.config, &snapshot, self.orchestration.as_ref());
         self.agent.set_system_prompt(prompt);
     }
@@ -1715,11 +1751,14 @@ pub async fn get_last_session_id(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Duration, Utc};
+    use chrono::{Duration, TimeZone, Utc};
+    use nca_common::config::{ProviderCompatibility, ProviderKind};
     use nca_common::event::AgentCommand;
     use nca_common::message::Message;
     use nca_common::session::{SessionMeta, SessionState, SessionStatus};
     use std::fs;
+    use std::sync::mpsc as std_mpsc;
+    use tiny_http::{Header, Response, Server};
 
     fn write_session_for_test(
         workspace: &std::path::Path,
@@ -1761,6 +1800,77 @@ mod tests {
 
         let json = serde_json::to_string_pretty(&session).expect("serialize session");
         fs::write(sessions_dir.join(format!("{id}.json")), json).expect("write session");
+    }
+
+    #[tokio::test]
+    async fn run_turn_at_refreshes_the_harness_with_the_supplied_clock() {
+        let server = Server::http("127.0.0.1:0").expect("provider fixture");
+        let address = match server.server_addr() {
+            tiny_http::ListenAddr::IP(address) => address,
+            other => panic!("unsupported provider address: {other:?}"),
+        };
+        let (body_tx, body_rx) = std_mpsc::channel();
+        std::thread::spawn(move || {
+            let mut request = server.recv().expect("provider request");
+            let mut body = String::new();
+            request
+                .as_reader()
+                .read_to_string(&mut body)
+                .expect("read provider body");
+            body_tx.send(body).expect("capture provider body");
+            request
+                .respond(
+                    Response::from_string(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                    )
+                    .with_header(
+                        Header::from_bytes("Content-Type", "text/event-stream")
+                            .expect("content type header"),
+                    ),
+                )
+                .expect("provider response");
+        });
+
+        let home = tempfile::tempdir().expect("product home");
+        unsafe { std::env::set_var("NCA_HOME", home.path()) };
+        unsafe { std::env::set_var("NCA_SKIP_CONTEXT_API", "1") };
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut config = nca_common::config::NcaConfig::default();
+        config.provider.default = ProviderKind::Custom;
+        config.provider.custom.base_url = format!("http://{address}");
+        config.provider.custom.api_key = Some("test-key".into());
+        config.provider.custom.model = "test-model".into();
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAi;
+        config.model.default_model = "test-model".into();
+        config.memory.context.auto_detect_context_window = false;
+        config.memory.context.query_provider_models_api = false;
+
+        let mut supervisor = Supervisor::create(SupervisorConfig {
+            config,
+            workspace_root: workspace.path().to_path_buf(),
+            safe_mode: true,
+            interactive_approvals: false,
+            session_id: Some("fake-clock-test".into()),
+            approval_handler: None,
+            orchestration_context: None,
+        })
+        .await
+        .expect("create supervisor");
+
+        let as_of = Utc.with_ymd_and_hms(2026, 7, 29, 12, 0, 0).unwrap();
+        let output = supervisor
+            .run_turn_at("say hello", as_of)
+            .await
+            .expect("run fake-clock turn");
+        assert_eq!(output, "ok");
+        let request_body = body_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("provider body");
+        assert!(request_body.contains("as_of: 2026-07-29T12:00:00+00:00"));
+
+        supervisor.finish(EndReason::Completed).await;
+        unsafe { std::env::remove_var("NCA_HOME") };
+        unsafe { std::env::remove_var("NCA_SKIP_CONTEXT_API") };
     }
 
     #[tokio::test]

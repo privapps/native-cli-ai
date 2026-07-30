@@ -1,28 +1,40 @@
-## Learned User Preferences
+# nca Development Instructions
 
-- Always use Rust-native solutions; no JavaScript, Node.js, or Electron involvement
-- MiniMax M2.5 is the primary LLM provider; prioritize MiniMax integration over other providers
-- **CLI (`nca`) is the product surface**—terminal UX, JSON/NDJSON streams, and Unix-socket IPC
-- Empty provider completions must fail loudly, never silently succeed
-- Use plan-first workflow: create a plan document, then implement from it
-- Install CLI via `cargo build --release` then `cp target/release/nca /usr/local/bin/`
-- Keep each crate focused: `common` for shared types, `core` for agent logic, `runtime` for session lifecycle, `cli` for terminal UX
-- User tests CLI in separate workspace directories (e.g. `test-makan`, `for-test`)
-- Prefer efficient algorithms and fast execution; the CLI is intended as a spawner for heavy tasks
-- Sub-agents should use isolated worktrees; parent/child session lineage should stay visible in session metadata and events
+Apply this section only when the request concerns developing, testing, building, documenting, configuring, or deploying the nca product or this repository. Do not apply it to unrelated conversation, research, writing, or other general-purpose tasks merely because the current directory is nca.
 
-## Learned Workspace Facts
+- Use Rust-native solutions for nca; do not introduce JavaScript, Node.js, Electron, Tauri, or web wrappers unless the nca task explicitly requires them.
+- MiniMax M2.5 is the primary provider; prioritize MiniMax integration, quality, configuration, and diagnostics while preserving provider abstraction.
+- The CLI (`nca`) is the product surface: terminal UX, JSON/NDJSON streams, and Unix-socket IPC.
+- Keep each crate focused: `common` for shared types, `core` for agent logic, `runtime` for session lifecycle, and `cli`/`tui` for terminal presentation and entrypoint concerns.
+- Empty provider completions must fail loudly and never silently succeed.
+- For non-trivial nca changes, create a plan document first and implement from it in bounded, testable steps.
+- For nca source changes, inspect with `list_directory`, `search_code`, `read_file`, and `query_symbols` before editing.
+- Prefer nca edit tools in this order: `replace_match` for an exact search hit, `edit_file` for a unique exact replacement, `apply_patch` for multiple hunks, and `write_file`/`create_directory` only for new paths.
+- Prefer efficient algorithms and fast execution; nca is intended to spawn and supervise heavy tasks.
+- Sub-agents must use isolated worktrees, with parent/child session lineage visible in session metadata and events.
+- User CLI testing may use separate workspace directories such as `test-makan` or `for-test`.
+- When explicitly asked to install nca, build with `cargo build --release` and copy `target/release/nca` to `/usr/local/bin/`; do not install as an implicit part of ordinary changes.
 
-- Rust workspace with **4 crates**: `nca-common`, `nca-core`, `nca-runtime`, `nca-cli`
-- IPC between CLI and runtime uses Unix domain sockets with newline-delimited JSON
-- Product home at `$NCA_HOME`, `$XDG_DATA_HOME/ncacli`, or `~/.local/share/ncacli/`; sessions/memory/last_session/cli-index under `workspaces/<workspace-id>/`
-- Sessions persisted as `<id>.json` (state) + `<id>.events.jsonl` (event log) in `~/.local/share/ncacli/workspaces/<id>/sessions/`
-- MiniMax provider endpoint: `https://api.minimaxi.chat/v1/text/chatcompletion_v2`
-- Global config at `~/.local/share/ncacli/config.toml` (legacy `~/.nca/config.toml` read fallback)
-- Git worktrees for isolated agent runs stored at `<repo>/.nca/worktrees/<session-id>`
-- **Single shipped app binary:** `nca` (CLI)
-- Tokio async runtime; `async-trait` for tool executor and approval handler interfaces
-- Session lineage: parent/child session IDs, inherited summary, spawn reason tracked in `SessionMeta`
-- `AgentEvent` enum is the shared event bus for CLI rendering, IPC broadcast, and disk persistence
-- Runtime socket dir defaults to `$XDG_RUNTIME_DIR/nca/` or `/tmp/nca/`
-- Dynamic harness: supervisor builds `HarnessSnapshot` and refreshes the system prompt each turn
+# General Agent Behavior
+
+- Inspect only the context relevant to the current request.
+- Prefer fast local signals and concrete verification before claiming success.
+- State important constraints, risks, assumptions, and verification results plainly.
+
+# Workspace Facts
+
+These facts describe the nca implementation; use them as reference only when the task concerns nca.
+
+- Rust workspace with crates for shared types (`nca-common`), agent logic (`nca-core`), session lifecycle (`nca-runtime`), terminal UI (`nca-tui`), CLI entrypoint (`nca-cli`), and autoresearch helpers.
+- IPC between CLI and runtime uses Unix domain sockets with newline-delimited JSON.
+- Product home is `$NCA_HOME`, `$XDG_DATA_HOME/ncacli`, or `~/.local/share/ncacli/`; sessions, memory, last-session state, and the CLI index live under `workspaces/<workspace-id>/`.
+- Sessions persist as `<id>.json` state plus `<id>.events.jsonl` event logs under the workspace sessions directory.
+- MiniMax uses `https://api.minimaxi.chat/v1/text/chatcompletion_v2`.
+- Global config is `~/.local/share/ncacli/config.toml`; legacy `~/.nca/config.toml` is read as a fallback.
+- Git worktrees for isolated agent runs live at `<repo>/.nca/worktrees/<session-id>`.
+- The shipped app is the single `nca` CLI binary.
+- Tokio provides the async runtime; `async-trait` supports tool executor and approval handler interfaces.
+- Session lineage records parent/child IDs, inherited summaries, and spawn reasons in `SessionMeta`.
+- `AgentEvent` is the shared event bus for CLI rendering, IPC broadcast, and disk persistence.
+- Runtime sockets default to `$XDG_RUNTIME_DIR/nca/` or `/tmp/nca/`.
+- The supervisor builds a `HarnessSnapshot` and refreshes the system prompt each turn.

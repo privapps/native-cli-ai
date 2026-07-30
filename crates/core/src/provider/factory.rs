@@ -60,6 +60,7 @@ mod tests {
     fn factory_fails_loudly_when_selected_provider_is_missing_credentials() {
         let mut config = NcaConfig::default();
         config.provider.default = ProviderKind::OpenAi;
+        config.provider.openai.api_key_env = "__NCA_TEST_MISSING_OPENAI_KEY__".into();
         match build_provider(&config) {
             Ok(_) => panic!("missing credentials should fail"),
             Err(error) => {

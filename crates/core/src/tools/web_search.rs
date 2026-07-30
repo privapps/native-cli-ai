@@ -1,5 +1,12 @@
+use crate::research::{
+    EvidenceRecord, ResearchContext, classify_source_authority, infer_report_metadata_for_issuer,
+    parse_publication_date,
+};
+use chrono::{DateTime, Utc};
 use nca_common::config::WebConfig;
 use nca_common::tool::{ToolCall, ToolDefinition, ToolResult};
+use serde_json::json;
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::ToolExecutor;
@@ -11,16 +18,21 @@ use super::fetch_url::{
 pub struct WebSearchTool {
     client: reqwest::Client,
     config: WebConfig,
+    context: Arc<ResearchContext>,
 }
 
 impl WebSearchTool {
-    pub fn new(config: WebConfig) -> Self {
+    pub fn new(config: WebConfig, context: Arc<ResearchContext>) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(config.timeout_secs))
             .user_agent(config.user_agent.clone())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self { client, config }
+        Self {
+            client,
+            config,
+            context,
+        }
     }
 }
 
@@ -29,12 +41,25 @@ impl ToolExecutor for WebSearchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "web_search".into(),
-            description: "Search the public web and return titles, URLs, and snippets".into(),
+            description: "Search the public web and return dated, source-attributed titles, URLs, and snippets. Use this before validating a financial report.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "query": { "type": "string" },
-                    "limit": { "type": "integer" }
+                    "limit": { "type": "integer" },
+                    "domains": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional domains to prefer, such as an issuer investor-relations site or sec.gov"
+                    },
+                    "issuer": {
+                        "type": "string",
+                        "description": "Optional issuer name; provide this for financial-report resolution so result metadata is tied to the named issuer"
+                    },
+                    "as_of": {
+                        "type": "string",
+                        "description": "Optional RFC3339 as-of assertion; it must match the runtime research boundary"
+                    }
                 },
                 "required": ["query"]
             }),
@@ -58,10 +83,30 @@ impl ToolExecutor for WebSearchTool {
             };
         }
 
+        if let Some(requested_as_of) = call.input["as_of"].as_str() {
+            let Some(requested_as_of) = parse_publication_date(requested_as_of) else {
+                return ToolResult {
+                    call_id: call.id.clone(),
+                    success: false,
+                    output: String::new(),
+                    error: Some("as_of must be an RFC3339 timestamp or YYYY-MM-DD date".into()),
+                };
+            };
+            if requested_as_of != self.context.as_of() {
+                return ToolResult {
+                    call_id: call.id.clone(),
+                    success: false,
+                    output: String::new(),
+                    error: Some("as_of must match the runtime research boundary".into()),
+                };
+            }
+        }
+
+        let query = add_domain_hints(query, &call.input["domains"]);
         let response = self
             .client
             .get("https://html.duckduckgo.com/html/")
-            .query(&[("q", query)])
+            .query(&[("q", query.as_str())])
             .send()
             .await;
 
@@ -99,13 +144,76 @@ impl ToolExecutor for WebSearchTool {
             };
         }
 
+        let retrieved_at = Utc::now();
+        let as_of = self.context.as_of();
+        let issuer = call.input["issuer"].as_str();
+        let results = rows
+            .into_iter()
+            .map(|row| {
+                let authority = classify_source_authority(&row.url);
+                let report_metadata = infer_report_metadata_for_issuer(
+                    &format!("{} {}", row.title, row.snippet),
+                    issuer,
+                );
+                self.context.record_evidence(EvidenceRecord {
+                    url: row.url.clone(),
+                    title: Some(row.title.clone()),
+                    snippet: Some(row.snippet.clone()),
+                    retrieved_at,
+                    response_status: None,
+                    http_date: None,
+                    published_at: row.published_at,
+                    authority,
+                    report_metadata: report_metadata.clone(),
+                });
+                json!({
+                    "title": row.title,
+                    "url": row.url,
+                    "snippet": row.snippet,
+                    "published_at": row.published_at,
+                    "retrieved_at": retrieved_at,
+                    "source_authority": authority,
+                    "report_metadata": report_metadata,
+                    "eligible_as_of": row.published_at.map(|date| date <= as_of),
+                })
+            })
+            .collect::<Vec<_>>();
+
         ToolResult {
             call_id: call.id.clone(),
             success: true,
-            output: rows.join("\n"),
+            output: serde_json::to_string_pretty(&json!({
+                "query": query,
+                "as_of": as_of,
+                "retrieved_at": retrieved_at,
+                "results": results,
+            }))
+            .unwrap_or_else(|_| "{\"results\":[]}".into()),
             error: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchResult {
+    title: String,
+    url: String,
+    snippet: String,
+    published_at: Option<DateTime<Utc>>,
+}
+
+fn add_domain_hints(query: &str, domains: &serde_json::Value) -> String {
+    let mut query = query.to_string();
+    if let Some(domains) = domains.as_array() {
+        for domain in domains.iter().filter_map(|domain| domain.as_str()) {
+            let domain = domain.trim();
+            if !domain.is_empty() {
+                query.push_str(" site:");
+                query.push_str(domain);
+            }
+        }
+    }
+    query
 }
 
 fn clean_href(href: &str) -> String {
@@ -116,7 +224,7 @@ fn clean_href(href: &str) -> String {
     }
 }
 
-fn parse_search_results(body: &str, limit: usize) -> Vec<String> {
+fn parse_search_results(body: &str, limit: usize) -> Vec<SearchResult> {
     let mut rows = Vec::new();
     for result in classed_divisions(body, "result").into_iter().take(limit) {
         let title_node = first_html_element_with_class(&result, "a", "result__a").or_else(|| {
@@ -135,7 +243,14 @@ fn parse_search_results(body: &str, limit: usize) -> Vec<String> {
             .map(|(_, snippet_body)| html_fragment_text(&snippet_body))
             .unwrap_or_default();
         if !title.is_empty() && !url.is_empty() {
-            rows.push(format!("- {title}\n  URL: {url}\n  Snippet: {snippet}"));
+            let published_at = first_html_element_with_class_any_tag(&result, "result__timestamp")
+                .and_then(|(_, timestamp)| parse_publication_date(&html_fragment_text(&timestamp)));
+            rows.push(SearchResult {
+                title,
+                url,
+                snippet,
+                published_at,
+            });
         }
     }
     rows
@@ -197,9 +312,40 @@ mod tests {
         assert_eq!(
             parse_search_results(html, 10),
             vec![
-                "- One\n  URL: https://example.com/one\n  Snippet: First …",
-                "- Two\n  URL: /two\n  Snippet: Second",
+                super::SearchResult {
+                    title: "One".into(),
+                    url: "https://example.com/one".into(),
+                    snippet: "First …".into(),
+                    published_at: None,
+                },
+                super::SearchResult {
+                    title: "Two".into(),
+                    url: "/two".into(),
+                    snippet: "Second".into(),
+                    published_at: None,
+                },
             ]
+        );
+    }
+
+    #[test]
+    fn parses_a_structured_publication_date_from_a_search_result() {
+        let html = r#"
+            <div class="result">
+                <a class="result__a" href="https://investor.example.com/results">Results</a>
+                <span class="result__timestamp">2026-07-29</span>
+                <p class="result__snippet">Annual earnings release</p>
+            </div>
+        "#;
+
+        let result = parse_search_results(html, 1).pop().expect("result");
+        assert_eq!(
+            result.published_at,
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-07-29T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)
+            )
         );
     }
 }

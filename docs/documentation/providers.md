@@ -147,7 +147,7 @@ model = "my-model"
 temperature = 0.7
 ```
 
-`base_url` must be an HTTP(S) origin, optionally written with a `/v1` suffix. `nca` normalizes either form to the origin and appends the protocol-specific request path. Credentials, query strings, fragments, and final request paths such as `/v1/models` are rejected.
+`base_url` must be an HTTP(S) origin, optionally with a path ending in `/v1` (for example, `https://opencode.ai/zen/v1`). `nca` preserves that path prefix and appends the protocol-specific request path. Credentials, query strings, fragments, and final request paths such as `/v1/models` are rejected.
 
 The default API-key environment-variable name is `CUSTOM_PROVIDER_API_KEY`, but it is editable in the TUI wizard and in TOML. Environment-variable names must be portable shell names such as `GATEWAY_API_KEY`.
 
@@ -181,6 +181,9 @@ The wizard collects four fields:
 
 Model IDs are entered manually and remain usable even when model discovery is unavailable.
 
+Reasoning effort is configured separately under `[model]`; it is not a field in
+the Custom-provider setup wizard.
+
 **Slash command:**
 
 ```
@@ -194,19 +197,19 @@ The `/custom` command remains supported for scripts and existing users. Omitting
 
 OpenAI-compatible custom endpoints use:
 
-- `GET /v1/models` with `Authorization: Bearer …` for the setup probe.
-- `POST /v1/chat/completions` with Bearer authentication for chat.
+- `GET <base path>/models` with `Authorization: Bearer …` for the setup probe (`/v1/models` for an origin, or `/zen/v1/models` for the example above).
+- `POST <base path>/chat/completions` with Bearer authentication for chat.
 - Server-sent events (`stream = true`) and OpenAI tool-call shapes for streaming agent turns.
 
 Anthropic-compatible custom endpoints use:
 
-- A minimal `POST /v1/messages` probe with `x-api-key` and `anthropic-version: 2023-06-01`.
-- `POST /v1/messages` with the same headers for chat.
+- A minimal `POST <base path>/messages` probe with `x-api-key` and `anthropic-version: 2023-06-01`.
+- `POST <base path>/messages` with the same headers for chat.
 - Server-sent events (`stream = true`) and Anthropic tool-use shapes for streaming agent turns.
 
 The TUI performs the cheap protocol-specific probe before activation. Malformed URLs, invalid environment-variable names, and missing credentials are blocking errors. Network, authentication, protocol, and endpoint failures offer **Retry**, **Save anyway**, or **Cancel**. **Save anyway** activates the manually configured provider without requiring model discovery. Probe errors are sanitized before display.
 
-Model discovery is best-effort: OpenAI-compatible endpoints use `/v1/models` with Bearer authentication, and Anthropic-compatible endpoints use the paginated `/v1/models` API with Anthropic headers. A failed discovery request does not prevent a manually entered model ID from being used.
+Model discovery is best-effort: OpenAI-compatible endpoints use `<base path>/models` with Bearer authentication, and Anthropic-compatible endpoints use the paginated `<base path>/models` API with Anthropic headers. A failed discovery request does not prevent a manually entered model ID from being used.
 
 ### Persistence
 
@@ -221,6 +224,38 @@ Notes:
 - `compatibility = "anthropic"` selects the Anthropic-compatible wire format.
 - After setup, use `/model <name>` to switch the active model ID.
 - Press `c` in the provider picker for a quick-reference help card
+
+## Reasoning Effort
+
+OpenAI-compatible Chat Completions models can receive a configurable
+`reasoning_effort` value. Set it globally in `~/.local/share/ncacli/config.toml`
+or the workspace override:
+
+```toml
+[model]
+reasoning_effort = "high"
+```
+
+The value is trimmed and passed through as a string. Use `"none"`, `"low"`,
+`"medium"`, `"high"`, `"xhigh"`, or a provider-specific value supported by
+your gateway. The literal `"nil"` (the default), an empty value, and a
+whitespace-only value omit the JSON property. This setting is sent for
+OpenAI, OpenRouter, and Custom providers with `compatibility = "openai"`.
+It is not sent for MiniMax, Anthropic, or Custom providers with
+`compatibility = "anthropic"`.
+
+For a single invocation, use the global CLI override:
+
+```bash
+nca --reasoning-effort low --prompt "review this code"
+nca --reasoning-effort nil --prompt "use the provider default"
+```
+
+The override is not persisted. In an interactive session, use
+`/reasoning-effort <value>` to persist a workspace setting, or
+`/reasoning-effort` to display the current value and whether the active
+provider supports it. `reasoning_effort` remains independent from extended
+thinking settings and temperature.
 
 ## Switching Providers
 

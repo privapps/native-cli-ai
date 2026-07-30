@@ -890,6 +890,19 @@ impl Repl {
                     format!("Children:    {}", snapshot.child_session_ids.len()),
                     format!("Todos:       {}", snapshot.todos.len()),
                     format!("Memory:      {}", self.runtime.memory_store_path().display()),
+                    format!(
+                        "Reasoning:   {} (OpenAI-compatible only; {})",
+                        self.runtime.config().model.reasoning_effort,
+                        if self
+                            .runtime
+                            .config()
+                            .reasoning_effort_active_for_default_provider()
+                        {
+                            "active"
+                        } else {
+                            "inactive for active provider"
+                        }
+                    ),
                     String::new(),
                     "Provider health:".into(),
                 ];
@@ -1347,6 +1360,13 @@ impl Repl {
                         self.runtime.config().model.enable_thinking,
                         self.runtime.config().model.thinking_budget
                     ));
+                    out.println(&format!(
+                        "reasoning_effort={} scope=OpenAI-compatible-only active={}",
+                        self.runtime.config().model.reasoning_effort,
+                        self.runtime
+                            .config()
+                            .reasoning_effort_active_for_default_provider()
+                    ));
                     for provider in nca_common::config::ProviderKind::ALL {
                         out.println(&format!(
                             "  {} -> {} ({})",
@@ -1517,6 +1537,15 @@ impl Repl {
                     format!("Permission:  {:?}", self.runtime.permission_mode()),
                     format!("Memory:      {}", self.runtime.memory_store_path().display()),
                     format!("Editor:      {}", config.effective_editor_command()),
+                    format!(
+                        "Reasoning:   {} (OpenAI-compatible only; {})",
+                        config.model.reasoning_effort,
+                        if config.reasoning_effort_active_for_default_provider() {
+                            "active"
+                        } else {
+                            "inactive for active provider"
+                        }
+                    ),
                     format!("Thinking:    {} (budget: {})", config.model.enable_thinking, config.model.thinking_budget),
                     format!("Max tokens:  {}", config.model.max_tokens),
                     String::new(),
@@ -1950,6 +1979,43 @@ impl Repl {
                         }
                     }
                     Err(e) => out.eprintln(&format!("[thinking] {e}")),
+                }
+            }
+            "/reasoning-effort" => {
+                let value = rest.trim();
+                if value.is_empty() {
+                    let config = self.runtime.config();
+                    out.println(&format!(
+                        "reasoning effort: {} (OpenAI-compatible only; {})",
+                        config.model.reasoning_effort,
+                        if config.reasoning_effort_active_for_default_provider() {
+                            "active"
+                        } else {
+                            "inactive for active provider"
+                        }
+                    ));
+                } else {
+                    let mut cfg = self.runtime.config().clone();
+                    cfg.model.reasoning_effort = value.to_string();
+                    match self.runtime.apply_nca_config(cfg) {
+                        Ok(()) => {
+                            if let Err(error) = self
+                                .runtime
+                                .config()
+                                .save_workspace_file(self.runtime.workspace_root())
+                            {
+                                out.eprintln(&format!(
+                                    "[reasoning-effort] applied but workspace save failed: {error}"
+                                ));
+                            } else {
+                                out.println(&format!(
+                                    "reasoning effort set to {} (OpenAI-compatible only)",
+                                    self.runtime.config().model.reasoning_effort
+                                ));
+                            }
+                        }
+                        Err(error) => out.eprintln(&format!("[reasoning-effort] {error}")),
+                    }
                 }
             }
             _ => {
@@ -3365,7 +3431,7 @@ mod tests {
         assert_eq!(repl.runtime.config().provider.default, ProviderKind::Custom);
         assert_eq!(
             repl.runtime.config().provider.custom.base_url,
-            "https://gateway.example"
+            "https://gateway.example/v1"
         );
         assert_eq!(repl.runtime.config().provider.custom.model, "gateway-model");
         assert_eq!(repl.runtime.model(), "gateway-model");
@@ -3396,12 +3462,68 @@ mod tests {
         assert_eq!(repl.runtime.config().provider.default, ProviderKind::Custom);
         assert_eq!(
             repl.runtime.config().provider.custom.base_url,
-            "https://legacy.example"
+            "https://legacy.example/v1"
         );
         assert_eq!(repl.runtime.config().provider.custom.model, "legacy-model");
         let saved = std::fs::read_to_string(workspace.path().join(".nca/config.local.toml"))
             .expect("workspace config");
         assert!(saved.contains("legacy-model"));
         assert!(!saved.contains("test-minimax-key"));
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_command_sets_and_persists_trimmed_value() {
+        let (mut repl, state, workspace) = test_repl(false).await;
+
+        repl.handle_command("/reasoning-effort   low  ", ReplOutput::Tui(&state))
+            .await
+            .expect("reasoning effort command");
+
+        assert_eq!(repl.runtime.config().model.reasoning_effort, "low");
+        let saved = std::fs::read_to_string(workspace.path().join(".nca/config.local.toml"))
+            .expect("workspace config");
+        assert!(saved.contains("reasoning_effort = \"low\""));
+
+        repl.handle_command("/reasoning-effort nil", ReplOutput::Tui(&state))
+            .await
+            .expect("disable reasoning effort");
+        assert_eq!(repl.runtime.config().model.reasoning_effort, "nil");
+        let saved = std::fs::read_to_string(workspace.path().join(".nca/config.local.toml"))
+            .expect("workspace config after disabling");
+        assert!(saved.contains("reasoning_effort = \"nil\""));
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_command_without_value_displays_current_setting() {
+        let (mut repl, state, _) = test_repl(false).await;
+        repl.runtime.config_mut().model.reasoning_effort = "high".into();
+
+        repl.handle_command("/reasoning-effort", ReplOutput::Tui(&state))
+            .await
+            .expect("display reasoning effort");
+
+        let state = state.lock().expect("state lock");
+        assert!(state.blocks.iter().any(|block| matches!(
+            block,
+            DisplayBlock::System(message) if message.contains("reasoning effort: high")
+        )));
+    }
+
+    #[tokio::test]
+    async fn config_status_identifies_reasoning_effort_protocol_scope() {
+        let (mut repl, state, _) = test_repl(false).await;
+        repl.runtime.config_mut().model.reasoning_effort = "medium".into();
+
+        repl.handle_command("/config", ReplOutput::Tui(&state))
+            .await
+            .expect("show config");
+
+        let state = state.lock().expect("state lock");
+        assert!(state.info_modal_open());
+        assert!(state.info_modal_lines().iter().any(|line| {
+            line.contains("Reasoning:")
+                && line.contains("OpenAI-compatible only")
+                && line.contains("inactive for active provider")
+        }));
     }
 }

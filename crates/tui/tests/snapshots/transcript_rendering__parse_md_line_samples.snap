@@ -5,8 +5,8 @@ expression: rendered
 [
     "                     # Heading => Heading",
     "                 ## Subheading => Subheading",
-    "                 - bullet item => - ",
-    "              1. numbered item => - ",
+    "                 - bullet item => - bullet item",
+    "              1. numbered item => - numbered item",
     "                 > quoted text => quoted text",
     "               plain paragraph => plain paragraph",
     "                 `inline code` => inline code",

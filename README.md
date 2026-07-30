@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <strong>Rust-native coding agent. Single binary. Terminal-first.</strong><br />
+  <strong>Rust-native general-purpose AI assistant. Single binary. Terminal-first.</strong><br />
   <sub>v0.4 — dedicated TUI crate, unified product home, live busy activity</sub>
 </p>
 
@@ -21,7 +21,7 @@
 
 ---
 
-`nca` is a Rust-native coding CLI that ships as a single binary. It is built for local-first, terminal-first workflows: interactive TUI, line REPL, one-shot runs, detached sessions, attach/status/logs, JSON and NDJSON output, Unix-socket IPC, worktree-isolated subagents, and autonomous research helpers.
+`nca` is a Rust-native, terminal-first general-purpose AI assistant that ships as a single binary. It supports research, writing, planning, analysis, coding, and tool-driven workflows through an interactive TUI, line REPL, one-shot runs, detached sessions, attach/status/logs, JSON and NDJSON output, Unix-socket IPC, worktree-isolated subagents, and autonomous research helpers.
 
 It is meant for people who like their AI tooling close to the terminal: fast to start, easy to script, and capable of running real session workflows without dragging in a browser shell.
 
@@ -38,7 +38,7 @@ The product surface is the CLI. No desktop wrapper, no Electron, no browser in t
 
 ## What It Does
 
-- Runs coding tasks in an interactive TUI or a line-oriented REPL.
+- Runs tasks in an interactive TUI or a line-oriented REPL.
 - Keeps slash commands, the command palette, and `/help` in sync via one registry (palette Enter runs the command).
 - Supports one-shot runs and detached background sessions.
 - Persists session state and event logs under the current workspace.
@@ -53,7 +53,7 @@ The product surface is the CLI. No desktop wrapper, no Electron, no browser in t
 
 ## Why People Reach For It
 
-- You want a coding CLI that feels quick and stays out of the way.
+- You want a terminal AI assistant that feels quick and stays out of the way.
 - You want sessions, event logs, and resumable work instead of a throwaway prompt box.
 - You want child agents that can branch off cleanly with lineage and optional git worktrees.
 - You want a CLI that still works well when another system is driving it through JSON, NDJSON, and IPC.
@@ -195,6 +195,7 @@ Slash commands, the Ctrl+P command palette, autocomplete, and `/help` all come f
 | `/copy` | Copy the latest assistant response (TUI; also `Ctrl+Shift+C`). |
 | `/todos` | Show the session todo list. |
 | `/model` | Open the model picker (`/models` is an alias). |
+| `/reasoning-effort` | Show or persist the OpenAI-compatible Chat Completions reasoning effort. |
 | `/connect` | Connect / switch provider, API key, or custom endpoint; use `/provider`, `/apikey`, or `/custom` for related setup commands. |
 | `/status` | Session status and health (`/stats`, `/cost`, `/doctor` are aliases). |
 | `/config` | Config and editor settings (`/settings`, `/set-editor` are aliases). |

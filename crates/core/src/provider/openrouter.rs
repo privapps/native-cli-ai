@@ -12,6 +12,7 @@ pub struct OpenRouterProvider {
     client: reqwest::Client,
     config: OpenRouterConfig,
     max_tokens: u32,
+    reasoning_effort: String,
 }
 
 impl OpenRouterProvider {
@@ -65,6 +66,7 @@ impl OpenRouterProvider {
             client,
             config: openrouter,
             max_tokens: config.model.max_tokens,
+            reasoning_effort: config.model.reasoning_effort.clone(),
         })
     }
 
@@ -97,6 +99,7 @@ impl Provider for OpenRouterProvider {
             &model,
             self.max_tokens,
             self.config.temperature,
+            &self.reasoning_effort,
             workspace_root,
         )?;
 
@@ -155,6 +158,14 @@ mod tests {
                     .any(|header| header.field.equiv("x-title")
                         && header.value.as_str() == "Native CLI AI")
             );
+            let mut request_body = String::new();
+            request
+                .as_reader()
+                .read_to_string(&mut request_body)
+                .expect("request body");
+            let payload: serde_json::Value =
+                serde_json::from_str(&request_body).expect("JSON request body");
+            assert_eq!(payload["reasoning_effort"], "high");
         });
 
         let mut config = NcaConfig::default();
@@ -162,6 +173,7 @@ mod tests {
         config.provider.openrouter.base_url = base_url;
         config.provider.openrouter.site_url = Some("https://nca.test".into());
         config.provider.openrouter.app_name = Some("Native CLI AI".into());
+        config.model.reasoning_effort = "high".into();
 
         let provider = OpenRouterProvider::from_config(&config).expect("provider");
         let stream = provider

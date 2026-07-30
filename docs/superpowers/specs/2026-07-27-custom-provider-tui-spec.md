@@ -29,7 +29,7 @@ Provider changes will be applied to the runtime before persistence. A provider-c
 6. As a user with an existing custom configuration, I want compatibility, base URL, and model values prefilled, so that editing does not require re-entering public settings.
 7. As a user, I want the secret field to remain empty when editing, so that stored credentials are never displayed or accidentally exposed in the TUI.
 8. As a user, I want to choose OpenAI-compatible or Anthropic-compatible protocol behavior, so that the endpoint receives the request format and authentication headers it expects.
-9. As a user, I want to enter an endpoint origin or `/v1` base URL, so that common gateway URL formats work without requiring knowledge of the final request path.
+9. As a user, I want to enter an endpoint origin or a base path ending in `/v1`, so that common gateway URL formats work without requiring knowledge of the final request path.
 10. As a user, I want invalid URLs, URLs containing credentials, query strings, fragments, or final request paths to be rejected before activation, so that malformed configuration cannot create confusing runtime failures.
 11. As a user, I want to edit the API-key environment-variable name in the credential step, so that existing and provider-specific environment conventions remain usable.
 12. As a user, I want environment-variable names validated as portable shell names, so that a configured variable can be exported consistently across platforms.
@@ -58,7 +58,7 @@ Provider changes will be applied to the runtime before persistence. A provider-c
 - Keep one persisted `Custom` provider slot. Do not introduce multiple custom-provider profiles, profile management, or a new provider database.
 - Use a shared pure setup state machine for onboarding and in-session flows. It owns field transitions, validation state, probe outcomes, retry behavior, save-anyway behavior, cancellation, and edit-mode prefill. Onboarding and session TUI renderers remain separate because they have different runtime and persistence lifecycles.
 - Represent the normalized setup input as compatibility, canonical base URL, API-key environment-variable name, credential source, and model ID. Credential source distinguishes preserving the current value from explicitly storing a pasted override.
-- Accept HTTP(S) endpoint origins and equivalent `/v1` forms. Normalize trailing slashes and protocol prefixes before the adapter appends its request path. Reject credentials, query strings, fragments, and URLs that already contain `/chat/completions` or `/messages`.
+- Accept HTTP(S) endpoint origins and paths ending in `/v1`. Normalize trailing slashes while preserving an accepted path prefix before the adapter appends its request path. Reject credentials, query strings, fragments, and URLs that already contain `/chat/completions` or `/messages`.
 - Validate API-key environment-variable names using the portable shell form `[A-Za-z_][A-Za-z0-9_]*`.
 - Keep runtime credential precedence as inline key over environment lookup. A blank credential input preserves an existing inline key when one exists; otherwise it persists only the environment-variable name and never materializes the resolved environment secret into TOML.
 - Use protocol-specific cheap probes: OpenAI-compatible endpoints use `GET /v1/models` with Bearer authentication; Anthropic-compatible endpoints use a minimal `/v1/messages` request with the required Anthropic headers. Probe errors are sanitized before display and must not include secrets.
@@ -79,7 +79,7 @@ Provider changes will be applied to the runtime before persistence. A provider-c
 
 - Test observable behavior at the highest available seam: the shared custom-provider setup/probe/persistence boundary. Avoid tests coupled to individual widget rendering helpers or private serialization implementation.
 - Test the pure setup state machine for new setup, edit setup, invalid input, missing credentials, retry, save-anyway, cancellation, and successful completion.
-- Test URL normalization with origin URLs, `/v1` URLs, trailing slashes, final endpoint paths, credentials, queries, fragments, and malformed schemes.
+- Test URL normalization with origin URLs, `/v1` and prefixed `/zen/v1` URLs, trailing slashes, final endpoint paths, credentials, queries, fragments, and malformed schemes.
 - Test credential behavior with environment-only credentials, existing inline credentials, explicit overrides, blank edits, custom environment-variable names, invalid names, and secret redaction.
 - Test provider probes with deterministic HTTP fixtures for OpenAI model listing and Anthropic Messages requests. Assert request paths, authentication headers, required protocol fields, sanitized errors, and retry/save/cancel outcomes.
 - Test targeted global and workspace persistence using temporary configuration files. Assert that unrelated provider credentials, workspace settings, environment-derived secrets, comments, and unknown keys are preserved appropriately.

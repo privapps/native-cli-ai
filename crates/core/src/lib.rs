@@ -6,6 +6,7 @@ pub mod cost;
 pub mod harness;
 pub mod hooks;
 pub mod provider;
+pub mod research;
 pub mod skill_installer;
 pub mod skills;
 pub mod tools;

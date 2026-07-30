@@ -1105,7 +1105,7 @@ fn render_custom_provider_modal(f: &mut Frame, area: Rect, props: CustomProvider
             lines.push(Line::from("↑/↓ choose · Enter continue · Esc cancel"));
         }
         OnboardingScreen::Custom(CustomOnboardingStep::Endpoint) => {
-            lines.push(Line::from("Base URL (origin or origin/v1):"));
+            lines.push(Line::from("Base URL (origin or path ending in /v1):"));
             lines.push(Line::from(Span::styled(
                 format!("{input}▌"),
                 Style::default().fg(Color::Green),
@@ -1355,7 +1355,7 @@ mod tests {
         let OnboardingTransition::Probe(custom) = transition else {
             panic!("custom setup should start a probe");
         };
-        assert_eq!(custom.base_url, "https://gateway.example");
+        assert_eq!(custom.base_url, "https://gateway.example/v1");
         assert_eq!(custom.api_key_env, "GATEWAY_API_KEY");
         assert_eq!(custom.model, "gateway-model");
         assert_eq!(custom.compatibility, ProviderCompatibility::OpenAi);
@@ -1442,7 +1442,7 @@ mod tests {
         };
         let raw = std::fs::read_to_string(home.path().join("config.toml")).expect("global config");
         assert!(raw.contains("default = \"custom\""));
-        assert!(raw.contains("base_url = \"https://gateway.example\""));
+        assert!(raw.contains("base_url = \"https://gateway.example/v1\""));
         assert!(raw.contains("model = \"gateway-model\""));
         assert!(raw.contains("onboarding_completed = true"));
         assert!(raw.contains("api_key_env = \"GATEWAY_API_KEY\""));

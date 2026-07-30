@@ -1,12 +1,12 @@
 # nca — Native CLI AI
 
-A native-first, Rust-powered AI coding assistant that runs entirely in the terminal. Zero JavaScript dependencies, sub-100ms startup, and a full agent loop for code generation, file editing, command execution, and project understanding.
+A native-first, Rust-powered general-purpose AI assistant that runs entirely in the terminal. Zero JavaScript dependencies, sub-100ms startup, and a full agent loop for research, writing, planning, analysis, coding, file operations, command execution, and project understanding.
 
 **Current release: v0.4**
 
 ## What is nca?
 
-**nca** (native-cli-ai) is a terminal-native AI coding agent comparable to Claude Code and OpenAI Codex CLI — built from scratch in Rust. It provides:
+**nca** (native-cli-ai) is a terminal-native general-purpose AI assistant built from scratch in Rust. It provides:
 
 - **Interactive TUI + REPL** with multi-turn conversation, live busy activity, and agent profiles
 - **One-shot mode** for scripting and CI pipelines

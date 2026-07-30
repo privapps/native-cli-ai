@@ -1080,7 +1080,7 @@ pub fn run_blocking(
                         }
                         CustomProviderSetupStep::BaseUrl => {
                             lines.push(Line::from(Span::styled(
-                                " Example: https://api.example.com (no trailing /v1/…)",
+                                " Example: https://api.example.com or https://api.example.com/zen/v1",
                                 Style::default().fg(theme::MUTED),
                             )));
                             lines.push(Line::default());
@@ -2997,7 +2997,7 @@ mod approval_parse_tests {
     use crate::tui::transcript::parse_approval_verdict;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use nca_common::config::CustomProviderConfig;
-    use nca_common::event::BusyState;
+    use nca_common::event::{AgentEvent, BusyState};
     use std::path::PathBuf;
     use tokio::sync::mpsc;
 
@@ -3125,7 +3125,7 @@ mod approval_parse_tests {
                 api_key: Some(api_key),
                 model,
                 ..
-            } if base_url == "https://gateway.example"
+            } if base_url == "https://gateway.example/v1"
                 && api_key_env == "GATEWAY_API_KEY"
                 && api_key == "inline-secret"
                 && model == "gateway-model"
@@ -3370,6 +3370,27 @@ mod approval_parse_tests {
             escape_cancels_active_turn(&state),
             "stuck question while idle must still be dismissable with Esc"
         );
+    }
+
+    #[test]
+    fn provider_error_hides_cancel_hint_and_allows_next_input() {
+        let mut state = state();
+        state.set_busy_state(BusyState::Thinking);
+        state.apply_event(&AgentEvent::Error {
+            message: "API request failed: provider unavailable".into(),
+        });
+        state.set_busy(false);
+
+        assert_eq!(state.current_busy_state, BusyState::Error);
+        assert!(!state.busy);
+        assert!(!escape_cancels_active_turn(&state));
+
+        state.apply_event(&AgentEvent::MessageReceived {
+            role: "user".into(),
+            content: "try again".into(),
+        });
+        assert_eq!(state.current_busy_state, BusyState::Thinking);
+        assert!(escape_cancels_active_turn(&state));
     }
 
     #[test]

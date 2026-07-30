@@ -172,6 +172,8 @@ impl ApprovalPolicy {
                 | "query_symbols"
                 | "web_search"
                 | "fetch_url"
+                | "resolve_latest_financial_report"
+                | "validate_financial_report"
                 | "ask_question"
                 | "update_todos"
                 | "invoke_skill"
@@ -460,6 +462,19 @@ mod tests {
                 policy.check("ask_question", r#"{"prompt":"q"}"#),
                 PermissionTier::Allowed,
                 "ask_question should be allowed in {mode:?}"
+            );
+            assert_eq!(
+                policy.check(
+                    "resolve_latest_financial_report",
+                    r#"{"issuer":"Microsoft","cadence":"latest"}"#
+                ),
+                PermissionTier::Allowed,
+                "financial report resolution should be allowed in {mode:?}"
+            );
+            assert_eq!(
+                policy.check("validate_financial_report", r#"{"issuer":"Microsoft"}"#),
+                PermissionTier::Allowed,
+                "financial report validation should be allowed in {mode:?}"
             );
         }
     }

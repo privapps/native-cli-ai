@@ -2,7 +2,7 @@
 
 ## Product Vision
 
-A native-first, Rust-powered AI coding assistant that runs entirely in the terminal with zero JavaScript dependencies. It provides an interactive agent loop for code generation, file editing, command execution, and project understanding—comparable in capability to Claude Code and OpenAI Codex CLI—with sub-100ms startup, low memory footprint, and machine-readable streams for orchestration and automation.
+A native-first, Rust-powered general-purpose AI assistant that runs entirely in the terminal with zero JavaScript dependencies. It provides an interactive agent loop for research, writing, planning, analysis, coding, file operations, command execution, and project understanding, with sub-100ms startup, low memory footprint, and machine-readable streams for orchestration and automation.
 
 The product name is **nca** (native-cli-ai) throughout this document.
 
@@ -10,12 +10,12 @@ The product name is **nca** (native-cli-ai) throughout this document.
 
 ## User Personas
 
-### Primary: Power Developer
+### Primary: Terminal Power User
 
 - Lives in the terminal (tmux, neovim, zsh).
-- Wants an AI assistant that fits into their existing workflow, not a browser tab.
+- Wants a general-purpose AI assistant that fits into their existing workflow, not a browser tab.
 - Cares about startup speed, memory, and not pulling in Node/Python runtimes.
-- Comfortable with config files, environment variables, and CLI flags.
+- May use nca for research, writing, planning, analysis, coding, and automation.
 
 ### Secondary: Team Lead / Reviewer
 

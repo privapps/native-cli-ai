@@ -686,6 +686,20 @@ Component management and styling...
         assert_eq!(shad.permission_mode, Some(PermissionMode::Plan));
     }
 
+    #[test]
+    fn ordinary_top_level_agents_sections_are_not_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("AGENTS.md"),
+            "# nca Development Instructions\n\nUse Rust for nca changes.\n\n# Workspace Facts\n\nThis is reference context.\n",
+        )
+        .unwrap();
+
+        let skills = parse_agents_md(dir.path()).unwrap();
+
+        assert!(skills.is_empty());
+    }
+
     // === extract_file_references tests ===
 
     #[test]

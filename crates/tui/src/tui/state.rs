@@ -1307,6 +1307,17 @@ impl TuiSessionState {
     }
 
     pub fn set_busy(&mut self, busy: bool) {
+        if !busy
+            && matches!(
+                self.current_busy_state,
+                BusyState::Thinking
+                    | BusyState::Streaming
+                    | BusyState::ToolRunning
+                    | BusyState::ApprovalPending
+            )
+        {
+            self.set_busy_state(BusyState::Idle);
+        }
         if self.busy != busy {
             self.busy = busy;
             self.mark_dirty();
@@ -1335,6 +1346,11 @@ impl TuiSessionState {
     }
 
     pub fn push_error(&mut self, msg: String) {
+        if self.blocks.last().is_some_and(
+            |block| matches!(block, DisplayBlock::ErrorLine(previous) if previous == &msg),
+        ) {
+            return;
+        }
         self.blocks.push(DisplayBlock::ErrorLine(msg));
         self.mark_transcript_dirty();
     }
@@ -1688,11 +1704,12 @@ impl TuiSessionState {
                 let lower = message.to_ascii_lowercase();
                 let soft_retry =
                     lower.contains("(retry ") || lower.contains("empty response (retry");
-                self.blocks.push(if soft_retry {
-                    DisplayBlock::System(format!("↻ {message}"))
+                if soft_retry {
+                    self.blocks
+                        .push(DisplayBlock::System(format!("↻ {message}")));
                 } else {
-                    DisplayBlock::ErrorLine(message.clone())
-                });
+                    self.push_error(message.clone());
+                }
                 if lower.contains("run cancelled") {
                     self.set_busy_state(BusyState::Idle);
                 } else if soft_retry {
@@ -1963,8 +1980,25 @@ fn format_tool_input(value: &Value) -> String {
 mod tests {
     use super::*;
     use nca_common::event::{
-        AgentEvent, InteractiveQuestionPayload, QuestionOption, QuestionSelection,
+        AgentEvent, BusyState, InteractiveQuestionPayload, QuestionOption, QuestionSelection,
     };
+
+    #[test]
+    fn clearing_legacy_busy_flag_ends_active_detailed_state() {
+        let mut st = TuiSessionState::new(
+            "session-x".into(),
+            "m".into(),
+            "@build".into(),
+            "default".into(),
+            PathBuf::from("/tmp"),
+        );
+        st.set_busy_state(BusyState::Thinking);
+
+        st.set_busy(false);
+
+        assert_eq!(st.current_busy_state, BusyState::Idle);
+        assert!(!st.busy);
+    }
 
     #[test]
     fn question_requested_sets_active_question() {

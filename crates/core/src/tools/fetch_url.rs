@@ -1,5 +1,12 @@
+use crate::research::{
+    EvidenceRecord, ResearchContext, classify_source_authority, infer_report_metadata_for_issuer,
+    parse_publication_date,
+};
+use chrono::{DateTime, Utc};
 use nca_common::config::WebConfig;
 use nca_common::tool::{ToolCall, ToolDefinition, ToolResult};
+use serde_json::json;
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::ToolExecutor;
@@ -7,16 +14,34 @@ use super::ToolExecutor;
 pub struct FetchUrlTool {
     client: reqwest::Client,
     config: WebConfig,
+    context: Arc<ResearchContext>,
 }
 
 impl FetchUrlTool {
-    pub fn new(config: WebConfig) -> Self {
+    pub fn new(config: WebConfig, context: Arc<ResearchContext>) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(config.timeout_secs))
             .user_agent(config.user_agent.clone())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self { client, config }
+        Self::with_client(config, context, client)
+    }
+
+    /// Construct a fetch tool with a caller-provided client.
+    ///
+    /// The runtime uses [`Self::new`]. This seam also lets deterministic
+    /// fixtures resolve an official host to a local HTTP server without
+    /// weakening source-authority classification.
+    pub fn with_client(
+        config: WebConfig,
+        context: Arc<ResearchContext>,
+        client: reqwest::Client,
+    ) -> Self {
+        Self {
+            client,
+            config,
+            context,
+        }
     }
 }
 
@@ -25,11 +50,15 @@ impl ToolExecutor for FetchUrlTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "fetch_url".into(),
-            description: "Fetch and normalize the text content of a URL".into(),
+            description: "Fetch and normalize the text content of a URL, preserving source and publication metadata for date-sensitive research".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "url": { "type": "string" }
+                    "url": { "type": "string" },
+                    "issuer": {
+                        "type": "string",
+                        "description": "Optional issuer name; provide this for financial-report resolution so the page must visibly name the issuer"
+                    }
                 },
                 "required": ["url"]
             }),
@@ -76,6 +105,12 @@ impl ToolExecutor for FetchUrlTool {
             .and_then(|value| value.to_str().ok())
             .unwrap_or("")
             .to_string();
+        let final_url = response.url().to_string();
+        let http_date = response
+            .headers()
+            .get(reqwest::header::DATE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_publication_date);
 
         let body = match response.text().await {
             Ok(body) => body,
@@ -95,16 +130,92 @@ impl ToolExecutor for FetchUrlTool {
             normalize_plain_text(&body)
         };
 
+        if normalized.trim().is_empty() {
+            return ToolResult {
+                call_id: call.id.clone(),
+                success: false,
+                output: String::new(),
+                error: Some("fetched page was empty or could not be normalized".into()),
+            };
+        }
+
+        let retrieved_at = Utc::now();
+        let published_at = extract_publication_date(&body);
+        let authority = classify_source_authority(&final_url);
+        let report_metadata =
+            infer_report_metadata_for_issuer(&normalized, call.input["issuer"].as_str());
+        self.context.record_evidence(EvidenceRecord {
+            url: final_url.clone(),
+            title: first_html_element(&body, "title")
+                .map(|(_, content)| html_fragment_text(&content))
+                .filter(|title| !title.is_empty()),
+            snippet: None,
+            retrieved_at,
+            response_status: Some(status.as_u16()),
+            http_date,
+            published_at,
+            authority,
+            report_metadata: report_metadata.clone(),
+        });
+
         ToolResult {
             call_id: call.id.clone(),
             success: true,
-            output: normalized
-                .chars()
-                .take(self.config.max_fetch_chars)
-                .collect(),
+            output: serde_json::to_string_pretty(&json!({
+                "source": {
+                    "url": final_url,
+                    "response_status": status.as_u16(),
+                    "retrieved_at": retrieved_at,
+                    "http_date": http_date,
+                    "published_at": published_at,
+                    "report_metadata": report_metadata,
+                    "source_authority": authority,
+                    "eligible_as_of": published_at.map(|date| date <= self.context.as_of()),
+                },
+                "content": normalized
+                    .chars()
+                    .take(self.config.max_fetch_chars)
+                    .collect::<String>(),
+            }))
+            .unwrap_or_else(|_| "{\"content\":\"\"}".into()),
             error: None,
         }
     }
+}
+
+fn extract_publication_date(body: &str) -> Option<DateTime<Utc>> {
+    let mut cursor = 0;
+    while let Some(markup) = next_html_markup(body, cursor) {
+        cursor = markup.end();
+        let HtmlMarkup::Tag(tag) = markup else {
+            continue;
+        };
+        if tag.closing || !tag.name.eq_ignore_ascii_case("meta") {
+            continue;
+        }
+        let signal = html_attribute(tag.attributes, "property")
+            .or_else(|| html_attribute(tag.attributes, "name"))
+            .or_else(|| html_attribute(tag.attributes, "itemprop"))
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !matches!(
+            signal.as_str(),
+            "article:published_time" | "datepublished" | "pubdate" | "publication_date" | "date"
+        ) {
+            continue;
+        }
+        if let Some(value) = html_attribute(tag.attributes, "content")
+            && let Some(date) = parse_publication_date(&value)
+        {
+            return Some(date);
+        }
+    }
+
+    first_html_element(body, "time")
+        .and_then(|(attributes, content)| {
+            html_attribute(&attributes, "datetime").or_else(|| Some(html_fragment_text(&content)))
+        })
+        .and_then(|value| parse_publication_date(&value))
 }
 
 fn normalize_html(body: &str) -> String {
@@ -513,8 +624,8 @@ fn is_hidden_text_element(tag_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        first_html_element, first_html_element_with_class, html_attribute, html_fragment_text,
-        normalize_html,
+        extract_publication_date, first_html_element, first_html_element_with_class,
+        html_attribute, html_fragment_text, normalize_html,
     };
 
     #[test]
@@ -585,5 +696,29 @@ mod tests {
     #[test]
     fn malformed_unterminated_tags_do_not_leak_into_text() {
         assert_eq!(html_fragment_text("Before <a href='broken"), "Before");
+    }
+
+    #[test]
+    fn extracts_common_publication_metadata_without_inventing_a_date() {
+        let html = r#"
+            <html>
+                <head>
+                    <meta property="article:published_time" content="2026-07-29T12:00:00Z">
+                </head>
+                <body>Results</body>
+            </html>
+        "#;
+        assert_eq!(
+            extract_publication_date(html),
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)
+            )
+        );
+        assert_eq!(
+            extract_publication_date("<html><body>Results</body></html>"),
+            None
+        );
     }
 }

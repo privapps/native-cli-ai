@@ -116,6 +116,16 @@ Available agent profiles:
 | `/provider [name]` | Show or set the default LLM provider |
 | `/custom <compat> <url> [key] [model]` | Configure a custom endpoint (OpenAI or Anthropic compatible) |
 | `/apikey <provider> <key>` | Store an API key for a provider |
+| `/reasoning-effort [value]` | Show or persist the OpenAI-compatible Chat Completions reasoning effort |
+
+`/reasoning-effort <value>` trims and saves the value to the workspace
+configuration. Use `/reasoning-effort nil` to omit the request property, or
+run `/reasoning-effort` without an argument to display the current value and
+whether the active provider uses the OpenAI-compatible request shape. Values
+such as `none`, `low`, `medium`, `high`, `xhigh`, and gateway-specific strings
+are passed through unchanged. The setting is not sent to MiniMax, Anthropic,
+or an Anthropic-compatible Custom endpoint, and it is not part of the Custom
+provider setup wizard.
 
 ### Session and Context
 

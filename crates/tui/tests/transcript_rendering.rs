@@ -72,6 +72,21 @@ fn markdown_block_renders_list_items() {
 }
 
 #[test]
+fn inline_markdown_does_not_insert_display_line_breaks() {
+    let lines = render_markdown_block("I'm **nca**, a general-purpose assistant.", 80);
+
+    assert_eq!(
+        lines.len(),
+        1,
+        "inline Markdown should remain one display line"
+    );
+    assert_eq!(
+        lines_to_plain(&lines),
+        "I'm nca, a general-purpose assistant."
+    );
+}
+
+#[test]
 fn transcript_lines_full_session_snapshot() {
     let mut state = TuiSessionState::new(
         "sess-snapshot".into(),

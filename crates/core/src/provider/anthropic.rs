@@ -138,11 +138,20 @@ mod tests {
                     .iter()
                     .any(|header| header.field.equiv("anthropic-version"))
             );
+            let mut request_body = String::new();
+            request
+                .as_reader()
+                .read_to_string(&mut request_body)
+                .expect("request body");
+            let payload: serde_json::Value =
+                serde_json::from_str(&request_body).expect("JSON request body");
+            assert!(payload.get("reasoning_effort").is_none());
         });
 
         let mut config = NcaConfig::default();
         config.provider.anthropic.api_key = Some("anthropic-test-key".into());
         config.provider.anthropic.base_url = base_url;
+        config.model.reasoning_effort = "high".into();
 
         let provider = AnthropicProvider::from_config(&config).expect("provider");
         let stream = provider

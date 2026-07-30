@@ -12,6 +12,7 @@ pub struct OpenAiProvider {
     client: reqwest::Client,
     config: OpenAiConfig,
     max_tokens: u32,
+    reasoning_effort: String,
 }
 
 impl OpenAiProvider {
@@ -45,6 +46,7 @@ impl OpenAiProvider {
             client,
             config: openai,
             max_tokens: config.model.max_tokens,
+            reasoning_effort: config.model.reasoning_effort.clone(),
         })
     }
 
@@ -77,6 +79,7 @@ impl Provider for OpenAiProvider {
             &model,
             self.max_tokens,
             self.config.temperature,
+            &self.reasoning_effort,
             workspace_root,
         )?;
 
@@ -125,11 +128,20 @@ mod tests {
                 .find(|header| header.field.equiv("authorization"))
                 .expect("authorization header");
             assert_eq!(auth.value.as_str(), "Bearer openai-test-key");
+            let mut request_body = String::new();
+            request
+                .as_reader()
+                .read_to_string(&mut request_body)
+                .expect("request body");
+            let payload: serde_json::Value =
+                serde_json::from_str(&request_body).expect("JSON request body");
+            assert_eq!(payload["reasoning_effort"], "medium");
         });
 
         let mut config = NcaConfig::default();
         config.provider.openai.api_key = Some("openai-test-key".into());
         config.provider.openai.base_url = base_url;
+        config.model.reasoning_effort = "medium".into();
 
         let provider = OpenAiProvider::from_config(&config).expect("provider");
         let stream = provider

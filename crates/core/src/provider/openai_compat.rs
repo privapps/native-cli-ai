@@ -15,6 +15,7 @@ pub fn openai_request_body(
     model: &str,
     max_tokens: u32,
     temperature: f32,
+    reasoning_effort: &str,
     workspace_root: &Path,
 ) -> Result<Value, ProviderError> {
     let tools = if tools.is_empty() {
@@ -37,7 +38,7 @@ pub fn openai_request_body(
         )
     };
 
-    Ok(json!({
+    let mut body = json!({
         "model": model,
         "messages": to_openai_messages(messages, workspace_root)?,
         "tools": tools,
@@ -47,7 +48,14 @@ pub fn openai_request_body(
         },
         "max_tokens": max_tokens,
         "temperature": temperature,
-    }))
+    });
+
+    let reasoning_effort = reasoning_effort.trim();
+    if !reasoning_effort.is_empty() && reasoning_effort != "nil" {
+        body["reasoning_effort"] = json!(reasoning_effort);
+    }
+
+    Ok(body)
 }
 
 pub fn spawn_openai_stream(
@@ -261,6 +269,51 @@ fn openai_user_content_value(
                 }
             }
             Ok(Value::Array(blocks))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reasoning_effort_nil_and_empty_values_are_omitted() {
+        for value in ["nil", "  nil  ", "", "   "] {
+            let body = openai_request_body(
+                &[Message::user("hello")],
+                &[],
+                "test-model",
+                100,
+                0.7,
+                value,
+                Path::new("."),
+            )
+            .expect("request body");
+
+            assert!(body.get("reasoning_effort").is_none(), "value={value:?}");
+        }
+    }
+
+    #[test]
+    fn reasoning_effort_values_are_trimmed_and_passed_through() {
+        for (configured, expected) in [
+            (" none ", "none"),
+            ("xhigh", "xhigh"),
+            ("vendor-tier", "vendor-tier"),
+        ] {
+            let body = openai_request_body(
+                &[Message::user("hello")],
+                &[],
+                "test-model",
+                100,
+                0.7,
+                configured,
+                Path::new("."),
+            )
+            .expect("request body");
+
+            assert_eq!(body["reasoning_effort"], expected, "value={configured:?}");
         }
     }
 }

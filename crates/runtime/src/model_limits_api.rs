@@ -13,7 +13,8 @@
 
 use crate::model_limits::ModelLimits;
 use nca_common::config::{
-    NcaConfig, ProviderCompatibility, ProviderKind, normalize_custom_provider_base_url,
+    NcaConfig, ProviderCompatibility, ProviderKind, custom_provider_endpoint,
+    normalize_custom_provider_base_url,
 };
 use serde::Deserialize;
 use std::collections::hash_map::DefaultHasher;
@@ -105,7 +106,7 @@ pub async fn resolve_model_limits(config: &NcaConfig, model: &str) -> ModelLimit
     let from_api = match config.provider.default {
         ProviderKind::OpenRouter => {
             let base = config.provider.openrouter.base_url.trim_end_matches('/');
-            let url = format!("{base}/v1/models");
+            let url = custom_provider_endpoint(base, "models");
             let key = config.provider.openrouter.resolve_api_key();
             fetch_openrouter_context(&client, &url, model, key.as_deref()).await
         }
@@ -290,7 +291,7 @@ async fn fetch_anthropic_context(
     let mut after_id: Option<String> = None;
 
     loop {
-        let mut url = format!("{base}/v1/models?limit=100");
+        let mut url = format!("{}?limit=100", custom_provider_endpoint(base, "models"));
         if let Some(ref id) = after_id {
             url.push_str("&after_id=");
             url.push_str(id);
@@ -383,7 +384,7 @@ async fn fetch_openai_context(
         }
     }
 
-    let url = format!("{base}/v1/models");
+    let url = custom_provider_endpoint(base, "models");
     let resp = client.get(&url).bearer_auth(api_key).send().await.ok()?;
     if !resp.status().is_success() {
         tracing::debug!(status = %resp.status(), url = %url, "openai models request failed");
@@ -456,7 +457,7 @@ fn custom_catalog_base_url(config: &NcaConfig) -> Option<String> {
 
 async fn fetch_openrouter_model_ids(client: &reqwest::Client, config: &NcaConfig) -> Vec<String> {
     let base = config.provider.openrouter.base_url.trim_end_matches('/');
-    let url = format!("{base}/v1/models");
+    let url = custom_provider_endpoint(base, "models");
     let key = config.provider.openrouter.resolve_api_key();
     let ttl = catalog_cache_ttl();
 
@@ -525,7 +526,7 @@ async fn fetch_anthropic_model_ids(client: &reqwest::Client, config: &NcaConfig)
     let mut after_id: Option<String> = None;
     let mut completed = true;
     loop {
-        let mut url = format!("{base}/v1/models?limit=100");
+        let mut url = format!("{}?limit=100", custom_provider_endpoint(base, "models"));
         if let Some(ref id) = after_id {
             url.push_str("&after_id=");
             url.push_str(id);
@@ -603,7 +604,7 @@ async fn fetch_openai_model_ids(client: &reqwest::Client, config: &NcaConfig) ->
         }
     }
 
-    let url = format!("{base}/v1/models");
+    let url = custom_provider_endpoint(base, "models");
     let resp = match client.get(&url).bearer_auth(&key).send().await {
         Ok(r) if r.status().is_success() => r,
         _ => return Vec::new(),
@@ -730,13 +731,13 @@ mod tests {
     }
 
     #[test]
-    fn custom_catalog_base_url_strips_optional_v1_suffix() {
+    fn custom_catalog_base_url_preserves_optional_v1_suffix() {
         let mut config = NcaConfig::default();
         config.provider.custom.base_url = "https://gateway.example/v1/".into();
 
         assert_eq!(
             custom_catalog_base_url(&config).as_deref(),
-            Some("https://gateway.example")
+            Some("https://gateway.example/v1")
         );
     }
 
@@ -748,7 +749,7 @@ mod tests {
         );
         let mut config = NcaConfig::default();
         config.provider.default = ProviderKind::Custom;
-        config.provider.custom.base_url = base_url;
+        config.provider.custom.base_url = format!("{base_url}/zen/v1");
         config.provider.custom.api_key = Some("custom-openai-key".into());
         config.provider.custom.compatibility = ProviderCompatibility::OpenAi;
 
@@ -756,7 +757,7 @@ mod tests {
         let request = server.join().expect("model fixture thread");
 
         assert_eq!(ids, vec!["alpha-model", "zeta-model"]);
-        assert!(request.starts_with("GET /v1/models HTTP/1.1\r\n"));
+        assert!(request.starts_with("GET /zen/v1/models HTTP/1.1\r\n"));
         assert!(
             request
                 .to_ascii_lowercase()
@@ -765,14 +766,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn custom_anthropic_discovery_requests_v1_models_and_parses_ids() {
+    async fn custom_anthropic_discovery_preserves_versioned_path_prefix_and_parses_ids() {
         let (base_url, server) = spawn_model_fixture(
             200,
             r#"{"data":[{"id":"claude-zeta"},{"id":"claude-alpha"}],"has_more":false}"#,
         );
         let mut config = NcaConfig::default();
         config.provider.default = ProviderKind::Custom;
-        config.provider.custom.base_url = format!("{base_url}/");
+        config.provider.custom.base_url = format!("{base_url}/zen/v1/");
         config.provider.custom.api_key = Some("custom-anthropic-key".into());
         config.provider.custom.compatibility = ProviderCompatibility::Anthropic;
 
@@ -781,7 +782,7 @@ mod tests {
         let request_lower = request.to_ascii_lowercase();
 
         assert_eq!(ids, vec!["claude-alpha", "claude-zeta"]);
-        assert!(request.starts_with("GET /v1/models?limit=100 HTTP/1.1\r\n"));
+        assert!(request.starts_with("GET /zen/v1/models?limit=100 HTTP/1.1\r\n"));
         assert!(request_lower.contains("x-api-key: custom-anthropic-key\r\n"));
         assert!(request_lower.contains("anthropic-version: 2023-06-01\r\n"));
     }

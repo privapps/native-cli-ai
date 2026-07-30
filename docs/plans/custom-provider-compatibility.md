@@ -21,19 +21,19 @@ An unconfigured Custom selection opens setup rather than attempting to use an em
 The Custom slot contains `compatibility`, `base_url`, `api_key_env`, optional inline `api_key`, `model`, and `temperature`.
 
 - Compatibility is either `openai` or `anthropic`.
-- The base URL is normalized from an HTTP(S) origin or origin `/v1` form to the origin. Credentials, query strings, fragments, and final endpoint paths are rejected.
+- The base URL is normalized from an HTTP(S) origin or a path ending in `/v1`; any accepted path prefix is preserved. Credentials, query strings, fragments, and final endpoint paths are rejected.
 - The API-key environment-variable name is editable but must use a portable shell-variable format. `CUSTOM_PROVIDER_API_KEY` is the default.
 - Credential resolution prefers an explicit inline key over the named environment variable. A blank key during editing preserves the existing source. Resolved environment secrets are never materialized into persisted TOML.
 - Model IDs are manual and are not dependent on successful model discovery.
 
 ## Protocol and activation behavior
 
-- OpenAI-compatible probes call `GET /v1/models` with Bearer authentication; chat calls `POST /v1/chat/completions` with streaming and OpenAI tool-call shapes.
-- Anthropic-compatible probes send a minimal `POST /v1/messages` with `x-api-key` and `anthropic-version: 2023-06-01`; chat uses the same endpoint and headers with streaming and Anthropic tool-use shapes.
+- OpenAI-compatible probes call `GET <base path>/models` with Bearer authentication; chat calls `POST <base path>/chat/completions` with streaming and OpenAI tool-call shapes.
+- Anthropic-compatible probes send a minimal `POST <base path>/messages` with `x-api-key` and `anthropic-version: 2023-06-01`; chat uses the same endpoint and headers with streaming and Anthropic tool-use shapes.
 - Malformed URLs, invalid environment-variable names, and missing credentials block setup.
 - Network, authentication, protocol, and endpoint probe failures offer **Retry**, **Save anyway**, or **Cancel**. Save anyway activates the manually configured provider and, during onboarding, completes onboarding.
 - Probe errors are sanitized. Empty streaming completions are errors rather than successful turns.
-- Model discovery is best-effort and uses the selected protocol's `/v1/models` behavior; manual IDs remain valid when discovery returns no models. Deterministic local fixtures cover both protocol paths, authentication, parsing, pagination, and provider failures.
+- Model discovery is best-effort and uses the selected protocol's `<base path>/models` behavior; manual IDs remain valid when discovery returns no models. Deterministic local fixtures cover both protocol paths, authentication, parsing, pagination, and provider failures.
 
 ## Persistence contract
 

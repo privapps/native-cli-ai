@@ -24,7 +24,7 @@ use stream::{StreamMode, spawn_stream_task};
 #[derive(Parser, Debug)]
 #[command(
     name = "nca",
-    about = "Native CLI AI - a Rust-powered coding assistant"
+    about = "Native CLI AI - a Rust-powered general-purpose AI assistant"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -61,6 +61,10 @@ struct Cli {
     /// Token budget for extended thinking
     #[arg(long, default_value = "5120")]
     thinking_budget: u32,
+
+    /// Reasoning effort for OpenAI-compatible Chat Completions requests
+    #[arg(long, global = true)]
+    reasoning_effort: Option<String>,
 
     /// Max response tokens
     #[arg(long, default_value = "8192")]
@@ -386,6 +390,7 @@ async fn try_main() -> anyhow::Result<()> {
     tracing::info!("nca starting");
     let mut config = NcaConfig::load()?;
     let orchestration_context = OrchestrationContext::from_env();
+    let reasoning_effort_override = cli.reasoning_effort.clone();
 
     if let Some(model) = &cli.model {
         config.apply_model_override(model);
@@ -395,6 +400,9 @@ async fn try_main() -> anyhow::Result<()> {
     if cli.enable_thinking {
         config.model.enable_thinking = true;
         config.model.thinking_budget = cli.thinking_budget;
+    }
+    if let Some(reasoning_effort) = &reasoning_effort_override {
+        config.model.reasoning_effort = reasoning_effort.clone();
     }
     if let Some(max_turns) = cli.max_turns {
         config.session.max_turns_per_run = max_turns;
@@ -470,6 +478,7 @@ async fn try_main() -> anyhow::Result<()> {
                 model
                     .as_deref()
                     .map(|model| config.model.resolve_alias(model)),
+                reasoning_effort_override.as_deref(),
                 safe,
                 effective_mode,
                 json,
@@ -911,6 +920,7 @@ async fn spawn_run(
     workspace_root: &Path,
     prompt: &str,
     model: Option<String>,
+    reasoning_effort: Option<&str>,
     safe: bool,
     permission_mode: CliPermissionMode,
     json: bool,
@@ -925,21 +935,14 @@ async fn spawn_run(
     let exe = std::env::current_exe()?;
 
     let mut command = std::process::Command::new(exe);
-    command
-        .arg("run")
-        .arg("--prompt")
-        .arg(prompt)
-        .arg("--stream")
-        .arg("ndjson")
-        .arg("--session-id")
-        .arg(&session_id)
-        .arg("--permission-mode")
-        .arg(permission_mode.as_arg())
-        .args(if safe { vec!["--safe"] } else { vec![] });
-
-    if let Some(model) = model {
-        command.arg("--model").arg(model);
-    }
+    command.args(spawn_command_args(
+        prompt,
+        &session_id,
+        reasoning_effort,
+        model.as_deref(),
+        safe,
+        permission_mode,
+    ));
 
     let child = command.stdout(stdout).stderr(stderr).spawn()?;
     let socket_path = if json {
@@ -966,6 +969,40 @@ async fn spawn_run(
         println!("{session_id}");
     }
     Ok(())
+}
+
+fn spawn_command_args(
+    prompt: &str,
+    session_id: &str,
+    reasoning_effort: Option<&str>,
+    model: Option<&str>,
+    safe: bool,
+    permission_mode: CliPermissionMode,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(reasoning_effort) = reasoning_effort {
+        args.push("--reasoning-effort".into());
+        args.push(reasoning_effort.into());
+    }
+    args.extend([
+        "run".into(),
+        "--prompt".into(),
+        prompt.into(),
+        "--stream".into(),
+        "ndjson".into(),
+        "--session-id".into(),
+        session_id.into(),
+        "--permission-mode".into(),
+        permission_mode.as_arg().into(),
+    ]);
+    if safe {
+        args.push("--safe".into());
+    }
+    if let Some(model) = model {
+        args.push("--model".into());
+        args.push(model.into());
+    }
+    args
 }
 
 async fn wait_for_spawned_socket_path(
@@ -1602,6 +1639,9 @@ fn show_models(config: &NcaConfig, json: bool) -> anyhow::Result<()> {
         aliases: config.model.aliases.clone(),
         thinking_enabled: config.model.enable_thinking,
         thinking_budget: config.model.thinking_budget,
+        reasoning_effort: config.model.reasoning_effort.clone(),
+        reasoning_effort_scope: "OpenAI-compatible only".into(),
+        reasoning_effort_active: config.reasoning_effort_active_for_default_provider(),
     };
     if json {
         print_json(&output, false)?;
@@ -1614,6 +1654,16 @@ fn show_models(config: &NcaConfig, json: bool) -> anyhow::Result<()> {
             "Thinking: {} (budget {})",
             if output.thinking_enabled { "on" } else { "off" },
             output.thinking_budget
+        );
+        println!(
+            "Reasoning effort: {} ({}; {})",
+            output.reasoning_effort,
+            output.reasoning_effort_scope,
+            if output.reasoning_effort_active {
+                "active"
+            } else {
+                "inactive for active provider"
+            }
         );
         println!("Provider models:");
         for provider in &output.provider_models {
@@ -1745,7 +1795,15 @@ async fn autoresearch_once(program: PathBuf, workspace: PathBuf) -> anyhow::Resu
 
 fn show_config(config: &NcaConfig, workspace_root: &Path, json: bool) -> anyhow::Result<()> {
     if json {
-        print_json(config, false)?;
+        print_json(
+            &ConfigOutput {
+                config,
+                reasoning_effort: &config.model.reasoning_effort,
+                reasoning_effort_scope: "OpenAI-compatible only",
+                reasoning_effort_active: config.reasoning_effort_active_for_default_provider(),
+            },
+            false,
+        )?;
     } else {
         println!(
             "Global config: {}",
@@ -1759,6 +1817,15 @@ fn show_config(config: &NcaConfig, workspace_root: &Path, json: bool) -> anyhow:
         );
         println!("Default provider: {:?}", config.provider.default);
         println!("Default model: {}", config.model.default_model);
+        println!(
+            "Reasoning effort: {} (OpenAI-compatible only; {})",
+            config.model.reasoning_effort,
+            if config.reasoning_effort_active_for_default_provider() {
+                "active"
+            } else {
+                "inactive for active provider"
+            }
+        );
         println!("Permission mode: {:?}", config.permissions.mode);
         println!("Provider endpoints:");
         for provider in ProviderKind::ALL {
@@ -1843,6 +1910,18 @@ struct ModelCatalogOutput {
     aliases: std::collections::BTreeMap<String, String>,
     thinking_enabled: bool,
     thinking_budget: u32,
+    reasoning_effort: String,
+    reasoning_effort_scope: String,
+    reasoning_effort_active: bool,
+}
+
+#[derive(serde::Serialize)]
+struct ConfigOutput<'a> {
+    #[serde(flatten)]
+    config: &'a NcaConfig,
+    reasoning_effort: &'a str,
+    reasoning_effort_scope: &'static str,
+    reasoning_effort_active: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -1994,6 +2073,53 @@ mod tests {
             }
             _ => panic!("expected run subcommand"),
         }
+    }
+
+    #[test]
+    fn parses_reasoning_effort_after_run_subcommand() {
+        let cli = Cli::try_parse_from([
+            "nca",
+            "run",
+            "--prompt",
+            "hello",
+            "--reasoning-effort",
+            "high",
+        ])
+        .expect("should parse reasoning effort after run subcommand");
+
+        assert_eq!(cli.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn spawn_args_forward_reasoning_effort_before_subcommand() {
+        let args = spawn_command_args(
+            "hello",
+            "session-1",
+            Some("high"),
+            Some("gpt-5"),
+            true,
+            CliPermissionMode::AcceptEdits,
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "--reasoning-effort",
+                "high",
+                "run",
+                "--prompt",
+                "hello",
+                "--stream",
+                "ndjson",
+                "--session-id",
+                "session-1",
+                "--permission-mode",
+                "accept-edits",
+                "--safe",
+                "--model",
+                "gpt-5",
+            ]
+        );
     }
 
     #[tokio::test]

@@ -221,6 +221,15 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         Always
     ),
     command!(
+        "reasoning-effort",
+        "/reasoning-effort",
+        [],
+        "Set or show reasoning effort",
+        Agent,
+        "",
+        Always
+    ),
+    command!(
         "stop",
         "/stop",
         [],

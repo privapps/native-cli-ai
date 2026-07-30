@@ -667,6 +667,7 @@ pub fn render_markdown_block(text: &str, width: usize) -> Vec<Line<'static>> {
     let mut code_lang = String::new();
     let mut code_buf = String::new();
     let mut list_depth = 0usize;
+    let mut pending_space = false;
 
     let flush_line = |out: &mut Vec<Line<'static>>, current: &mut Line<'static>| {
         if !current.spans.is_empty() || !current.style.add_modifier.is_empty() {
@@ -679,6 +680,7 @@ pub fn render_markdown_block(text: &str, width: usize) -> Vec<Line<'static>> {
         match event {
             MdEvent::Start(Tag::CodeBlock(kind)) => {
                 flush_line(&mut out, &mut current);
+                pending_space = false;
                 in_code = true;
                 code_buf.clear();
                 code_lang = match kind {
@@ -691,43 +693,60 @@ pub fn render_markdown_block(text: &str, width: usize) -> Vec<Line<'static>> {
                 let highlighted = highlight_code_block(&code_lang, &code_buf, width);
                 out.extend(highlighted);
                 code_buf.clear();
+                pending_space = false;
             }
-            MdEvent::Code(text) => {
-                current.spans.push(Span::styled(
-                    text.to_string(),
-                    Style::default().fg(theme::TOOL),
-                ));
+            MdEvent::Code(text) => append_markdown_text(
+                &mut out,
+                &mut current,
+                &text,
+                width,
+                Style::default().fg(theme::TOOL),
+                &mut pending_space,
+            ),
+            MdEvent::Start(Tag::Heading { .. }) => {
+                flush_line(&mut out, &mut current);
+                pending_space = false;
             }
-            MdEvent::Start(Tag::Heading { .. }) => flush_line(&mut out, &mut current),
-            MdEvent::End(TagEnd::Heading(_)) => flush_line(&mut out, &mut current),
+            MdEvent::End(TagEnd::Heading(_)) => {
+                flush_line(&mut out, &mut current);
+                pending_space = false;
+            }
             MdEvent::Start(Tag::List(_)) => list_depth += 1,
             MdEvent::End(TagEnd::List(_)) => list_depth = list_depth.saturating_sub(1),
             MdEvent::Start(Tag::Item) => {
                 flush_line(&mut out, &mut current);
+                pending_space = false;
                 let pad = "  ".repeat(list_depth.saturating_sub(1));
                 current.spans.push(Span::styled(
                     format!("{pad}- "),
                     Style::default().fg(theme::MUTED),
                 ));
             }
-            MdEvent::End(TagEnd::Item) => flush_line(&mut out, &mut current),
+            MdEvent::End(TagEnd::Item) => {
+                flush_line(&mut out, &mut current);
+                pending_space = false;
+            }
             MdEvent::Start(Tag::Strong) => {}
             MdEvent::End(TagEnd::Strong) => {}
             MdEvent::Start(Tag::Emphasis) => {}
             MdEvent::End(TagEnd::Emphasis) => {}
             MdEvent::Text(t) if in_code => code_buf.push_str(&t),
-            MdEvent::Text(t) => {
-                for wrapped in wrap_text(&t, width) {
-                    if !current.spans.is_empty() {
-                        flush_line(&mut out, &mut current);
-                    }
-                    current
-                        .spans
-                        .push(Span::styled(wrapped, Style::default().fg(theme::TEXT)));
-                    flush_line(&mut out, &mut current);
-                }
+            MdEvent::Text(t) => append_markdown_text(
+                &mut out,
+                &mut current,
+                &t,
+                width,
+                Style::default().fg(theme::TEXT),
+                &mut pending_space,
+            ),
+            MdEvent::SoftBreak | MdEvent::HardBreak => {
+                flush_line(&mut out, &mut current);
+                pending_space = false;
             }
-            MdEvent::SoftBreak | MdEvent::HardBreak => flush_line(&mut out, &mut current),
+            MdEvent::End(TagEnd::Paragraph) => {
+                flush_line(&mut out, &mut current);
+                pending_space = false;
+            }
             _ => {}
         }
     }
@@ -739,6 +758,111 @@ pub fn render_markdown_block(text: &str, width: usize) -> Vec<Line<'static>> {
         )));
     }
     out
+}
+
+/// Append one Markdown text event to the current terminal line.
+///
+/// `pulldown-cmark` splits a paragraph into separate events around inline
+/// markup (`Text("before ")`, `Code("inside")`, `Text(" after")`, etc.).
+/// Those event boundaries are not display line boundaries, so wrapping has to
+/// happen while the current line is shared across events.
+fn append_markdown_text(
+    out: &mut Vec<Line<'static>>,
+    current: &mut Line<'static>,
+    text: &str,
+    width: usize,
+    style: Style,
+    pending_space: &mut bool,
+) {
+    let starts_with_space = text.chars().next().is_some_and(char::is_whitespace);
+    let mut first_word = true;
+    for word in text.split_whitespace() {
+        let needs_space = if first_word {
+            *pending_space || starts_with_space
+        } else {
+            true
+        };
+        append_markdown_word(out, current, word, width, style, needs_space);
+        first_word = false;
+    }
+    *pending_space = text.chars().last().is_some_and(char::is_whitespace);
+}
+
+fn append_markdown_word(
+    out: &mut Vec<Line<'static>>,
+    current: &mut Line<'static>,
+    word: &str,
+    width: usize,
+    style: Style,
+    needs_space: bool,
+) {
+    let width = width.max(1);
+    let separator = needs_space && !current.spans.is_empty() && !line_ends_with_whitespace(current);
+    let separator_width = usize::from(separator);
+    let word_width = Span::raw(word).width();
+
+    if current.spans.is_empty() || current.width() + separator_width + word_width <= width {
+        if separator {
+            current.spans.push(Span::styled(" ".to_string(), style));
+        }
+        current.spans.push(Span::styled(word.to_string(), style));
+        return;
+    }
+
+    out.push(current.clone());
+    *current = Line::from(Vec::<Span<'static>>::new());
+    append_long_markdown_word(out, current, word, width, style);
+}
+
+fn append_long_markdown_word(
+    out: &mut Vec<Line<'static>>,
+    current: &mut Line<'static>,
+    word: &str,
+    width: usize,
+    style: Style,
+) {
+    let mut remaining = word;
+    while !remaining.is_empty() {
+        let available = width.saturating_sub(current.width());
+        if available == 0 {
+            out.push(current.clone());
+            *current = Line::from(Vec::<Span<'static>>::new());
+            continue;
+        }
+
+        let mut used = 0usize;
+        let mut end = 0usize;
+        for (idx, ch) in remaining.char_indices() {
+            let char_width = Span::raw(ch.to_string()).width();
+            if used + char_width > available {
+                break;
+            }
+            used += char_width;
+            end = idx + ch.len_utf8();
+        }
+
+        if end == 0 {
+            out.push(current.clone());
+            *current = Line::from(Vec::<Span<'static>>::new());
+            continue;
+        }
+
+        current
+            .spans
+            .push(Span::styled(remaining[..end].to_string(), style));
+        remaining = &remaining[end..];
+        if !remaining.is_empty() {
+            out.push(current.clone());
+            *current = Line::from(Vec::<Span<'static>>::new());
+        }
+    }
+}
+
+fn line_ends_with_whitespace(line: &Line<'_>) -> bool {
+    line.spans
+        .last()
+        .and_then(|span| span.content.chars().last())
+        .is_some_and(char::is_whitespace)
 }
 
 fn highlight_code_block(lang: &str, code: &str, width: usize) -> Vec<Line<'static>> {

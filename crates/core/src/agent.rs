@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use futures_util::future::join_all;
 use nca_common::config::SmartCompactionMode;
 use nca_common::event::{AgentEvent, BusyState};
@@ -15,6 +16,7 @@ use crate::context_view::plan_context_view;
 use crate::cost::CostTracker;
 use crate::hooks::{HookEventKind, HookRunner};
 use crate::provider::{Provider, ProviderError, StreamChunk};
+use crate::research::ResearchContext;
 use crate::tools::ToolRegistry;
 
 fn is_interactive_tool(name: &str) -> bool {
@@ -37,6 +39,7 @@ pub struct AgentLoop {
     hooks: Option<HookRunner>,
     /// Opt-in provider-request smart compaction (canonical history always kept).
     smart_compaction_mode: SmartCompactionMode,
+    research_context: std::sync::Arc<ResearchContext>,
 }
 
 impl AgentLoop {
@@ -52,6 +55,7 @@ impl AgentLoop {
         checkpoint_interval: u32,
         hooks: Option<HookRunner>,
     ) -> Self {
+        let research_context = tools.research_context();
         Self {
             provider,
             tools,
@@ -66,6 +70,7 @@ impl AgentLoop {
             cancel_flag: Arc::new(AtomicBool::new(false)),
             hooks,
             smart_compaction_mode: SmartCompactionMode::Off,
+            research_context,
         }
     }
 
@@ -161,9 +166,17 @@ impl AgentLoop {
                 turn,
             })
             .await;
-            self.provider
+            if let Err(error) = self
+                .provider
                 .prepare_messages_for_request(&mut self.messages, workspace_root)
-                .await?;
+                .await
+            {
+                self.emit(AgentEvent::Error {
+                    message: error.to_string(),
+                })
+                .await;
+                return Err(error);
+            }
 
             // Smart compaction builds a provider-only view; canonical history stays intact.
             let request_messages = if self.smart_compaction_mode.is_enabled() {
@@ -194,16 +207,47 @@ impl AgentLoop {
             } else {
                 self.messages.clone()
             };
+            let tool_definitions = self.tool_definitions();
 
-            let mut stream = self
-                .provider
-                .chat(
+            let cancel_flag = self.cancel_flag.clone();
+            let wait_for_cancel = async move {
+                let mut cancel_poll = tokio::time::interval(Duration::from_millis(25));
+                cancel_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    cancel_poll.tick().await;
+                    if cancel_flag.load(Ordering::SeqCst) {
+                        break;
+                    }
+                }
+            };
+            let provider_result = tokio::select! {
+                result = self.provider.chat(
                     &request_messages,
-                    &self.tool_definitions(),
+                    &tool_definitions,
                     &self.model,
                     workspace_root,
-                )
-                .await?;
+                ) => result,
+                _ = wait_for_cancel => {
+                    return Err(self.provider_request_cancelled().await);
+                }
+            };
+
+            // Prefer cancellation if the flag was raised at the same time the
+            // provider completed its request.
+            if self.is_cancelled() {
+                return Err(self.provider_request_cancelled().await);
+            }
+
+            let mut stream = match provider_result {
+                Ok(stream) => stream,
+                Err(error) => {
+                    self.emit(AgentEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                    return Err(error);
+                }
+            };
 
             let mut assistant_text = String::new();
             let mut tool_calls: Vec<ToolCall> = Vec::new();
@@ -301,11 +345,6 @@ impl AgentLoop {
                 }
                 self.messages
                     .push(Message::assistant(assistant_text.clone()));
-                self.emit(AgentEvent::MessageReceived {
-                    role: "assistant".into(),
-                    content: assistant_text.clone(),
-                })
-                .await;
                 break assistant_text;
             }
 
@@ -605,6 +644,19 @@ impl AgentLoop {
             }
         };
 
+        let verification_warning = self.research_context.final_response_warning(&final_text);
+        let final_text = self.research_context.annotate_final_response(&final_text);
+        self.emit(AgentEvent::MessageReceived {
+            role: "assistant".into(),
+            content: final_text.clone(),
+        })
+        .await;
+        if let Some(message) = verification_warning {
+            // Surface the downgrade through the event bus as well as the returned
+            // value so human, JSON, and NDJSON clients receive the same status.
+            self.emit(AgentEvent::ContextWarning { message }).await;
+        }
+
         if self.cost_tracker.input_tokens == 0 && self.cost_tracker.output_tokens == 0 {
             let estimated_input = (self
                 .messages
@@ -637,8 +689,21 @@ impl AgentLoop {
         let _ = self.event_tx.send(event).await;
     }
 
+    async fn provider_request_cancelled(&self) -> ProviderError {
+        let event_message = "Run cancelled while waiting for model";
+        self.emit(AgentEvent::Error {
+            message: event_message.into(),
+        })
+        .await;
+        ProviderError::Other(event_message.to_ascii_lowercase())
+    }
+
     pub fn event_sender(&self) -> Option<tokio::sync::mpsc::Sender<AgentEvent>> {
         Some(self.event_tx.clone())
+    }
+
+    pub fn begin_research_turn(&self, as_of: DateTime<Utc>) {
+        self.research_context.begin_turn(as_of);
     }
 
     pub fn request_cancel(&self) {

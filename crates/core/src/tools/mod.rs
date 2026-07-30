@@ -15,31 +15,46 @@ pub mod mcp;
 pub mod move_path;
 pub mod rename_path;
 pub mod replace_match;
+pub mod resolve_latest_financial_report;
 pub mod run_validation;
 pub mod search;
 pub mod skill_hints;
 pub mod spawn_subagent;
 pub mod types;
 pub mod update_todos;
+pub mod validate_financial_report;
 pub mod web_search;
 pub mod write_file;
 
 pub use ask_question::AskQuestionTool;
 pub use invoke_skill::InvokeSkillTool;
+pub use resolve_latest_financial_report::ResolveLatestFinancialReportTool;
 pub use skill_hints::RecentSkillHints;
 pub use update_todos::{TodoStore, UpdateTodosTool, validate_todos};
+pub use validate_financial_report::ValidateFinancialReportTool;
 
+use crate::research::ResearchContext;
+use chrono::Utc;
 use nca_common::config::WebConfig;
 use nca_common::tool::{ToolCall, ToolDefinition, ToolResult};
+use std::sync::Arc;
 
 /// Registry of available tools the agent can invoke.
 pub struct ToolRegistry {
     tools: Vec<Box<dyn ToolExecutor>>,
+    research_context: Arc<ResearchContext>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        Self { tools: Vec::new() }
+        Self {
+            tools: Vec::new(),
+            research_context: Arc::new(ResearchContext::new(Utc::now())),
+        }
+    }
+
+    pub fn research_context(&self) -> Arc<ResearchContext> {
+        self.research_context.clone()
     }
 
     pub fn register(&mut self, tool: Box<dyn ToolExecutor>) {
@@ -62,8 +77,19 @@ impl ToolRegistry {
         )));
         registry.register(Box::new(git::GitStatusTool::new(workspace_root.clone())));
         registry.register(Box::new(git::GitDiffTool::new(workspace_root)));
-        registry.register(Box::new(web_search::WebSearchTool::new(web_config.clone())));
-        registry.register(Box::new(fetch_url::FetchUrlTool::new(web_config)));
+        let research_context = registry.research_context();
+        registry.register(Box::new(web_search::WebSearchTool::new(
+            web_config.clone(),
+            research_context.clone(),
+        )));
+        registry.register(Box::new(fetch_url::FetchUrlTool::new(
+            web_config,
+            research_context.clone(),
+        )));
+        registry.register(Box::new(ValidateFinancialReportTool::new(research_context)));
+        registry.register(Box::new(ResolveLatestFinancialReportTool::new(
+            registry.research_context(),
+        )));
         registry
     }
 
@@ -77,6 +103,7 @@ impl ToolRegistry {
         )));
         registry.register(Box::new(write_file::WriteFileTool::new(
             workspace_root.clone(),
+            registry.research_context(),
         )));
         registry.register(Box::new(create_directory::CreateDirectoryTool::new(
             workspace_root.clone(),

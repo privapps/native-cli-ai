@@ -55,6 +55,7 @@ default_model = "MiniMax-M2.7"
 max_tokens = 8192
 enable_thinking = false
 thinking_budget = 5120
+reasoning_effort = "nil"   # nil/empty = omit; otherwise pass through to OpenAI-compatible Chat Completions
 
 [model.aliases]
 # Built-in aliases (pre-configured):
@@ -72,6 +73,16 @@ thinking_budget = 5120
 fast = "gpt-4o-mini"
 smart = "claude-3-7-sonnet-latest"
 ```
+
+`model.reasoning_effort` is a string passed to OpenAI, OpenRouter, and Custom
+providers configured with `compatibility = "openai"`. Surrounding whitespace
+is trimmed. The default sentinel `"nil"` (case-sensitive), an empty string,
+or a whitespace-only value omits the `reasoning_effort` JSON property entirely.
+Other values such as `"none"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, or a
+gateway-specific value are sent unchanged. The setting is independent of
+`enable_thinking`, `thinking_budget`, and `temperature`, and is not sent to
+MiniMax, Anthropic, or a Custom provider using the Anthropic-compatible
+protocol.
 
 ### `[permissions]` — Permission System
 

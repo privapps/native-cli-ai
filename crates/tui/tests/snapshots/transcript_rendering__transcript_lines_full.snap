@@ -11,14 +11,9 @@ Please read src/main.rs and summarize.
  ✓ read_file — 42 lines
  nca 
 
-The file defines the
-main
-function and a helper.
-- 
-Loads config.
-- 
-Starts runtime.
-- 
-Blocks on Ctrl-C.
+The file defines the main function and a helper.
+- Loads config.
+- Starts runtime.
+- Blocks on Ctrl-C.
 
  ‣ Session saved.

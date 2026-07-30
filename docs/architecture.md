@@ -134,13 +134,13 @@ from `common::config::NcaConfig`. The CLI resolves configuration from defaults, 
 The system prompt is layered by `core::harness::build_system_prompt` from a runtime-built `HarnessSnapshot`:
 
 1. built-in identity + permission mode
-2. **Environment** (cwd, git branch, model, permission mode, agent profile)
-3. **Todos** (capped session todo list)
-4. **Memory** (newest notes from the home workspace cache)
+2. **Available Context** (cwd, git branch, model, permission mode, agent profile; contextual only)
+3. **Todos** (capped session todo list; contextual only)
+4. **Memory** (newest notes from the home workspace cache; contextual only)
 5. `AGENTS.md` / project (`.ncarc`) / local instructions
 6. skills catalog
 7. optional orchestration metadata from `NCA_ORCH_*`
-8. tool playbook (prefer `replace_match` → `edit_file` → `apply_patch` → `write_file`)
+8. built-in tool and execution guidance; nca development instructions add the edit order (`replace_match` → `edit_file` → `apply_patch` → `write_file`)
 
 ```mermaid
 sequenceDiagram

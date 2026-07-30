@@ -148,3 +148,47 @@ impl Provider for MiniMaxProvider {
         Ok(spawn_anthropic_stream(response, "minimax"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::test_support::{collect_chunks, spawn_sse_server};
+
+    #[tokio::test]
+    async fn minimax_anthropic_compatible_provider_omits_reasoning_effort() {
+        let body = concat!(
+            "event: message_start\n",
+            "data: {\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"usage\":{\"output_tokens\":1}}\n\n"
+        )
+        .to_string();
+        let base_url = spawn_sse_server(body, 200, |request| {
+            assert_eq!(request.url(), "/v1/messages");
+            let mut request_body = String::new();
+            request
+                .as_reader()
+                .read_to_string(&mut request_body)
+                .expect("request body");
+            let payload: serde_json::Value =
+                serde_json::from_str(&request_body).expect("JSON request body");
+            assert!(payload.get("reasoning_effort").is_none());
+        });
+
+        let mut config = NcaConfig::default();
+        config.provider.minimax.api_key = Some("minimax-test-key".into());
+        config.provider.minimax.base_url = base_url;
+        config.model.reasoning_effort = "high".into();
+
+        let provider = MiniMaxProvider::from_config(&config).expect("provider");
+        let stream = provider
+            .chat(&[Message::user("hello")], &[], "", Path::new("."))
+            .await
+            .expect("chat stream");
+        let chunks = collect_chunks(stream).await;
+
+        assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
+    }
+}

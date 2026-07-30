@@ -310,6 +310,18 @@ impl NcaConfig {
         self.provider.custom.compatibility = compatibility;
     }
 
+    /// Whether the active provider uses the OpenAI-compatible Chat Completions
+    /// request shape that supports `reasoning_effort`.
+    pub fn reasoning_effort_active_for_default_provider(&self) -> bool {
+        match self.provider.default {
+            ProviderKind::OpenAi | ProviderKind::OpenRouter => true,
+            ProviderKind::Custom => {
+                self.provider.custom.compatibility == ProviderCompatibility::OpenAi
+            }
+            ProviderKind::MiniMax | ProviderKind::Anthropic => false,
+        }
+    }
+
     /// Editor command: `NCA_EDITOR`, then `[ui].editor`, then `EDITOR`, then `vim`.
     pub fn effective_editor_command(&self) -> String {
         if let Ok(v) = env::var("NCA_EDITOR") {
@@ -1499,7 +1511,7 @@ pub struct CustomProviderSetup {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CustomProviderConfigError {
-    #[error("custom provider base URL must be an HTTP(S) origin or origin/v1")]
+    #[error("custom provider base URL must be an HTTP(S) origin or an origin path ending in /v1")]
     InvalidBaseUrl,
     #[error("custom provider API-key environment variable name is not portable")]
     InvalidApiKeyEnvironmentName,
@@ -1594,16 +1606,26 @@ pub fn normalize_custom_provider_base_url(raw: &str) -> Result<String, CustomPro
         return Err(CustomProviderConfigError::InvalidBaseUrl);
     }
 
-    let path = parsed.path().trim_end_matches('/');
-    if !path.is_empty() && path != "/v1" {
+    let path = parsed.path().trim_end_matches('/').to_string();
+    if !path.is_empty() && !path.ends_with("/v1") {
         return Err(CustomProviderConfigError::InvalidBaseUrl);
     }
 
-    let mut origin = parsed;
-    origin.set_path("");
-    origin.set_query(None);
-    origin.set_fragment(None);
-    Ok(origin.as_str().trim_end_matches('/').to_string())
+    let mut normalized = parsed;
+    normalized.set_path(&path);
+    normalized.set_query(None);
+    normalized.set_fragment(None);
+    Ok(normalized.as_str().trim_end_matches('/').to_string())
+}
+
+/// Append a protocol operation to a custom-provider base URL.
+pub fn custom_provider_endpoint(base_url: &str, operation: &str) -> String {
+    let base_url = base_url.trim_end_matches('/');
+    if base_url.ends_with("/v1") {
+        format!("{base_url}/{operation}")
+    } else {
+        format!("{base_url}/v1/{operation}")
+    }
 }
 
 /// Return the host portion of a validated custom-provider endpoint for
@@ -1637,11 +1659,17 @@ pub struct ModelConfig {
     pub max_tokens: u32,
     pub enable_thinking: bool,
     pub thinking_budget: u32,
+    #[serde(default = "default_reasoning_effort")]
+    pub reasoning_effort: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub aliases: BTreeMap<String, String>,
     /// Last N used model names for F2 cycling.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_models: Vec<String>,
+}
+
+fn default_reasoning_effort() -> String {
+    "nil".into()
 }
 
 impl Default for ModelConfig {
@@ -1651,6 +1679,7 @@ impl Default for ModelConfig {
             max_tokens: 8192,
             enable_thinking: false,
             thinking_budget: 5120,
+            reasoning_effort: "nil".into(),
             aliases: default_model_aliases(),
             recent_models: Vec::new(),
         }
@@ -1670,6 +1699,9 @@ impl ModelConfig {
         }
         if let Some(thinking_budget) = partial.thinking_budget {
             self.thinking_budget = thinking_budget;
+        }
+        if let Some(reasoning_effort) = partial.reasoning_effort {
+            self.reasoning_effort = reasoning_effort;
         }
         if let Some(aliases) = partial.aliases {
             self.aliases = aliases;
@@ -2182,6 +2214,7 @@ struct PartialModelConfig {
     max_tokens: Option<u32>,
     enable_thinking: Option<bool>,
     thinking_budget: Option<u32>,
+    reasoning_effort: Option<String>,
     aliases: Option<BTreeMap<String, String>>,
     recent_models: Option<Vec<String>>,
 }
@@ -2310,10 +2343,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn custom_setup_normalizes_origin_and_v1_urls() {
+    fn custom_setup_normalizes_versioned_path_urls() {
         let setup = CustomProviderSetup {
             compatibility: ProviderCompatibility::OpenAi,
-            base_url: "https://gateway.example/v1/".into(),
+            base_url: "https://gateway.example/zen/v1/".into(),
             api_key_env: "GATEWAY_API_KEY".into(),
             credential: CustomCredentialSource::Environment,
             model: "gateway-model".into(),
@@ -2321,7 +2354,7 @@ mod tests {
 
         let config = CustomProviderConfig::from_setup(setup).expect("valid setup");
 
-        assert_eq!(config.base_url, "https://gateway.example");
+        assert_eq!(config.base_url, "https://gateway.example/zen/v1");
         assert_eq!(config.api_key_env, "GATEWAY_API_KEY");
         assert_eq!(config.api_key, None);
     }
@@ -2476,6 +2509,57 @@ mod tests {
         assert_eq!(config.provider.openai.model, "gpt-4o");
         assert_eq!(config.model.default_model, "gpt-4o");
         assert_eq!(config.provider.minimax.model, "MiniMax-M2.5");
+    }
+
+    #[test]
+    fn reasoning_effort_defaults_to_nil_and_merges_across_model_config_layers() {
+        let mut config = NcaConfig::default();
+        assert_eq!(config.model.reasoning_effort, "nil");
+
+        let legacy: PartialNcaConfig = toml::from_str(
+            r#"
+[model]
+max_tokens = 4096
+"#,
+        )
+        .expect("parse legacy model config");
+        config.merge(legacy);
+        assert_eq!(config.model.reasoning_effort, "nil");
+
+        let global: PartialNcaConfig = toml::from_str(
+            r#"
+[model]
+reasoning_effort = "  low  "
+"#,
+        )
+        .expect("parse global model config");
+        config.merge(global);
+
+        assert_eq!(config.model.reasoning_effort, "  low  ");
+
+        let workspace: PartialNcaConfig = toml::from_str(
+            r#"
+[model]
+reasoning_effort = " high "
+"#,
+        )
+        .expect("parse workspace model config");
+        config.merge(workspace);
+
+        assert_eq!(config.model.reasoning_effort, " high ");
+    }
+
+    #[test]
+    fn legacy_model_deserialization_defaults_reasoning_effort_to_nil() {
+        let model: ModelConfig = serde_json::from_value(serde_json::json!({
+            "default_model": "legacy-model",
+            "max_tokens": 4096,
+            "enable_thinking": false,
+            "thinking_budget": 5120
+        }))
+        .expect("legacy model config");
+
+        assert_eq!(model.reasoning_effort, "nil");
     }
 
     #[test]

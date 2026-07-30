@@ -452,6 +452,156 @@ model = "openai/gpt-4o-mini"
 }
 
 #[test]
+fn models_json_reports_reasoning_effort_and_active_provider_scope() {
+    let temp = tempdir().expect("tempdir");
+    write_local_config_contents(
+        temp.path(),
+        r#"
+[provider]
+default = "custom"
+
+[provider.custom]
+api_key = "custom-key"
+base_url = "https://gateway.example"
+compatibility = "anthropic"
+
+[model]
+reasoning_effort = "low"
+"#,
+    );
+
+    let output = Command::cargo_bin("nca")
+        .expect("binary")
+        .current_dir(temp.path())
+        .env("HOME", temp.path())
+        .arg("models")
+        .arg("--json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let payload: Value = serde_json::from_slice(&output).expect("json");
+    assert_eq!(payload["reasoning_effort"], "low");
+    assert_eq!(payload["reasoning_effort_scope"], "OpenAI-compatible only");
+    assert_eq!(payload["reasoning_effort_active"], false);
+}
+
+#[test]
+fn config_json_reports_reasoning_effort_and_active_provider_scope() {
+    let temp = tempdir().expect("tempdir");
+    write_local_config_contents(
+        temp.path(),
+        r#"
+[provider]
+default = "custom"
+
+[provider.custom]
+api_key = "custom-key"
+base_url = "https://gateway.example"
+compatibility = "anthropic"
+
+[model]
+reasoning_effort = "low"
+"#,
+    );
+
+    let output = Command::cargo_bin("nca")
+        .expect("binary")
+        .current_dir(temp.path())
+        .env("HOME", temp.path())
+        .arg("config")
+        .arg("--json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let payload: Value = serde_json::from_slice(&output).expect("json");
+    assert_eq!(payload["reasoning_effort"], "low");
+    assert_eq!(payload["reasoning_effort_scope"], "OpenAI-compatible only");
+    assert_eq!(payload["reasoning_effort_active"], false);
+}
+
+#[test]
+fn reasoning_effort_cli_override_is_run_scoped() {
+    let temp = tempdir().expect("tempdir");
+    write_local_config_contents(
+        temp.path(),
+        r#"
+[provider]
+default = "minimax"
+
+[provider.minimax]
+api_key = "minimax-key"
+
+[model]
+reasoning_effort = "low"
+"#,
+    );
+
+    let output = Command::cargo_bin("nca")
+        .expect("binary")
+        .current_dir(temp.path())
+        .env("HOME", temp.path())
+        .arg("--reasoning-effort")
+        .arg("nil")
+        .arg("models")
+        .arg("--json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let payload: Value = serde_json::from_slice(&output).expect("json");
+    assert_eq!(payload["reasoning_effort"], "nil");
+    let persisted =
+        fs::read_to_string(temp.path().join(".nca/config.local.toml")).expect("persisted config");
+    assert!(persisted.contains("reasoning_effort = \"low\""));
+}
+
+#[test]
+fn non_nil_reasoning_effort_cli_override_is_run_scoped() {
+    let temp = tempdir().expect("tempdir");
+    write_local_config_contents(
+        temp.path(),
+        r#"
+[provider]
+default = "minimax"
+
+[provider.minimax]
+api_key = "minimax-key"
+
+[model]
+reasoning_effort = "low"
+"#,
+    );
+
+    let output = Command::cargo_bin("nca")
+        .expect("binary")
+        .current_dir(temp.path())
+        .env("HOME", temp.path())
+        .arg("--reasoning-effort")
+        .arg("high")
+        .arg("models")
+        .arg("--json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let payload: Value = serde_json::from_slice(&output).expect("json");
+    assert_eq!(payload["reasoning_effort"], "high");
+    let persisted =
+        fs::read_to_string(temp.path().join(".nca/config.local.toml")).expect("persisted config");
+    assert!(persisted.contains("reasoning_effort = \"low\""));
+}
+
+#[test]
 fn doctor_json_reports_provider_readiness_for_all_backends() {
     let temp = tempdir().expect("tempdir");
     write_local_config_contents(
@@ -473,6 +623,7 @@ model = "claude-3-7-sonnet-latest"
         .expect("binary")
         .current_dir(temp.path())
         .env("HOME", temp.path())
+        .env_remove("OPENAI_API_KEY")
         .arg("doctor")
         .arg("--json")
         .assert()

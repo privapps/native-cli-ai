@@ -2,7 +2,7 @@ use std::path::Path;
 
 use nca_common::config::{
     CustomProviderConfig, CustomProviderConfigError, NcaConfig, ProviderCompatibility,
-    normalize_custom_provider_base_url, validate_custom_api_key_env_name,
+    custom_provider_endpoint, normalize_custom_provider_base_url, validate_custom_api_key_env_name,
 };
 use nca_common::message::Message;
 use nca_common::tool::ToolDefinition;
@@ -17,6 +17,7 @@ pub struct CustomProvider {
     client: reqwest::Client,
     config: CustomProviderConfig,
     max_tokens: u32,
+    reasoning_effort: String,
 }
 
 impl CustomProvider {
@@ -62,17 +63,17 @@ impl CustomProvider {
             client,
             config: custom,
             max_tokens: config.model.max_tokens,
+            reasoning_effort: config.model.reasoning_effort.clone(),
         })
     }
 
     fn endpoint(&self) -> String {
         match self.config.compatibility {
-            ProviderCompatibility::OpenAi => format!(
-                "{}/v1/chat/completions",
-                self.config.base_url.trim_end_matches('/')
-            ),
+            ProviderCompatibility::OpenAi => {
+                custom_provider_endpoint(&self.config.base_url, "chat/completions")
+            }
             ProviderCompatibility::Anthropic => {
-                format!("{}/v1/messages", self.config.base_url.trim_end_matches('/'))
+                custom_provider_endpoint(&self.config.base_url, "messages")
             }
         }
     }
@@ -101,14 +102,14 @@ pub async fn probe_custom_provider(config: &CustomProviderConfig) -> Result<(), 
     let response = match config.compatibility {
         ProviderCompatibility::OpenAi => {
             client
-                .get(format!("{base_url}/v1/models"))
+                .get(custom_provider_endpoint(&base_url, "models"))
                 .bearer_auth(&api_key)
                 .send()
                 .await
         }
         ProviderCompatibility::Anthropic => {
             client
-                .post(format!("{base_url}/v1/messages"))
+                .post(custom_provider_endpoint(&base_url, "messages"))
                 .header("x-api-key", &api_key)
                 .header("anthropic-version", "2023-06-01")
                 .json(&serde_json::json!({
@@ -187,6 +188,7 @@ impl Provider for CustomProvider {
                     &model,
                     self.max_tokens,
                     self.config.temperature,
+                    &self.reasoning_effort,
                     workspace_root,
                 )?;
 
@@ -267,9 +269,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anthropic_probe_sends_minimal_messages_request_with_required_headers() {
+    async fn anthropic_probe_preserves_versioned_path_prefix_and_sends_required_headers() {
         let (base_url, request_rx) = spawn_probe_server(200, r#"{"id":"msg_1"}"#);
-        let config = custom_config(ProviderCompatibility::Anthropic, &base_url, "probe-secret");
+        let prefixed_base_url = format!("{base_url}/zen/v1");
+        let config = custom_config(
+            ProviderCompatibility::Anthropic,
+            &prefixed_base_url,
+            "probe-secret",
+        );
 
         probe_custom_provider(&config)
             .await
@@ -277,7 +284,7 @@ mod tests {
 
         let request = request_rx.recv().expect("probe request");
         assert_eq!(request.method, "POST");
-        assert_eq!(request.url, "/v1/messages");
+        assert_eq!(request.url, "/zen/v1/messages");
         assert_eq!(request.x_api_key.as_deref(), Some("probe-secret"));
         assert_eq!(request.anthropic_version.as_deref(), Some("2023-06-01"));
         assert!(request.body.contains("\"messages\""));
@@ -496,6 +503,7 @@ mod tests {
         config.provider.custom.base_url = base_url;
         config.provider.custom.compatibility = ProviderCompatibility::OpenAi;
         config.provider.custom.model = "custom-openai-model".into();
+        config.model.reasoning_effort = "  low  ".into();
 
         let provider = CustomProvider::from_config(&config).expect("provider");
         let stream = provider
@@ -529,6 +537,7 @@ mod tests {
                 "stream_options": {"include_usage": true},
                 "max_tokens": 8192,
                 "temperature": 0.699999988079071,
+                "reasoning_effort": "low",
             })
         );
         assert!(matches!(&chunks[0], StreamChunk::TextDelta(text) if text == "Hello "));
@@ -539,6 +548,69 @@ mod tests {
                 output_tokens: 2
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn custom_openai_provider_preserves_versioned_path_prefix() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"index\":0,\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .to_string();
+        let (request_tx, request_rx) = mpsc::channel();
+        let origin = spawn_sse_server(body, 200, move |request| {
+            request_tx
+                .send(capture_chat_request(request))
+                .expect("capture OpenAI chat request");
+        });
+
+        let mut config = NcaConfig::default();
+        config.provider.custom.api_key = Some("custom-test-key".into());
+        config.provider.custom.base_url = format!("{origin}/zen/v1");
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAi;
+
+        let provider = CustomProvider::from_config(&config).expect("provider");
+        let stream = provider
+            .chat(&[Message::user("hello")], &[], "", Path::new("."))
+            .await
+            .expect("chat stream");
+        let chunks = collect_chunks(stream).await;
+
+        let request = request_rx.recv().expect("OpenAI chat request");
+        assert_eq!(request.url, "/zen/v1/chat/completions");
+        assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
+    }
+
+    #[tokio::test]
+    async fn custom_openai_compatible_provider_omits_default_reasoning_effort() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"index\":0,\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .to_string();
+        let (request_tx, request_rx) = mpsc::channel();
+        let base_url = spawn_sse_server(body, 200, move |request| {
+            request_tx
+                .send(capture_chat_request(request))
+                .expect("capture OpenAI chat request");
+        });
+
+        let mut config = NcaConfig::default();
+        config.provider.custom.api_key = Some("custom-test-key".into());
+        config.provider.custom.base_url = base_url;
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAi;
+
+        let provider = CustomProvider::from_config(&config).expect("provider");
+        let stream = provider
+            .chat(&[Message::user("hello")], &[], "", Path::new("."))
+            .await
+            .expect("chat stream");
+        let chunks = collect_chunks(stream).await;
+        let request = request_rx.recv().expect("OpenAI chat request");
+        let payload: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+
+        assert!(payload.get("reasoning_effort").is_none());
+        assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
     }
 
     #[tokio::test]
@@ -566,6 +638,7 @@ mod tests {
         config.provider.custom.base_url = base_url;
         config.provider.custom.compatibility = ProviderCompatibility::Anthropic;
         config.provider.custom.model = "custom-anthropic-model".into();
+        config.model.reasoning_effort = "high".into();
 
         let provider = CustomProvider::from_config(&config).expect("provider");
         let stream = provider
