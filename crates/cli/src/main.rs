@@ -62,7 +62,7 @@ struct Cli {
     #[arg(long, default_value = "5120")]
     thinking_budget: u32,
 
-    /// Reasoning effort for OpenAI-compatible Chat Completions requests
+    /// Reasoning effort for OpenAI-compatible Chat Completions or Responses requests
     #[arg(long, global = true)]
     reasoning_effort: Option<String>,
 

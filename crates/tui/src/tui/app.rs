@@ -1058,6 +1058,7 @@ pub fn run_blocking(
                         CustomProviderSetupStep::Compatibility => {
                             let opts = [
                                 ("OpenAI-compatible", "POST …/v1/chat/completions (Bearer)"),
+                                ("OpenAI Responses", "POST …/v1/responses (Bearer)"),
                                 ("Anthropic-compatible", "POST …/v1/messages (x-api-key)"),
                             ];
                             for (j, (a, b)) in opts.iter().enumerate() {

@@ -2,7 +2,7 @@
 
 ## Status
 
-The Custom provider implementation uses one configurable provider slot and supports endpoints that speak either the OpenAI-compatible Chat Completions protocol or the Anthropic-compatible Messages protocol. The TUI exposes configuration during first-run onboarding and during an existing session. Focused source/test coverage and full locked workspace verification are present.
+The Custom provider implementation uses one configurable provider slot and supports endpoints that speak OpenAI-compatible Chat Completions, OpenAI Responses, or Anthropic-compatible Messages. The TUI exposes configuration during first-run onboarding and during an existing session. Focused source/test coverage and full locked workspace verification are present.
 
 The complete TUI lifecycle and acceptance contract is recorded in [Custom Provider TUI Configuration](../superpowers/specs/2026-07-27-custom-provider-tui-spec.md).
 
@@ -12,7 +12,7 @@ The complete TUI lifecycle and acceptance contract is recorded in [Custom Provid
 - Existing session: select **Custom** from `/connect` to configure it.
 - Existing session: use `/provider` → **Add custom provider…** to add or edit the slot.
 - Activation: use `/provider custom` or select **Custom (BYO endpoint)** in the provider picker.
-- Legacy/script path: `/custom <openai|anthropic> <base-url> [api-key] [model]` remains supported.
+- Legacy/script path: `/custom <openai|responses|anthropic> <base-url> [api-key] [model]` remains supported.
 
 An unconfigured Custom selection opens setup rather than attempting to use an empty endpoint. The model/provider picker has the same recovery behavior.
 
@@ -20,7 +20,7 @@ An unconfigured Custom selection opens setup rather than attempting to use an em
 
 The Custom slot contains `compatibility`, `base_url`, `api_key_env`, optional inline `api_key`, `model`, and `temperature`.
 
-- Compatibility is either `openai` or `anthropic`.
+- Compatibility is `openai`, `openai-responses`, or `anthropic`.
 - The base URL is normalized from an HTTP(S) origin or a path ending in `/v1`; any accepted path prefix is preserved. Credentials, query strings, fragments, and final endpoint paths are rejected.
 - The API-key environment-variable name is editable but must use a portable shell-variable format. `CUSTOM_PROVIDER_API_KEY` is the default.
 - Credential resolution prefers an explicit inline key over the named environment variable. A blank key during editing preserves the existing source. Resolved environment secrets are never materialized into persisted TOML.
@@ -29,11 +29,12 @@ The Custom slot contains `compatibility`, `base_url`, `api_key_env`, optional in
 ## Protocol and activation behavior
 
 - OpenAI-compatible probes call `GET <base path>/models` with Bearer authentication; chat calls `POST <base path>/chat/completions` with streaming and OpenAI tool-call shapes.
+- OpenAI Responses probes use the same Bearer-authenticated model listing; chat calls `POST <base path>/responses` with `stream: true`, `store: false`, native Responses items, and Responses SSE events. The shared temperature setting is omitted because model support varies.
 - Anthropic-compatible probes send a minimal `POST <base path>/messages` with `x-api-key` and `anthropic-version: 2023-06-01`; chat uses the same endpoint and headers with streaming and Anthropic tool-use shapes.
 - Malformed URLs, invalid environment-variable names, and missing credentials block setup.
 - Network, authentication, protocol, and endpoint probe failures offer **Retry**, **Save anyway**, or **Cancel**. Save anyway activates the manually configured provider and, during onboarding, completes onboarding.
 - Probe errors are sanitized. Empty streaming completions are errors rather than successful turns.
-- Model discovery is best-effort and uses the selected protocol's `<base path>/models` behavior; manual IDs remain valid when discovery returns no models. Deterministic local fixtures cover both protocol paths, authentication, parsing, pagination, and provider failures.
+- Model discovery is best-effort and uses the selected protocol's `<base path>/models` behavior; manual IDs remain valid when discovery returns no models. Deterministic local fixtures cover all protocol paths, authentication, parsing, pagination, and provider failures.
 
 ## Persistence contract
 

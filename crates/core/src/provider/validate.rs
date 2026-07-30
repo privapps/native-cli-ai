@@ -56,7 +56,7 @@ pub async fn validate_api_key(
                 .await
         }
         ProviderKind::Custom => match compatibility.unwrap_or(ProviderCompatibility::OpenAi) {
-            ProviderCompatibility::OpenAi => {
+            ProviderCompatibility::OpenAi | ProviderCompatibility::OpenAiResponses => {
                 let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
                 client
                     .get(&url)

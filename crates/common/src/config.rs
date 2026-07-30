@@ -310,13 +310,16 @@ impl NcaConfig {
         self.provider.custom.compatibility = compatibility;
     }
 
-    /// Whether the active provider uses the OpenAI-compatible Chat Completions
-    /// request shape that supports `reasoning_effort`.
+    /// Whether the active provider uses an OpenAI-compatible request shape that
+    /// supports the configured reasoning-effort setting.
     pub fn reasoning_effort_active_for_default_provider(&self) -> bool {
         match self.provider.default {
             ProviderKind::OpenAi | ProviderKind::OpenRouter => true,
             ProviderKind::Custom => {
-                self.provider.custom.compatibility == ProviderCompatibility::OpenAi
+                matches!(
+                    self.provider.custom.compatibility,
+                    ProviderCompatibility::OpenAi | ProviderCompatibility::OpenAiResponses
+                )
             }
             ProviderKind::MiniMax | ProviderKind::Anthropic => false,
         }
@@ -943,6 +946,7 @@ fn patch_document(document: &mut DocumentMut, patch: &ProviderConfigPatch) -> Re
             provider_fields["compatibility"] = value(match compatibility {
                 ProviderCompatibility::OpenAi => "openai",
                 ProviderCompatibility::Anthropic => "anthropic",
+                ProviderCompatibility::OpenAiResponses => "openai-responses",
             });
         }
     }
@@ -1404,13 +1408,18 @@ pub struct ProviderCapabilitySupport {
 pub enum ProviderCompatibility {
     OpenAi,
     Anthropic,
+    #[serde(rename = "openai-responses")]
+    OpenAiResponses,
 }
 
 impl ProviderCompatibility {
+    pub const ALL: [Self; 3] = [Self::OpenAi, Self::OpenAiResponses, Self::Anthropic];
+
     pub fn from_cli_name(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "openai" | "open-ai" => Some(Self::OpenAi),
             "anthropic" | "claude" => Some(Self::Anthropic),
+            "responses" | "openai-responses" | "openai_responses" => Some(Self::OpenAiResponses),
             _ => None,
         }
     }
@@ -1419,7 +1428,56 @@ impl ProviderCompatibility {
         match self {
             Self::OpenAi => "OpenAI-compatible",
             Self::Anthropic => "Anthropic-compatible",
+            Self::OpenAiResponses => "OpenAI Responses",
         }
+    }
+
+    pub const fn index(self) -> usize {
+        match self {
+            Self::OpenAi => 0,
+            Self::OpenAiResponses => 1,
+            Self::Anthropic => 2,
+        }
+    }
+
+    pub const fn from_index(index: usize) -> Self {
+        match index {
+            1 => Self::OpenAiResponses,
+            2 => Self::Anthropic,
+            _ => Self::OpenAi,
+        }
+    }
+}
+
+#[cfg(test)]
+mod responses_compatibility_tests {
+    use super::ProviderCompatibility;
+
+    #[test]
+    fn responses_compatibility_has_stable_cli_aliases_and_display_name() {
+        for alias in ["responses", "openai-responses", "openai_responses"] {
+            assert_eq!(
+                ProviderCompatibility::from_cli_name(alias),
+                Some(ProviderCompatibility::OpenAiResponses)
+            );
+        }
+        assert_eq!(
+            ProviderCompatibility::OpenAiResponses.display_name(),
+            "OpenAI Responses"
+        );
+        assert_eq!(
+            ProviderCompatibility::from_cli_name("openai"),
+            Some(ProviderCompatibility::OpenAi)
+        );
+        assert_eq!(
+            serde_json::to_string(&ProviderCompatibility::OpenAiResponses).unwrap(),
+            "\"openai-responses\""
+        );
+        assert_eq!(
+            ProviderCompatibility::from_index(1),
+            ProviderCompatibility::OpenAiResponses
+        );
+        assert_eq!(ProviderCompatibility::OpenAiResponses.index(), 1);
     }
 }
 

@@ -114,9 +114,9 @@ Available agent profiles:
 | `/model [name]` | Set the active model for the session |
 | `/connect` | Open the provider connection picker |
 | `/provider [name]` | Show or set the default LLM provider |
-| `/custom <compat> <url> [key] [model]` | Configure a custom endpoint (OpenAI or Anthropic compatible) |
+| `/custom <compat> <url> [key] [model]` | Configure a custom endpoint (`openai`, `responses`, or `anthropic`) |
 | `/apikey <provider> <key>` | Store an API key for a provider |
-| `/reasoning-effort [value]` | Show or persist the OpenAI-compatible Chat Completions reasoning effort |
+| `/reasoning-effort [value]` | Show or persist OpenAI-compatible Chat/Responses reasoning effort |
 
 `/reasoning-effort <value>` trims and saves the value to the workspace
 configuration. Use `/reasoning-effort nil` to omit the request property, or

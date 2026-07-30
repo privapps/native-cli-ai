@@ -1,4 +1,4 @@
-# Configurable Reasoning Effort for OpenAI-Compatible Chat Completions
+# Configurable Reasoning Effort for OpenAI-Compatible Chat Completions and Responses
 
 ## Problem Statement
 
@@ -6,7 +6,7 @@ Users connect `nca` to OpenAI-compatible gateways and models that support the Ch
 
 This is especially limiting for the Custom provider, where the endpoint and model are user-selected and may expose provider-specific reasoning-effort values. The existing `enable_thinking` and `thinking_budget` settings do not provide this capability: they are independent settings and are not translated into an OpenAI-compatible `reasoning_effort` field.
 
-The current Custom provider supports two wire protocols. An OpenAI-compatible Custom endpoint shares the request-body path used by OpenAI and OpenRouter; an Anthropic-compatible Custom endpoint uses the Anthropic Messages shape and must not receive an OpenAI-only field.
+The current Custom provider supports OpenAI-compatible Chat Completions, OpenAI Responses, and Anthropic-compatible Messages. Chat Completions shares the request-body path used by OpenAI and OpenRouter; Responses uses native input and nested reasoning fields; Anthropic-compatible Custom endpoints use the Anthropic Messages shape and must not receive OpenAI-only fields.
 
 ## Solution
 
@@ -18,7 +18,7 @@ The default value is the literal string `"nil"`. After trimming surrounding whit
 - An empty value also omits the property.
 - Every other value is sent unchanged, including `"none"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, and provider-specific values.
 
-The field is added only to OpenAI-compatible Chat Completions requests for OpenAI, OpenRouter, and Custom providers configured with OpenAI compatibility. Anthropic-compatible requests do not receive it. A configured value is always sent without model-capability detection or automatic fallback; provider rejection is surfaced as the normal request error.
+The field is added to OpenAI-compatible Chat Completions requests for OpenAI, OpenRouter, and Custom providers configured with `openai`, and to Custom Responses requests as `reasoning.effort`. Anthropic-compatible requests do not receive it. Configured values are sent without model-capability detection or automatic fallback; provider rejection is surfaced as the normal request error.
 
 ## User Stories
 
@@ -32,7 +32,7 @@ The field is added only to OpenAI-compatible Chat Completions requests for OpenA
 8. As an `nca` user, I want an empty or whitespace-only value to omit the property, so that `nca` never sends an empty reasoning-effort string.
 9. As an OpenAI user, I want the configured value in Chat Completions requests, so that native OpenAI models can honor my reasoning preference.
 10. As an OpenRouter user, I want the configured value in Chat Completions requests, so that routed reasoning models can honor my preference.
-11. As a Custom-provider user using an OpenAI-compatible endpoint, I want the configured value in the request, so that self-hosted and third-party gateways can honor it.
+11. As a Custom-provider user using OpenAI-compatible Chat Completions, I want the configured value in the request, so that self-hosted and third-party gateways can honor it.
 12. As a Custom-provider user using an Anthropic-compatible endpoint, I want OpenAI-only fields omitted, so that the endpoint receives a valid Anthropic Messages request.
 13. As an `nca` user, I want one global model-level setting to apply across OpenAI-compatible providers, so that switching providers does not require duplicate configuration.
 14. As an `nca` user, I want `--reasoning-effort VALUE` to override the configured value for one invocation, so that I can experiment without changing persistent settings.
@@ -45,21 +45,22 @@ The field is added only to OpenAI-compatible Chat Completions requests for OpenA
 21. As an `nca` user, I want the setting visible in model and configuration status output, so that I can distinguish an explicit `nil` setting from a missing or accidentally ignored setting.
 22. As an `nca` user, I want status output to identify that the setting is OpenAI-compatible-only, so that seeing a configured value while using an Anthropic-compatible endpoint is not misleading.
 23. As an `nca` user, I want `reasoning_effort` to remain independent from `enable_thinking` and `thinking_budget`, so that existing thinking configuration is not silently reinterpreted.
-24. As an `nca` user, I want temperature behavior to remain unchanged when reasoning effort is configured, so that the new option does not unexpectedly alter another request parameter.
+24. As an `nca` user, I want temperature behavior unchanged on Chat Completions and Anthropic-compatible paths, while Responses omits unsupported `temperature`, so that each protocol receives a valid request.
 25. As an `nca` user, I want an unsupported value to produce the provider's normal error, so that invalid or incompatible configuration is visible instead of being silently downgraded.
-26. As an `nca` maintainer, I want the shared OpenAI-compatible request seam to own this behavior, so that OpenAI, OpenRouter, and Custom OpenAI-compatible requests stay consistent.
+26. As an `nca` maintainer, I want protocol adapters to own this behavior, so that OpenAI, OpenRouter, Custom Chat Completions, and Custom Responses requests stay consistent.
 
 ## Implementation Decisions
 
 - Add `reasoning_effort` to the global model configuration as a string with a default of `"nil"`. Existing configurations that lack the field must acquire that default during deserialization and merging.
 - Treat the setting as a pass-through value rather than an enum. This preserves compatibility with custom gateways and future provider values.
 - Normalize only at the boundary: trim surrounding whitespace; omit for `nil` after trimming, and omit for an empty result. Preserve the remaining value exactly, including values such as `none` and vendor-specific strings.
-- Extend the shared OpenAI-compatible request-body contract with the optional root-level `reasoning_effort` JSON property. The property is present only when the normalized value is non-empty and not `nil`.
-- Route the global setting into OpenAI, OpenRouter, and the OpenAI-compatible Custom provider adapters through the existing shared request-body seam.
+- Extend the shared OpenAI-compatible Chat Completions request-body contract with the optional root-level `reasoning_effort` JSON property. The property is present only when the normalized value is non-empty and not `nil`.
+- Route the global setting into OpenAI, OpenRouter, and the Custom Chat Completions adapter through the existing shared request-body seam.
+- Route the global setting into the Custom Responses adapter as nested `reasoning.effort`.
 - Do not add the property to the Anthropic-compatible request-body contract, including Anthropic-compatible Custom endpoints and the MiniMax Anthropic-compatible path.
-- Always send a configured non-`nil` value for the selected OpenAI-compatible provider, without inspecting model names or attempting capability detection.
+- Always send a configured non-`nil` value for the selected Chat Completions or Responses provider in that protocol's request shape, without inspecting model names or attempting capability detection.
 - Do not retry a rejected request without the property. Provider errors remain visible to the user.
-- Keep `temperature` unchanged when reasoning effort is configured. The feature does not infer or impose provider-specific temperature rules.
+- Keep `temperature` unchanged on Chat Completions and Anthropic-compatible paths. Custom Responses omits `temperature` because model support varies; this is a fixed protocol rule, not capability detection or retry behavior.
 - Keep `enable_thinking` and `thinking_budget` independent. This feature does not translate those settings into `reasoning_effort` and does not implement Anthropic `thinking` blocks.
 - Add a CLI `--reasoning-effort` option whose omission leaves the loaded configuration unchanged and whose explicit value, including `nil`, overrides it for the current invocation only.
 - Add the `/reasoning-effort` TUI command. With a value, it trims and persists the new setting to workspace configuration; without a value, it displays the current setting. The Custom-provider setup wizard remains focused on endpoint and credential configuration.
@@ -83,12 +84,12 @@ The field is added only to OpenAI-compatible Chat Completions requests for OpenA
 - Implementing Anthropic `thinking` request blocks or mapping `thinking_budget` to an Anthropic budget.
 - Removing, renaming, or redefining `enable_thinking` or `thinking_budget`.
 - Automatic model capability discovery or model-name heuristics.
-- Automatic removal or adjustment of `temperature` for reasoning models.
+- Automatic capability detection or retry-based removal of `temperature`; Custom Responses has a documented fixed omission rule.
 - Retrying requests without `reasoning_effort` after provider rejection.
 - A fixed allowlist of reasoning-effort values.
 - A reasoning-effort field in the Custom-provider setup wizard.
 - Per-provider or per-model reasoning-effort profiles.
-- Sending `reasoning_effort` to Anthropic-compatible or other non-Chat-Completions request paths.
+- Sending `reasoning_effort` to Anthropic-compatible or other non-Chat-Completions/Responses request paths.
 - Adding a separate provider-specific JSON extension mechanism beyond this setting.
 
 ## Further Notes

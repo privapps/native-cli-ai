@@ -312,6 +312,25 @@ mod tests {
     }
 
     #[test]
+    fn responses_compatibility_is_preserved_through_setup_candidate() {
+        let mut flow = CustomProviderSetupFlow::new(&config());
+        assert!(matches!(
+            flow.choose_compatibility(ProviderCompatibility::OpenAiResponses),
+            CustomProviderSetupTransition::Continue
+        ));
+        flow.submit_base_url("https://gateway.example/v1");
+        flow.submit_credentials("GATEWAY_API_KEY", "secret");
+        let CustomProviderSetupTransition::Probe(candidate) = flow.submit_model("responses-model")
+        else {
+            panic!("expected probe");
+        };
+        assert_eq!(
+            candidate.compatibility,
+            ProviderCompatibility::OpenAiResponses
+        );
+    }
+
+    #[test]
     fn blank_secret_preserves_existing_credential() {
         let mut flow = CustomProviderSetupFlow::new(&config());
         flow.choose_compatibility(ProviderCompatibility::OpenAi);

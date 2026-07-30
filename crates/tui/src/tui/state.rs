@@ -629,10 +629,7 @@ impl TuiSessionState {
         } = &mut self.overlay
         {
             *overlay_step = step;
-            *compat_index = usize::from(matches!(
-                draft.compatibility,
-                nca_common::config::ProviderCompatibility::Anthropic
-            ));
+            *compat_index = draft.compatibility.index();
             *overlay_input = input;
             *base_url = draft.base_url;
             *api_key = draft.api_key.unwrap_or_default();
@@ -1194,14 +1191,7 @@ impl TuiSessionState {
         self.custom_provider_setup_flow = Some(CustomProviderSetupFlow::new(config));
         self.set_overlay(UiOverlay::CustomProviderSetup {
             step: CustomProviderSetupStep::Compatibility,
-            compat_index: if matches!(
-                config.compatibility,
-                nca_common::config::ProviderCompatibility::Anthropic
-            ) {
-                1
-            } else {
-                0
-            },
+            compat_index: config.compatibility.index(),
             input: config.base_url.clone(),
             base_url: config.base_url.clone(),
             api_key: String::new(),
@@ -1251,14 +1241,7 @@ impl TuiSessionState {
         };
         self.set_overlay(UiOverlay::CustomProviderSetup {
             step,
-            compat_index: if matches!(
-                compatibility,
-                nca_common::config::ProviderCompatibility::Anthropic
-            ) {
-                1
-            } else {
-                0
-            },
+            compat_index: compatibility.index(),
             input,
             base_url,
             api_key: String::new(),

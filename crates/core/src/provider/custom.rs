@@ -1,10 +1,12 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use nca_common::config::{
     CustomProviderConfig, CustomProviderConfigError, NcaConfig, ProviderCompatibility,
     custom_provider_endpoint, normalize_custom_provider_base_url, validate_custom_api_key_env_name,
 };
-use nca_common::message::Message;
+use nca_common::message::{ContentPart, Message, MessageContent, Role};
 use nca_common::tool::ToolDefinition;
 use reqwest::RequestBuilder;
 use reqwest::header::HeaderValue;
@@ -86,7 +88,7 @@ pub enum CustomCapabilityAdapter {
 impl CustomCapabilityAdapter {
     pub fn from_compatibility(compatibility: ProviderCompatibility) -> Self {
         match compatibility {
-            ProviderCompatibility::OpenAi => Self::OpenAi,
+            ProviderCompatibility::OpenAi | ProviderCompatibility::OpenAiResponses => Self::OpenAi,
             ProviderCompatibility::Anthropic => Self::Anthropic,
         }
     }
@@ -251,6 +253,90 @@ impl CustomProtocolAdapter for OpenAiCustomAdapter {
             has_more: false,
             next_cursor: None,
         })
+    }
+}
+
+struct OpenAiResponsesCustomAdapter;
+
+static OPENAI_RESPONSES_CUSTOM_ADAPTER: OpenAiResponsesCustomAdapter = OpenAiResponsesCustomAdapter;
+
+impl CustomProtocolAdapter for OpenAiResponsesCustomAdapter {
+    fn protocol_name(&self) -> &'static str {
+        "OpenAI Responses"
+    }
+
+    fn validate_api_key(&self, api_key: &str) -> Result<(), ProviderError> {
+        OPENAI_CUSTOM_ADAPTER.validate_api_key(api_key)
+    }
+
+    fn probe_request(
+        &self,
+        client: &reqwest::Client,
+        base_url: &str,
+        config: &CustomProviderConfig,
+        api_key: &str,
+    ) -> Result<RequestBuilder, ProviderError> {
+        OPENAI_CUSTOM_ADAPTER.probe_request(client, base_url, config, api_key)
+    }
+
+    fn validate_probe_response(&self, body: &str) -> Result<(), String> {
+        OPENAI_CUSTOM_ADAPTER.validate_probe_response(body)
+    }
+
+    fn chat_request(
+        &self,
+        client: &reqwest::Client,
+        base_url: &str,
+        body: Value,
+        api_key: &str,
+    ) -> Result<RequestBuilder, ProviderError> {
+        self.validate_api_key(api_key)?;
+        Ok(client
+            .post(custom_provider_endpoint(base_url, "responses"))
+            .bearer_auth(api_key)
+            .json(&body))
+    }
+
+    fn chat_body(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        model: &str,
+        max_tokens: u32,
+        temperature: f32,
+        reasoning_effort: &str,
+        workspace_root: &Path,
+    ) -> Result<Value, ProviderError> {
+        responses_request_body(
+            messages,
+            tools,
+            model,
+            max_tokens,
+            temperature,
+            reasoning_effort,
+            workspace_root,
+        )
+    }
+
+    fn spawn_stream(
+        &self,
+        response: reqwest::Response,
+    ) -> tokio::sync::mpsc::Receiver<StreamChunk> {
+        spawn_responses_stream(response, "custom")
+    }
+
+    fn models_request(
+        &self,
+        client: &reqwest::Client,
+        base_url: &str,
+        api_key: &str,
+        cursor: Option<&str>,
+    ) -> Result<RequestBuilder, ProviderError> {
+        OPENAI_CUSTOM_ADAPTER.models_request(client, base_url, api_key, cursor)
+    }
+
+    fn parse_models_page(&self, body: &str) -> Result<CustomModelsPage, String> {
+        OPENAI_CUSTOM_ADAPTER.parse_models_page(body)
     }
 }
 
@@ -434,10 +520,476 @@ impl CustomProtocolAdapter for AnthropicCustomAdapter {
     }
 }
 
+fn responses_request_body(
+    messages: &[Message],
+    tools: &[ToolDefinition],
+    model: &str,
+    max_tokens: u32,
+    _temperature: f32,
+    reasoning_effort: &str,
+    workspace_root: &Path,
+) -> Result<Value, ProviderError> {
+    let mut input = Vec::new();
+    for message in messages {
+        match message.role {
+            Role::System => input.push(serde_json::json!({
+                "role": "system",
+                "content": message_content_text(&message.content),
+            })),
+            Role::User => input.push(serde_json::json!({
+                "role": "user",
+                "content": responses_content_value(&message.content, workspace_root)?,
+            })),
+            Role::Assistant => {
+                if !message.content.is_empty() {
+                    input.push(serde_json::json!({
+                        "role": "assistant",
+                        "content": message_content_text(&message.content),
+                    }));
+                }
+                if let Some(calls) = &message.tool_calls {
+                    for call in calls {
+                        input.push(serde_json::json!({
+                            "type": "function_call",
+                            "call_id": call.id,
+                            "name": call.name,
+                            "arguments": serde_json::to_string(&call.arguments)
+                                .unwrap_or_else(|_| "{}".into()),
+                        }));
+                    }
+                }
+            }
+            Role::Tool => input.push(serde_json::json!({
+                "type": "function_call_output",
+                "call_id": message.tool_call_id,
+                "output": message_content_text(&message.content),
+            })),
+        }
+    }
+
+    let mut body = serde_json::json!({
+        "model": model,
+        "input": input,
+        "stream": true,
+        "store": false,
+        "max_output_tokens": max_tokens,
+    });
+
+    if !tools.is_empty() {
+        body["tools"] = Value::Array(
+            tools
+                .iter()
+                .map(|tool| {
+                    serde_json::json!({
+                        "type": "function",
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    })
+                })
+                .collect(),
+        );
+    }
+
+    let reasoning_effort = reasoning_effort.trim();
+    if !reasoning_effort.is_empty() && reasoning_effort != "nil" {
+        body["reasoning"] = serde_json::json!({"effort": reasoning_effort});
+    }
+
+    Ok(body)
+}
+
+fn message_content_text(content: &MessageContent) -> String {
+    match content {
+        MessageContent::Text(text) => text.clone(),
+        MessageContent::Parts(_) => content.to_summary_text(),
+    }
+}
+
+fn responses_content_value(
+    content: &MessageContent,
+    workspace_root: &Path,
+) -> Result<Value, ProviderError> {
+    match content {
+        MessageContent::Text(text) => Ok(Value::String(text.clone())),
+        MessageContent::Parts(parts) => {
+            let mut blocks = Vec::new();
+            for part in parts {
+                match part {
+                    ContentPart::Text { text } => blocks.push(serde_json::json!({
+                        "type": "input_text",
+                        "text": text,
+                    })),
+                    ContentPart::Image { media_type, path } => {
+                        let full_path = workspace_root.join(path);
+                        let bytes = std::fs::read(&full_path).map_err(|error| {
+                            ProviderError::RequestFailed(format!(
+                                "failed to read image {}: {error}",
+                                full_path.display()
+                            ))
+                        })?;
+                        blocks.push(serde_json::json!({
+                            "type": "input_image",
+                            "image_url": format!(
+                                "data:{media_type};base64,{}",
+                                B64.encode(bytes)
+                            ),
+                        }));
+                    }
+                }
+            }
+            Ok(Value::Array(blocks))
+        }
+    }
+}
+
+#[derive(Default)]
+struct ResponsesToolAccumulator {
+    call_id: String,
+    name: String,
+    arguments: String,
+}
+
+fn spawn_responses_stream(
+    response: reqwest::Response,
+    provider_name: &'static str,
+) -> tokio::sync::mpsc::Receiver<StreamChunk> {
+    use futures_util::StreamExt;
+
+    let mut byte_stream = response.bytes_stream();
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+
+    tokio::spawn(async move {
+        let mut buffer = Vec::new();
+        let mut event_name = String::new();
+        let mut tools: BTreeMap<String, ResponsesToolAccumulator> = BTreeMap::new();
+        let mut emitted_tools = BTreeSet::new();
+        let mut produced_output = false;
+        let mut completed = false;
+
+        while let Some(item) = byte_stream.next().await {
+            let chunk = match item {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    let _ = tx
+                        .send(StreamChunk::Error(format!(
+                            "{provider_name} Responses stream error: {error}"
+                        )))
+                        .await;
+                    return;
+                }
+            };
+            buffer.extend_from_slice(&chunk);
+
+            loop {
+                let raw = match take_responses_sse_line(&mut buffer) {
+                    Ok(Some(line)) => line,
+                    Ok(None) => break,
+                    Err(error) => {
+                        let _ = tx
+                            .send(StreamChunk::Error(format!(
+                                "{provider_name} Responses stream error: {error}"
+                            )))
+                            .await;
+                        return;
+                    }
+                };
+                let line = raw.trim_end_matches('\r').trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Some(name) = line.strip_prefix("event:") {
+                    event_name = name.trim().to_string();
+                    continue;
+                }
+                let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+                    continue;
+                };
+                if data == "[DONE]" {
+                    completed = true;
+                    break;
+                }
+
+                let value = match serde_json::from_str::<Value>(data) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        if is_known_responses_event(&event_name) {
+                            let _ = tx
+                                .send(StreamChunk::Error(format!(
+                                    "{provider_name} Responses event is malformed: {error}"
+                                )))
+                                .await;
+                            return;
+                        }
+                        continue;
+                    }
+                };
+                let event_type = value
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or(event_name.as_str());
+
+                match event_type {
+                    "response.output_text.delta" => {
+                        let Some(delta) = value.get("delta").and_then(Value::as_str) else {
+                            send_responses_error(
+                                &tx,
+                                provider_name,
+                                "text delta is missing a string delta",
+                            )
+                            .await;
+                            return;
+                        };
+                        if !delta.is_empty() {
+                            let _ = tx.send(StreamChunk::TextDelta(delta.to_string())).await;
+                            produced_output = true;
+                        }
+                    }
+                    "response.output_item.added" | "response.output_item.done" => {
+                        let Some(item) = value.get("item").and_then(Value::as_object) else {
+                            send_responses_error(
+                                &tx,
+                                provider_name,
+                                "function output item is missing",
+                            )
+                            .await;
+                            return;
+                        };
+                        if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                            let key = item_key(item);
+                            let entry = tools.entry(key.clone()).or_default();
+                            if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
+                                entry.call_id = call_id.to_string();
+                            }
+                            if let Some(name) = item.get("name").and_then(Value::as_str) {
+                                entry.name = name.to_string();
+                            }
+                            if let Some(arguments) = item.get("arguments").and_then(Value::as_str) {
+                                entry.arguments = arguments.to_string();
+                            }
+                            if event_type == "response.output_item.done" {
+                                let emitted = match emit_responses_tool(
+                                    &tx,
+                                    provider_name,
+                                    &tools,
+                                    &mut emitted_tools,
+                                    &key,
+                                )
+                                .await
+                                {
+                                    Ok(emitted) => emitted,
+                                    Err(()) => return,
+                                };
+                                produced_output = emitted || emitted_tools.contains(&key);
+                            }
+                        }
+                    }
+                    "response.function_call_arguments.delta" => {
+                        let Some(delta) = value.get("delta").and_then(Value::as_str) else {
+                            send_responses_error(
+                                &tx,
+                                provider_name,
+                                "function arguments delta is missing a string delta",
+                            )
+                            .await;
+                            return;
+                        };
+                        let key = value
+                            .get("item_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                            .or_else(|| value.get("output_index").map(Value::to_string))
+                            .unwrap_or_else(|| "0".into());
+                        tools.entry(key).or_default().arguments.push_str(delta);
+                    }
+                    "response.function_call_arguments.done" => {
+                        let key = value
+                            .get("item_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                            .or_else(|| value.get("output_index").map(Value::to_string))
+                            .unwrap_or_else(|| "0".into());
+                        if let Some(arguments) = value.get("arguments").and_then(Value::as_str) {
+                            tools.entry(key.clone()).or_default().arguments = arguments.into();
+                        }
+                        let emitted = match emit_responses_tool(
+                            &tx,
+                            provider_name,
+                            &tools,
+                            &mut emitted_tools,
+                            &key,
+                        )
+                        .await
+                        {
+                            Ok(emitted) => emitted,
+                            Err(()) => return,
+                        };
+                        produced_output = emitted || emitted_tools.contains(&key);
+                    }
+                    "response.completed" => {
+                        if let Some(usage) = value
+                            .get("response")
+                            .and_then(|response| response.get("usage"))
+                            .and_then(Value::as_object)
+                        {
+                            let input_tokens = usage
+                                .get("input_tokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0);
+                            let output_tokens = usage
+                                .get("output_tokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0);
+                            if input_tokens > 0 || output_tokens > 0 {
+                                let _ = tx
+                                    .send(StreamChunk::Usage {
+                                        input_tokens,
+                                        output_tokens,
+                                    })
+                                    .await;
+                            }
+                        }
+                        completed = true;
+                        break;
+                    }
+                    "response.failed" => {
+                        let message = value
+                            .get("response")
+                            .and_then(|response| response.get("error"))
+                            .and_then(|error| error.get("message"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("provider reported a failed response");
+                        send_responses_error(&tx, provider_name, message).await;
+                        return;
+                    }
+                    _ => {}
+                }
+                event_name.clear();
+                if completed {
+                    break;
+                }
+            }
+        }
+
+        if let Err(error) = std::str::from_utf8(&buffer) {
+            let _ = tx
+                .send(StreamChunk::Error(format!(
+                    "{provider_name} Responses stream error: invalid UTF-8 in incomplete SSE line: {error}"
+                )))
+                .await;
+            return;
+        }
+
+        finish_responses_stream(&tx, provider_name, produced_output).await;
+    });
+
+    rx
+}
+
+fn take_responses_sse_line(buffer: &mut Vec<u8>) -> Result<Option<String>, String> {
+    let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') else {
+        return Ok(None);
+    };
+
+    let line = buffer.drain(..newline).collect::<Vec<_>>();
+    buffer.drain(..1);
+    String::from_utf8(line)
+        .map(Some)
+        .map_err(|error| format!("invalid UTF-8 in SSE line: {error}"))
+}
+
+fn is_known_responses_event(event_name: &str) -> bool {
+    matches!(
+        event_name,
+        "response.output_text.delta"
+            | "response.output_item.added"
+            | "response.output_item.done"
+            | "response.function_call_arguments.delta"
+            | "response.function_call_arguments.done"
+            | "response.completed"
+            | "response.failed"
+    )
+}
+
+fn item_key(item: &serde_json::Map<String, Value>) -> String {
+    item.get("id")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("call_id").and_then(Value::as_str))
+        .unwrap_or("0")
+        .to_string()
+}
+
+async fn emit_responses_tool(
+    tx: &tokio::sync::mpsc::Sender<StreamChunk>,
+    provider_name: &'static str,
+    tools: &BTreeMap<String, ResponsesToolAccumulator>,
+    emitted: &mut BTreeSet<String>,
+    key: &str,
+) -> Result<bool, ()> {
+    if emitted.contains(key) {
+        return Ok(false);
+    }
+    let Some(tool) = tools.get(key) else {
+        send_responses_error(tx, provider_name, "function call item is missing").await;
+        return Err(());
+    };
+    if tool.call_id.is_empty() || tool.name.is_empty() {
+        send_responses_error(tx, provider_name, "function call is missing its identity").await;
+        return Err(());
+    }
+    let Ok(input) = serde_json::from_str(&tool.arguments) else {
+        send_responses_error(
+            tx,
+            provider_name,
+            "function call arguments are invalid JSON",
+        )
+        .await;
+        return Err(());
+    };
+    let _ = tx
+        .send(StreamChunk::ToolUse(nca_common::tool::ToolCall {
+            id: tool.call_id.clone(),
+            name: tool.name.clone(),
+            input,
+        }))
+        .await;
+    emitted.insert(key.to_string());
+    Ok(true)
+}
+
+async fn send_responses_error(
+    tx: &tokio::sync::mpsc::Sender<StreamChunk>,
+    provider_name: &'static str,
+    message: &str,
+) {
+    let _ = tx
+        .send(StreamChunk::Error(format!(
+            "{provider_name} Responses provider error: {message}"
+        )))
+        .await;
+}
+
+async fn finish_responses_stream(
+    tx: &tokio::sync::mpsc::Sender<StreamChunk>,
+    provider_name: &'static str,
+    produced_output: bool,
+) {
+    if produced_output {
+        let _ = tx.send(StreamChunk::Done).await;
+    } else {
+        let _ = tx
+            .send(StreamChunk::Error(format!(
+                "{provider_name} Responses provider returned an empty completion"
+            )))
+            .await;
+    }
+}
+
 fn custom_adapter(compatibility: ProviderCompatibility) -> &'static dyn CustomProtocolAdapter {
     match compatibility {
         ProviderCompatibility::OpenAi => &OPENAI_CUSTOM_ADAPTER,
         ProviderCompatibility::Anthropic => &ANTHROPIC_CUSTOM_ADAPTER,
+        ProviderCompatibility::OpenAiResponses => &OPENAI_RESPONSES_CUSTOM_ADAPTER,
     }
 }
 
@@ -618,6 +1170,7 @@ mod tests {
     use super::*;
     use crate::provider::test_support::{collect_chunks, spawn_sse_server};
     use serde_json::json;
+    use std::io::Read;
     use std::sync::mpsc;
     use tiny_http::{Header, Request, Response, Server, StatusCode};
 
@@ -871,6 +1424,56 @@ mod tests {
         }
     }
 
+    fn spawn_chunked_sse_server(chunks: Vec<Vec<u8>>) -> String {
+        let server = Server::http("127.0.0.1:0").expect("start chunked SSE server");
+        let base_url = match server.server_addr() {
+            tiny_http::ListenAddr::IP(addr) => format!("http://{addr}"),
+            other => panic!("unsupported listen addr: {other:?}"),
+        };
+
+        std::thread::spawn(move || {
+            let mut request = server.recv().expect("receive chunked SSE request");
+            let mut request_body = Vec::new();
+            request
+                .as_reader()
+                .read_to_end(&mut request_body)
+                .expect("read chunked SSE request body");
+            let response = Response::new(
+                StatusCode(200),
+                vec![Header::from_bytes("content-type", "text/event-stream").unwrap()],
+                ChunkedBodyReader { chunks, index: 0 },
+                None,
+                None,
+            );
+            request
+                .respond(response)
+                .expect("send chunked SSE response");
+        });
+
+        base_url
+    }
+
+    struct ChunkedBodyReader {
+        chunks: Vec<Vec<u8>>,
+        index: usize,
+    }
+
+    impl Read for ChunkedBodyReader {
+        fn read(&mut self, target: &mut [u8]) -> std::io::Result<usize> {
+            let Some(chunk) = self.chunks.get(self.index) else {
+                return Ok(0);
+            };
+            let length = chunk.len().min(target.len());
+            target[..length].copy_from_slice(&chunk[..length]);
+            if length == chunk.len() {
+                self.index += 1;
+            } else {
+                self.chunks[self.index].drain(..length);
+            }
+            Ok(length)
+        }
+    }
+
     fn spawn_probe_server(
         status: u16,
         response_body: &str,
@@ -983,6 +1586,432 @@ mod tests {
                 input_tokens: 5,
                 output_tokens: 2
             }
+        ));
+    }
+
+    #[tokio::test]
+    async fn custom_openai_responses_provider_streams_text_with_native_request_settings() {
+        let body = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n"
+        )
+        .to_string();
+        let (request_tx, request_rx) = mpsc::channel();
+        let base_url = spawn_sse_server(body, 200, move |request| {
+            request_tx
+                .send(capture_chat_request(request))
+                .expect("capture Responses request");
+        });
+
+        let mut config = NcaConfig::default();
+        config.provider.custom.api_key = Some("custom-test-key".into());
+        config.provider.custom.base_url = base_url;
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
+        config.provider.custom.model = "responses-model".into();
+
+        let provider = CustomProvider::from_config(&config).expect("provider");
+        let stream = provider
+            .chat(
+                &[Message::system("be helpful"), Message::user("hello")],
+                &[],
+                "",
+                Path::new("."),
+            )
+            .await
+            .expect("chat stream");
+        let chunks = collect_chunks(stream).await;
+        let request = request_rx.recv().expect("Responses request");
+
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.url, "/v1/responses");
+        assert_eq!(
+            request.authorization.as_deref(),
+            Some("Bearer custom-test-key")
+        );
+        let payload: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+        assert_eq!(payload["model"], "responses-model");
+        assert_eq!(payload["stream"], true);
+        assert_eq!(payload["store"], false);
+        assert_eq!(payload["input"][0]["role"], "system");
+        assert_eq!(payload["input"][1]["role"], "user");
+        assert_eq!(payload["input"][1]["content"], "hello");
+        assert_eq!(payload.get("tools"), None);
+        assert!(matches!(
+            &chunks[0],
+            StreamChunk::TextDelta(text) if text == "Hello"
+        ));
+        assert!(matches!(
+            &chunks[1],
+            StreamChunk::Usage {
+                input_tokens: 5,
+                output_tokens: 2
+            }
+        ));
+        assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
+    }
+
+    #[tokio::test]
+    async fn custom_openai_responses_preserves_utf8_split_across_http_chunks() {
+        let body = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"世界\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+        )
+        .as_bytes()
+        .to_vec();
+        let marker = b"\"delta\":\"";
+        let delta_start = body
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("find text delta")
+            + marker.len();
+        let split_at = delta_start + 1;
+        let base_url =
+            spawn_chunked_sse_server(vec![body[..split_at].to_vec(), body[split_at..].to_vec()]);
+
+        let mut config = NcaConfig::default();
+        config.provider.custom.api_key = Some("custom-test-key".into());
+        config.provider.custom.base_url = base_url;
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
+
+        let provider = CustomProvider::from_config(&config).expect("provider");
+        let stream = provider
+            .chat(&[Message::user("hello")], &[], "", Path::new("."))
+            .await
+            .expect("chat stream");
+        let chunks = collect_chunks(stream).await;
+
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            StreamChunk::TextDelta(text) if text == "世界"
+        )));
+        assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
+    }
+
+    #[tokio::test]
+    async fn custom_openai_responses_rejects_invalid_utf8_in_sse_lines() {
+        let mut body = b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"".to_vec();
+        body.push(0xff);
+        body.extend_from_slice(b"\"}\n\n");
+        let base_url = spawn_chunked_sse_server(vec![body]);
+
+        let mut config = NcaConfig::default();
+        config.provider.custom.api_key = Some("custom-test-key".into());
+        config.provider.custom.base_url = base_url;
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
+
+        let provider = CustomProvider::from_config(&config).expect("provider");
+        let stream = provider
+            .chat(&[Message::user("hello")], &[], "", Path::new("."))
+            .await
+            .expect("chat stream");
+        let chunks = collect_chunks(stream).await;
+
+        assert!(matches!(
+            chunks.as_slice(),
+            [StreamChunk::Error(message)]
+                if message.contains("invalid UTF-8") && !message.contains('\u{fffd}')
+        ));
+    }
+
+    #[tokio::test]
+    async fn custom_openai_responses_provider_streams_native_function_calls_and_replays_outputs() {
+        let body = concat!(
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"lookup\",\"arguments\":\"\"}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"{\\\"path\\\":\\\"src\\\"}\"}\n\n",
+            "event: response.function_call_arguments.done\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_1\",\"arguments\":\"{\\\"path\\\":\\\"src\\\"}\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":4}}}\n\n"
+        )
+        .to_string();
+        let (request_tx, request_rx) = mpsc::channel();
+        let base_url = spawn_sse_server(body, 200, move |request| {
+            request_tx
+                .send(capture_chat_request(request))
+                .expect("capture Responses tool request");
+        });
+
+        let mut config = NcaConfig::default();
+        config.provider.custom.api_key = Some("custom-test-key".into());
+        config.provider.custom.base_url = base_url;
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
+        config.provider.custom.model = "responses-model".into();
+
+        let provider = CustomProvider::from_config(&config).expect("provider");
+        let stream = provider
+            .chat(
+                &[
+                    Message::user("look up src"),
+                    Message::assistant_with_tool_calls(
+                        "",
+                        vec![nca_common::message::MessageToolCall {
+                            id: "call_0".into(),
+                            name: "lookup".into(),
+                            arguments: json!({"path": "README.md"}),
+                        }],
+                    ),
+                    Message::tool("call_0", "README contents"),
+                ],
+                &[ToolDefinition {
+                    name: "lookup".into(),
+                    description: "Look up a workspace path".into(),
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}}
+                    }),
+                }],
+                "",
+                Path::new("."),
+            )
+            .await
+            .expect("chat stream");
+        let chunks = collect_chunks(stream).await;
+        let request = request_rx.recv().expect("Responses tool request");
+        let payload: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+
+        assert_eq!(
+            payload["tools"],
+            json!([{
+                "type": "function",
+                "name": "lookup",
+                "description": "Look up a workspace path",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}}
+                }
+            }])
+        );
+        assert_eq!(payload["input"][1]["type"], "function_call");
+        assert_eq!(payload["input"][1]["call_id"], "call_0");
+        assert_eq!(payload["input"][1]["arguments"], r#"{"path":"README.md"}"#);
+        assert_eq!(payload["input"][2]["type"], "function_call_output");
+        assert_eq!(payload["input"][2]["call_id"], "call_0");
+        assert_eq!(payload["input"][2]["output"], "README contents");
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            StreamChunk::ToolUse(call)
+                if call.id == "call_1"
+                    && call.name == "lookup"
+                    && call.input == json!({"path": "src"})
+        )));
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            StreamChunk::Usage {
+                input_tokens: 12,
+                output_tokens: 4
+            }
+        )));
+        assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
+    }
+
+    #[tokio::test]
+    async fn custom_openai_responses_provider_maps_images_and_supported_generation_settings() {
+        let body = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
+        )
+        .to_string();
+        let (request_tx, request_rx) = mpsc::channel();
+        let base_url = spawn_sse_server(body, 200, move |request| {
+            request_tx
+                .send(capture_chat_request(request))
+                .expect("capture Responses image request");
+        });
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("sample.png"), [137, 80, 78, 71])
+            .expect("write image fixture");
+
+        let mut config = NcaConfig::default();
+        config.provider.custom.api_key = Some("custom-test-key".into());
+        config.provider.custom.base_url = base_url;
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
+        config.provider.custom.model = "responses-model".into();
+        config.model.max_tokens = 321;
+        config.provider.custom.temperature = 0.25;
+        config.model.reasoning_effort = "  low  ".into();
+
+        let provider = CustomProvider::from_config(&config).expect("provider");
+        let stream = provider
+            .chat(
+                &[Message::user_with_parts(vec![
+                    ContentPart::Text {
+                        text: "what is this?".into(),
+                    },
+                    ContentPart::Image {
+                        media_type: "image/png".into(),
+                        path: "sample.png".into(),
+                    },
+                ])],
+                &[],
+                "",
+                workspace.path(),
+            )
+            .await
+            .expect("chat stream");
+        let chunks = collect_chunks(stream).await;
+        let request = request_rx.recv().expect("Responses image request");
+        let payload: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+
+        assert_eq!(payload["max_output_tokens"], 321);
+        assert_eq!(payload.get("temperature"), None);
+        assert_eq!(payload["reasoning"], json!({"effort": "low"}));
+        assert_eq!(
+            payload["input"][0]["content"][0],
+            json!({
+                "type": "input_text",
+                "text": "what is this?"
+            })
+        );
+        assert_eq!(payload["input"][0]["content"][1]["type"], "input_image");
+        assert_eq!(
+            payload["input"][0]["content"][1]["image_url"],
+            "data:image/png;base64,iVBORw=="
+        );
+        assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
+    }
+
+    #[tokio::test]
+    async fn custom_openai_responses_omits_temperature_for_models_that_reject_it() {
+        let server = Server::http("127.0.0.1:0").expect("start temperature compatibility server");
+        let base_url = match server.server_addr() {
+            tiny_http::ListenAddr::IP(addr) => format!("http://{addr}"),
+            other => panic!("unsupported listen addr: {other:?}"),
+        };
+        let (request_tx, request_rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let mut request = server
+                .recv()
+                .expect("receive temperature compatibility request");
+            let captured = capture_chat_request(&mut request);
+            let payload: serde_json::Value = serde_json::from_str(&captured.body).unwrap();
+            request_tx
+                .send(captured)
+                .expect("capture temperature compatibility request");
+
+            let (status, body, content_type) = if payload.get("temperature").is_some() {
+                (
+                    400,
+                    r#"{"error":{"message":"Unsupported parameter: 'temperature' is not supported with this model.","code":"invalid_request_body"}}"#,
+                    "application/json",
+                )
+            } else {
+                (
+                    200,
+                    concat!(
+                        "event: response.output_text.delta\n",
+                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+                        "event: response.completed\n",
+                        "data: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+                    ),
+                    "text/event-stream",
+                )
+            };
+            request
+                .respond(
+                    Response::from_string(body)
+                        .with_status_code(StatusCode(status))
+                        .with_header(Header::from_bytes("Content-Type", content_type).unwrap()),
+                )
+                .expect("send temperature compatibility response");
+        });
+
+        let mut config = NcaConfig::default();
+        config.provider.custom.api_key = Some("custom-test-key".into());
+        config.provider.custom.base_url = base_url;
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
+
+        let provider = CustomProvider::from_config(&config).expect("provider");
+        let stream = provider
+            .chat(&[Message::user("hello")], &[], "", Path::new("."))
+            .await
+            .expect("Responses request should omit unsupported temperature");
+        let chunks = collect_chunks(stream).await;
+        let request = request_rx
+            .recv()
+            .expect("temperature compatibility request");
+        let payload: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+
+        assert_eq!(payload.get("temperature"), None);
+        assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
+    }
+
+    #[tokio::test]
+    async fn custom_openai_responses_provider_ignores_unknown_events_but_rejects_empty_completion()
+    {
+        let body = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\"}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+        )
+        .to_string();
+        let base_url = spawn_sse_server(body, 200, |_| {});
+        let mut config = NcaConfig::default();
+        config.provider.custom.api_key = Some("custom-test-key".into());
+        config.provider.custom.base_url = base_url;
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
+
+        let provider = CustomProvider::from_config(&config).expect("provider");
+        let stream = provider
+            .chat(&[Message::user("hello")], &[], "", Path::new("."))
+            .await
+            .expect("chat stream");
+        let chunks = collect_chunks(stream).await;
+        assert!(matches!(chunks.first(), Some(StreamChunk::TextDelta(text)) if text == "ok"));
+        assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
+
+        let empty_body = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+        )
+        .to_string();
+        let empty_base_url = spawn_sse_server(empty_body, 200, |_| {});
+        config.provider.custom.base_url = empty_base_url;
+        let provider = CustomProvider::from_config(&config).expect("provider");
+        let stream = provider
+            .chat(&[Message::user("hello")], &[], "", Path::new("."))
+            .await
+            .expect("chat stream");
+        let chunks = collect_chunks(stream).await;
+        assert!(matches!(
+            chunks.as_slice(),
+            [StreamChunk::Error(message)] if message.contains("empty")
+        ));
+    }
+
+    #[tokio::test]
+    async fn custom_openai_responses_provider_rejects_malformed_known_events() {
+        let body = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\"}\n\n"
+        )
+        .to_string();
+        let base_url = spawn_sse_server(body, 200, |_| {});
+        let mut config = NcaConfig::default();
+        config.provider.custom.api_key = Some("custom-test-key".into());
+        config.provider.custom.base_url = base_url;
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
+
+        let provider = CustomProvider::from_config(&config).expect("provider");
+        let stream = provider
+            .chat(&[Message::user("hello")], &[], "", Path::new("."))
+            .await
+            .expect("chat stream");
+        let chunks = collect_chunks(stream).await;
+        assert!(matches!(
+            chunks.as_slice(),
+            [StreamChunk::Error(message)] if message.contains("missing a string delta")
         ));
     }
 

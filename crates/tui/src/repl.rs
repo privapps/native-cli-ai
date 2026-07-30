@@ -51,7 +51,7 @@ fn parse_custom_provider_command(
         return Ok(None);
     };
     let compatibility = ProviderCompatibility::from_cli_name(compatibility)
-        .ok_or("compatibility must be `openai` or `anthropic`")?;
+        .ok_or("compatibility must be `openai`, `responses`, or `anthropic`")?;
     Ok(Some(CustomProviderCommand {
         compatibility,
         base_url: base_url.to_string(),
@@ -3257,8 +3257,19 @@ mod tests {
             }))
         );
         assert_eq!(
+            parse_custom_provider_command(
+                "responses https://gateway.example responses-secret responses-model",
+            ),
+            Ok(Some(CustomProviderCommand {
+                compatibility: ProviderCompatibility::OpenAiResponses,
+                base_url: "https://gateway.example".into(),
+                api_key: Some("responses-secret".into()),
+                model: Some("responses-model".into()),
+            }))
+        );
+        assert_eq!(
             parse_custom_provider_command("nope https://gateway.example"),
-            Err("compatibility must be `openai` or `anthropic`")
+            Err("compatibility must be `openai`, `responses`, or `anthropic`")
         );
     }
 

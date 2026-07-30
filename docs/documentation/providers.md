@@ -10,7 +10,7 @@ nca supports five LLM provider backends. You can switch between them at any time
 | **Anthropic** | `claude-3-7-sonnet-latest` | Native Anthropic | Direct Anthropic API for Claude models. |
 | **OpenAI** | `gpt-4o-mini` | OpenAI Chat | Standard OpenAI chat completions API. |
 | **OpenRouter** | `openai/gpt-4o-mini` | OpenAI-compatible | Aggregator providing access to 100+ models from multiple providers. |
-| **Custom** | `custom-model` | OpenAI-compatible or Anthropic-compatible | Bring your own endpoint and choose the wire protocol. |
+| **Custom** | `custom-model` | OpenAI Chat, OpenAI Responses, or Anthropic-compatible | Bring your own endpoint and choose the wire protocol. |
 
 ## MiniMax (Default)
 
@@ -140,11 +140,11 @@ Use the single `Custom` provider slot when you want `nca` to talk to a non-built
 default = "custom"
 
 [provider.custom]
-compatibility = "openai"   # or "anthropic"
+compatibility = "openai"   # or "openai-responses" or "anthropic"
 base_url = "https://sumopod.example"
 api_key_env = "CUSTOM_PROVIDER_API_KEY"
 model = "my-model"
-temperature = 0.7
+temperature = 0.7  # Responses mode retains this setting but omits the field
 ```
 
 `base_url` must be an HTTP(S) origin, optionally with a path ending in `/v1` (for example, `https://opencode.ai/zen/v1`). `nca` preserves that path prefix and appends the protocol-specific request path. Credentials, query strings, fragments, and final request paths such as `/v1/models` are rejected.
@@ -174,7 +174,7 @@ There are two TUI entry points:
 
 The wizard collects four fields:
 
-1. OpenAI-compatible or Anthropic-compatible protocol.
+1. OpenAI-compatible Chat Completions, OpenAI Responses, or Anthropic-compatible protocol.
 2. Base URL.
 3. API-key environment-variable name and optional inline secret.
 4. Model ID.
@@ -188,6 +188,7 @@ the Custom-provider setup wizard.
 
 ```
 /custom openai https://sumopod.example your-key my-model
+/custom responses https://responses-gateway.example your-key my-model
 /custom anthropic https://my-gateway.example your-key my-model
 ```
 
@@ -207,14 +208,22 @@ Anthropic-compatible custom endpoints use:
 - `POST <base path>/messages` with the same headers for chat.
 - Server-sent events (`stream = true`) and Anthropic tool-use shapes for streaming agent turns.
 
+OpenAI Responses custom endpoints use:
+
+- `GET <base path>/models` with Bearer authentication for the setup probe when the gateway exposes model discovery.
+- `POST <base path>/responses` with Bearer authentication, `stream = true`, and `store = false` for agent turns.
+- Native Responses input items, function calls, function-call outputs, and SSE events. Existing nca function tools are supported; provider-hosted tools are not.
+- The complete canonical session history on every request; nca does not use `previous_response_id`.
+- The configured `temperature` value is not serialized. Responses model support for that field varies, and omitting it avoids `Unsupported parameter: 'temperature'` request failures.
+
 The TUI performs the cheap protocol-specific probe before activation. Malformed URLs, invalid environment-variable names, and missing credentials are blocking errors. Network, authentication, protocol, and endpoint failures offer **Retry**, **Save anyway**, or **Cancel**. **Save anyway** activates the manually configured provider without requiring model discovery. Probe errors are sanitized before display.
 
-Model discovery is best-effort: OpenAI-compatible endpoints use `<base path>/models` with Bearer authentication, and Anthropic-compatible endpoints use the paginated `<base path>/models` API with Anthropic headers. A failed discovery request does not prevent a manually entered model ID from being used.
+Model discovery is best-effort: OpenAI-compatible and OpenAI Responses endpoints use `<base path>/models` with Bearer authentication, and Anthropic-compatible endpoints use the paginated `<base path>/models` API with Anthropic headers. A failed discovery request does not prevent a manually entered model ID from being used.
 
 Provider capabilities are dispatched through one runtime seam. Settings access (selected model,
 base URL, API-key environment name, and credential presence) is centralized, while model catalogs
 and context-window lookups use protocol-aware capability adapters. Custom OpenAI and Anthropic
-compatibilities select their matching adapter, preserving path prefixes and authentication. Cache
+compatibilities select their matching capability adapter, preserving path prefixes and authentication. Cache
 identity includes provider, normalized endpoint, compatibility, model where relevant, and a
 non-reversible credential tag; raw credentials are never logged or cached. Remote failures and
 missing credentials retain the static context-limit or empty-catalog fallback.
@@ -229,13 +238,14 @@ missing credentials retain the static context-limit or empty-catalog fallback.
 Notes:
 
 - `compatibility = "openai"` selects the OpenAI-compatible wire format.
+- `compatibility = "openai-responses"` selects the OpenAI Responses wire format. CLI aliases include `responses` and `openai-responses`.
 - `compatibility = "anthropic"` selects the Anthropic-compatible wire format.
 - After setup, use `/model <name>` to switch the active model ID.
 - Press `c` in the provider picker for a quick-reference help card
 
 ## Reasoning Effort
 
-OpenAI-compatible Chat Completions models can receive a configurable
+OpenAI-compatible Chat Completions and OpenAI Responses models can receive a configurable
 `reasoning_effort` value. Set it globally in `~/.local/share/ncacli/config.toml`
 or the workspace override:
 
@@ -248,8 +258,9 @@ The value is trimmed and passed through as a string. Use `"none"`, `"low"`,
 `"medium"`, `"high"`, `"xhigh"`, or a provider-specific value supported by
 your gateway. The literal `"nil"` (the default), an empty value, and a
 whitespace-only value omit the JSON property. This setting is sent for
-OpenAI, OpenRouter, and Custom providers with `compatibility = "openai"`.
-It is not sent for MiniMax, Anthropic, or Custom providers with
+OpenAI, OpenRouter, and Custom providers with `compatibility = "openai"` or
+`compatibility = "openai-responses"`; Responses sends it as nested
+`reasoning.effort`. It is not sent for MiniMax, Anthropic, or Custom providers with
 `compatibility = "anthropic"`.
 
 For a single invocation, use the global CLI override:

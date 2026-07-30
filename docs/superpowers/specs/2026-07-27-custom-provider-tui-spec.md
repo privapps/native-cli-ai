@@ -5,7 +5,7 @@
 
 ## Problem Statement
 
-The `nca` runtime already has a singular `Custom` provider configuration and adapters for endpoints compatible with OpenAI Chat Completions or Anthropic Messages. The interactive TUI does not expose that capability consistently.
+The `nca` runtime already has a singular `Custom` provider configuration and adapters for endpoints compatible with OpenAI Chat Completions, OpenAI Responses, or Anthropic Messages. The interactive TUI does not expose that capability consistently.
 
 During first-run onboarding, `Custom` is filtered out of the provider list. In the in-session `/connect` flow, selecting `Custom` follows the generic API-key path instead of opening the custom endpoint setup. Other provider and model-picker routes can also fail when the custom endpoint has not yet been configured. Users are therefore pushed toward an indirect setup path and can become stuck on an existing provider.
 
@@ -13,7 +13,7 @@ Provider persistence also serializes the fully merged configuration. A workspace
 
 ## Solution
 
-Make `Custom` a first-class TUI provider configuration flow while retaining one custom provider slot. The flow will support OpenAI-compatible and Anthropic-compatible endpoints, validate the endpoint with a cheap protocol-specific probe, and then activate it in the current runtime.
+Make `Custom` a first-class TUI provider configuration flow while retaining one custom provider slot. The flow will support OpenAI-compatible Chat Completions, OpenAI Responses, and Anthropic-compatible endpoints, validate the endpoint with a cheap protocol-specific probe, and then activate it in the current runtime.
 
 The same pure setup state machine will serve standalone first-run onboarding and in-session setup, while each surface keeps its own renderer and persistence scope. First-run setup writes global configuration; in-session setup writes workspace-local configuration. Existing `/custom` syntax and `CUSTOM_PROVIDER_*` environment variables remain supported through the same normalization and persistence behavior.
 
@@ -28,7 +28,7 @@ Provider changes will be applied to the runtime before persistence. A provider-c
 5. As a user selecting an unconfigured custom provider from a provider or model picker, I want setup to open instead of producing an opaque failure, so that the picker provides a path to recovery.
 6. As a user with an existing custom configuration, I want compatibility, base URL, and model values prefilled, so that editing does not require re-entering public settings.
 7. As a user, I want the secret field to remain empty when editing, so that stored credentials are never displayed or accidentally exposed in the TUI.
-8. As a user, I want to choose OpenAI-compatible or Anthropic-compatible protocol behavior, so that the endpoint receives the request format and authentication headers it expects.
+8. As a user, I want to choose OpenAI-compatible Chat Completions, OpenAI Responses, or Anthropic-compatible protocol behavior, so that the endpoint receives the request format and authentication headers it expects.
 9. As a user, I want to enter an endpoint origin or a base path ending in `/v1`, so that common gateway URL formats work without requiring knowledge of the final request path.
 10. As a user, I want invalid URLs, URLs containing credentials, query strings, fragments, or final request paths to be rejected before activation, so that malformed configuration cannot create confusing runtime failures.
 11. As a user, I want to edit the API-key environment-variable name in the credential step, so that existing and provider-specific environment conventions remain usable.
@@ -61,7 +61,7 @@ Provider changes will be applied to the runtime before persistence. A provider-c
 - Accept HTTP(S) endpoint origins and paths ending in `/v1`. Normalize trailing slashes while preserving an accepted path prefix before the adapter appends its request path. Reject credentials, query strings, fragments, and URLs that already contain `/chat/completions` or `/messages`.
 - Validate API-key environment-variable names using the portable shell form `[A-Za-z_][A-Za-z0-9_]*`.
 - Keep runtime credential precedence as inline key over environment lookup. A blank credential input preserves an existing inline key when one exists; otherwise it persists only the environment-variable name and never materializes the resolved environment secret into TOML.
-- Use protocol-specific cheap probes: OpenAI-compatible endpoints use `GET /v1/models` with Bearer authentication; Anthropic-compatible endpoints use a minimal `/v1/messages` request with the required Anthropic headers. Probe errors are sanitized before display and must not include secrets.
+- Use protocol-specific cheap probes: OpenAI-compatible Chat and Responses endpoints use `GET /v1/models` with Bearer authentication; Anthropic-compatible endpoints use a minimal `/v1/messages` request with the required Anthropic headers. Probe errors are sanitized before display and must not include secrets.
 - Treat malformed URLs, invalid environment-variable names, and missing credentials as hard blockers. Network, authentication, protocol, or endpoint failures offer Retry, Save anyway, or Cancel.
 - Save anyway activates the manually configured provider and completes onboarding when used from first-run onboarding. It does not make model discovery mandatory.
 - Require the existing streaming/SSE behavior, correct protocol authentication headers, and agent-capable tool support. Do not add non-streaming or text-only fallbacks.
@@ -81,7 +81,7 @@ Provider changes will be applied to the runtime before persistence. A provider-c
 - Test the pure setup state machine for new setup, edit setup, invalid input, missing credentials, retry, save-anyway, cancellation, and successful completion.
 - Test URL normalization with origin URLs, `/v1` and prefixed `/zen/v1` URLs, trailing slashes, final endpoint paths, credentials, queries, fragments, and malformed schemes.
 - Test credential behavior with environment-only credentials, existing inline credentials, explicit overrides, blank edits, custom environment-variable names, invalid names, and secret redaction.
-- Test provider probes with deterministic HTTP fixtures for OpenAI model listing and Anthropic Messages requests. Assert request paths, authentication headers, required protocol fields, sanitized errors, and retry/save/cancel outcomes.
+- Test provider probes with deterministic HTTP fixtures for OpenAI model listing, Responses model listing, and Anthropic Messages requests. Assert request paths, authentication headers, required protocol fields, sanitized errors, and retry/save/cancel outcomes.
 - Test targeted global and workspace persistence using temporary configuration files. Assert that unrelated provider credentials, workspace settings, environment-derived secrets, comments, and unknown keys are preserved appropriately.
 - Test malformed TOML and write failures to confirm the original file remains intact and the active runtime behavior matches the persistence contract.
 - Test TUI routing at the modal-command boundary for onboarding Custom selection, `/connect`, configured activation, unconfigured picker recovery, and explicit editing.

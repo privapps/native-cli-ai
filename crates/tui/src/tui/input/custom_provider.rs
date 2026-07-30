@@ -75,9 +75,9 @@ pub fn custom_provider_submission(state: &TuiSessionState) -> CustomProviderSetu
     }
     CustomProviderSetupSubmission {
         compatibility: if state.custom_setup_compat_index() == 0 {
-            ProviderCompatibility::OpenAi
+            ProviderCompatibility::from_index(0)
         } else {
-            ProviderCompatibility::Anthropic
+            ProviderCompatibility::from_index(state.custom_setup_compat_index())
         },
         base_url: state.custom_setup_base_url().trim().to_string(),
         api_key_env: state.custom_setup_api_key_env().trim().to_string(),
@@ -131,7 +131,7 @@ pub fn handle_custom_provider_setup_key(
             if state.custom_provider_setup_step() == CustomProviderSetupStep::Compatibility =>
         {
             if let Some(index) = state.custom_setup_compat_index_mut() {
-                *index = (*index + 1).min(1);
+                *index = (*index + 1).min(ProviderCompatibility::ALL.len() - 1);
             }
             CustomProviderSetupKeyResult::Handled
         }
@@ -177,11 +177,8 @@ pub fn handle_custom_provider_setup_key(
         }
         (KeyCode::Enter, _) => match state.custom_provider_setup_step() {
             CustomProviderSetupStep::Compatibility => {
-                let compatibility = if state.custom_setup_compat_index() == 0 {
-                    ProviderCompatibility::OpenAi
-                } else {
-                    ProviderCompatibility::Anthropic
-                };
+                let compatibility =
+                    ProviderCompatibility::from_index(state.custom_setup_compat_index());
                 let transition = state
                     .custom_provider_setup_flow_mut()
                     .map(|flow| flow.choose_compatibility(compatibility));

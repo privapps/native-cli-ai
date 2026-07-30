@@ -195,7 +195,7 @@ Slash commands, the Ctrl+P command palette, autocomplete, and `/help` all come f
 | `/copy` | Copy the latest assistant response (TUI; also `Ctrl+Shift+C`). |
 | `/todos` | Show the session todo list. |
 | `/model` | Open the model picker (`/models` is an alias). |
-| `/reasoning-effort` | Show or persist the OpenAI-compatible Chat Completions reasoning effort. |
+| `/reasoning-effort` | Show or persist OpenAI-compatible Chat/Responses reasoning effort. |
 | `/connect` | Connect / switch provider, API key, or custom endpoint; use `/provider`, `/apikey`, or `/custom` for related setup commands. |
 | `/status` | Session status and health (`/stats`, `/cost`, `/doctor` are aliases). |
 | `/config` | Config and editor settings (`/settings`, `/set-editor` are aliases). |
@@ -314,7 +314,7 @@ Typical environment variables:
 
 ### Custom Endpoints
 
-Use `/connect` in the TUI (or the command palette) and choose **Custom** to configure the single custom-provider slot. In an existing session, `/provider` → **Add custom provider…** opens the add/edit wizard, while `/provider custom` activates the configured slot. The `/custom` command remains available for scripts and existing configurations.
+Use `/connect` in the TUI (or the command palette) and choose **Custom** to configure the single custom-provider slot. The slot supports OpenAI-compatible Chat Completions, OpenAI Responses, and Anthropic-compatible endpoints. In an existing session, `/provider` → **Add custom provider…** opens the add/edit wizard, while `/provider custom` activates the configured slot. The `/custom` command remains available for scripts and existing configurations.
 
 ```
 /connect

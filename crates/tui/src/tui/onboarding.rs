@@ -461,10 +461,15 @@ async fn run_onboarding_inner(
                         connect_open = true;
                     }
                     (KeyCode::Up, _) if custom_step == CustomOnboardingStep::Compatibility => {
-                        custom_compatibility = ProviderCompatibility::OpenAi;
+                        custom_compatibility = ProviderCompatibility::from_index(
+                            custom_compatibility.index().saturating_sub(1),
+                        );
                     }
                     (KeyCode::Down, _) if custom_step == CustomOnboardingStep::Compatibility => {
-                        custom_compatibility = ProviderCompatibility::Anthropic;
+                        custom_compatibility = ProviderCompatibility::from_index(
+                            (custom_compatibility.index() + 1)
+                                .min(ProviderCompatibility::ALL.len() - 1),
+                        );
                     }
                     (KeyCode::Enter, _) if custom_step == CustomOnboardingStep::Compatibility => {
                         let result = flow.choose_custom_compatibility(custom_compatibility);
@@ -702,14 +707,19 @@ async fn run_onboarding_inner(
                         _,
                         OnboardingScreen::Custom(CustomOnboardingStep::Compatibility),
                     ) => {
-                        custom_compatibility = ProviderCompatibility::OpenAi;
+                        custom_compatibility = ProviderCompatibility::from_index(
+                            custom_compatibility.index().saturating_sub(1),
+                        );
                     }
                     (
                         KeyCode::Down,
                         _,
                         OnboardingScreen::Custom(CustomOnboardingStep::Compatibility),
                     ) => {
-                        custom_compatibility = ProviderCompatibility::Anthropic;
+                        custom_compatibility = ProviderCompatibility::from_index(
+                            (custom_compatibility.index() + 1)
+                                .min(ProviderCompatibility::ALL.len() - 1),
+                        );
                     }
                     (
                         KeyCode::Enter,
@@ -1082,12 +1092,7 @@ fn render_custom_provider_modal(f: &mut Frame, area: Rect, props: CustomProvider
     match screen {
         OnboardingScreen::Custom(CustomOnboardingStep::Compatibility) => {
             lines.push(Line::from("Choose API compatibility:"));
-            for option in [
-                ProviderCompatibility::OpenAi,
-                ProviderCompatibility::Anthropic,
-            ]
-            .into_iter()
-            {
+            for option in ProviderCompatibility::ALL.into_iter() {
                 let selected = option == compatibility;
                 lines.push(Line::from(Span::styled(
                     format!(

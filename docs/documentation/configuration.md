@@ -45,6 +45,13 @@ model = "openai/gpt-4o-mini"
 temperature = 0.7
 site_url = ""       # Optional referrer URL
 app_name = ""       # Optional app name header
+
+[provider.custom]
+compatibility = "openai"   # "openai" | "openai-responses" | "anthropic"
+base_url = "https://gateway.example"
+api_key_env = "CUSTOM_PROVIDER_API_KEY"
+model = "gateway-model"
+temperature = 0.7           # Responses mode intentionally omits this field
 ```
 
 ### `[model]` — Model Settings
@@ -55,7 +62,7 @@ default_model = "MiniMax-M2.7"
 max_tokens = 8192
 enable_thinking = false
 thinking_budget = 5120
-reasoning_effort = "nil"   # nil/empty = omit; otherwise pass through to OpenAI-compatible Chat Completions
+reasoning_effort = "nil"   # nil/empty = omit; otherwise send to OpenAI Chat/Responses providers
 
 [model.aliases]
 # Built-in aliases (pre-configured):
@@ -75,14 +82,21 @@ smart = "claude-3-7-sonnet-latest"
 ```
 
 `model.reasoning_effort` is a string passed to OpenAI, OpenRouter, and Custom
-providers configured with `compatibility = "openai"`. Surrounding whitespace
+providers configured with `compatibility = "openai"` or
+`compatibility = "openai-responses"`. Surrounding whitespace
 is trimmed. The default sentinel `"nil"` (case-sensitive), an empty string,
 or a whitespace-only value omits the `reasoning_effort` JSON property entirely.
 Other values such as `"none"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, or a
-gateway-specific value are sent unchanged. The setting is independent of
+gateway-specific value are sent unchanged. Responses providers receive the
+value as `reasoning.effort`. The setting is independent of
 `enable_thinking`, `thinking_budget`, and `temperature`, and is not sent to
 MiniMax, Anthropic, or a Custom provider using the Anthropic-compatible
 protocol.
+
+Custom providers using `compatibility = "openai-responses"` retain the shared
+`temperature` setting for configuration compatibility, but do not serialize it
+in Responses requests. Some Responses models reject that parameter; omitting it
+keeps the request valid while `max_tokens` is still sent as `max_output_tokens`.
 
 ### `[permissions]` — Permission System
 

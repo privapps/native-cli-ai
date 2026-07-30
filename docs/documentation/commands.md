@@ -20,7 +20,7 @@ When invoked without a subcommand, nca starts an interactive session. Behavior d
 | `--model` | — | string | — | Override the default model |
 | `--enable-thinking` | `-t` | flag | false | Enable extended thinking/reasoning |
 | `--thinking-budget` | — | u32 | 5120 | Token budget for extended thinking |
-| `--reasoning-effort` | — | string | `nil` | OpenAI-compatible Chat Completions reasoning effort for this invocation |
+| `--reasoning-effort` | — | string | `nil` | OpenAI-compatible Chat/Responses reasoning effort for this invocation |
 | `--max-tokens` | — | u32 | 8192 | Max response tokens |
 | `--verbose` | `-v` | flag | false | Verbose debug logging |
 | `--json` | — | flag | false | Output structured JSON (for CI) |
@@ -73,7 +73,7 @@ nca --permission-mode bypass-permissions
 ## Reasoning Effort
 
 `--reasoning-effort VALUE` is a global, run-scoped override for OpenAI-compatible
-Chat Completions requests. An omitted flag leaves the configured value
+Chat Completions and Responses requests. An omitted flag leaves the configured value
 unchanged, while an explicit `nil` disables the request property for that
 invocation.
 
@@ -85,8 +85,8 @@ nca --reasoning-effort nil --prompt "omit the request property"
 The value is trimmed. `nil`, an empty value, and a whitespace-only value omit
 the JSON property; other values are passed through unchanged, including
 `none`, `low`, `medium`, `high`, `xhigh`, and gateway-specific values. The
-setting is only sent by OpenAI, OpenRouter, and OpenAI-compatible Custom
-providers.
+setting is sent by OpenAI, OpenRouter, and Custom Chat Completions
+providers; Custom Responses mode nests it under `reasoning.effort`.
 
 ---
 
