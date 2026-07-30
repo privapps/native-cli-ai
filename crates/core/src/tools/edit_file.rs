@@ -43,7 +43,9 @@ impl ToolExecutor for EditFileTool {
             .unwrap_or_else(|_| self.workspace_root.clone());
         let full_path = self.workspace_root.join(path);
         let canonical = match full_path.canonicalize() {
-            Ok(canonical) if canonical.starts_with(&workspace_root) => canonical,
+            Ok(canonical) if super::yolo_enabled() || canonical.starts_with(&workspace_root) => {
+                canonical
+            }
             _ => {
                 return ToolResult {
                     call_id: call.id.clone(),

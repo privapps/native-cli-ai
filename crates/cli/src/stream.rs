@@ -187,14 +187,13 @@ pub fn spawn_event_fanout_task(
 
     tokio::spawn(async move {
         use nca_common::event::EventEnvelope;
-        use tokio::fs::OpenOptions;
-        use tokio::io::AsyncWriteExt;
 
-        let mut log_file = OpenOptions::new()
+        // Keep event-log writes synchronous so aborting this fanout task after
+        // a provider error cannot leave Tokio's async file state half-polled.
+        let mut log_file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&log_path)
-            .await
             .ok();
 
         let mut event_id: u64 = 0;
@@ -212,8 +211,8 @@ pub fn spawn_event_fanout_task(
             if let Some(file) = log_file.as_mut()
                 && let Ok(line) = serde_json::to_string(&envelope)
             {
-                let _ = file.write_all(line.as_bytes()).await;
-                let _ = file.write_all(b"\n").await;
+                let _ = file.write_all(line.as_bytes());
+                let _ = file.write_all(b"\n");
             }
 
             if let Some(ref cb) = on_event {
@@ -634,5 +633,25 @@ mod tests {
             role: "assistant".into(),
             content: "{\"as_of\":\"2026-07-29\",\"verification_status\":\"unverified\",\"verification_warning\":\"source publication date is unknown\"}".into(),
         });
+    }
+
+    #[tokio::test]
+    async fn event_fanout_records_provider_errors_without_panicking() {
+        let temp = tempfile::tempdir().expect("event log directory");
+        let log_path = temp.path().join("session.events.jsonl");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let task = spawn_event_fanout_task(rx, StreamMode::Off, log_path.clone(), None, None);
+
+        tx.send(AgentEvent::Error {
+            message: "custom Responses provider error: function call is missing its identity"
+                .into(),
+        })
+        .await
+        .expect("send provider error");
+        drop(tx);
+        task.await.expect("event fanout should exit cleanly");
+
+        let log = std::fs::read_to_string(log_path).expect("read event log");
+        assert!(log.contains("function call is missing its identity"));
     }
 }

@@ -70,6 +70,7 @@ pub struct HarnessSnapshot {
     pub git_branch: Option<String>,
     pub model: String,
     pub permission_mode: String,
+    pub yolo: bool,
     pub agent_profile: Option<String>,
     pub memory_notes: Vec<HarnessMemoryNote>,
     pub todos: Vec<AgentTodo>,
@@ -200,6 +201,9 @@ fn environment_section(snapshot: &HarnessSnapshot) -> Option<String> {
     }
     if !snapshot.permission_mode.is_empty() {
         lines.push(format!("- permission_mode: {}", snapshot.permission_mode));
+    }
+    if snapshot.yolo {
+        lines.push("- authorization: YOLO (nca safety and approval guards are bypassed; OS permissions and outer sandboxes still apply)".into());
     }
     if let Some(profile) = &snapshot.agent_profile {
         lines.push(format!("- agent_profile: {profile}"));
@@ -357,6 +361,7 @@ mod tests {
             git_branch: Some("main".into()),
             model: "MiniMax-M2.5".into(),
             permission_mode: "default".into(),
+            yolo: false,
             agent_profile: Some("@build".into()),
             memory_notes: Vec::new(),
             todos: Vec::new(),

@@ -438,6 +438,7 @@ impl AgentLoop {
 
                         if approved {
                             if let Some(hooks) = &self.hooks
+                                && !self.approval.is_yolo()
                                 && let Err(reason) = hooks
                                     .run(
                                         HookEventKind::PreToolUse,
@@ -485,6 +486,7 @@ impl AgentLoop {
 
                     PermissionTier::Allowed => {
                         if let Some(hooks) = &self.hooks
+                            && !self.approval.is_yolo()
                             && let Err(reason) = hooks
                                 .run(
                                     HookEventKind::PreToolUse,
@@ -504,6 +506,21 @@ impl AgentLoop {
                                 error: Some(reason),
                             }));
                             continue;
+                        }
+                        if self.approval.is_yolo()
+                            && let Some(hooks) = &self.hooks
+                        {
+                            hooks
+                                .run_best_effort(
+                                    HookEventKind::PreToolUse,
+                                    Some(&call.name),
+                                    &json!({
+                                        "call_id": call.id.clone(),
+                                        "tool": call.name.clone(),
+                                        "input": call.input.clone(),
+                                    }),
+                                )
+                                .await;
                         }
                         tickets.push(Ticket::Execute(call.clone()));
                     }

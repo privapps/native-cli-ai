@@ -4,6 +4,7 @@ use crate::supervisor::{
 };
 use nca_common::config::NcaConfig;
 use nca_common::event::{AgentEvent, EndReason, EventEnvelope};
+use nca_common::execution::ExecutionContext;
 use nca_common::session::OrchestrationContext;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -20,6 +21,7 @@ pub struct ServiceSessionRequest {
     pub config: NcaConfig,
     pub workspace_root: PathBuf,
     pub safe_mode: bool,
+    pub execution: ExecutionContext,
     pub initial_prompt: Option<String>,
     pub orchestration_context: Option<OrchestrationContext>,
     pub kind: ServiceSessionKind,
@@ -98,6 +100,7 @@ async fn run_service_session_with_startup(
                 session_id: session_id.clone(),
                 approval_handler: None,
                 orchestration_context: request.orchestration_context.clone(),
+                execution: request.execution,
             })
             .await
         }
@@ -109,6 +112,7 @@ async fn run_service_session_with_startup(
                 true,
                 session_id,
                 None,
+                request.execution,
             )
             .await
         }
@@ -151,6 +155,8 @@ async fn run_service_session_with_startup(
             info.session_id.clone(),
             info.workspace_root.clone(),
             request.config.clone(),
+            request.execution,
+            request.safe_mode,
             supervisor.agent().messages.clone(),
             supervisor.event_tx(),
         ))

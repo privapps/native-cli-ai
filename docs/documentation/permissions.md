@@ -167,6 +167,33 @@ In safe mode:
 
 Safe mode is ideal for code exploration, review, and analysis without any risk of modification.
 
+## YOLO Mode
+
+`--yolo` is an explicit, invocation-scoped override for nca-level approval and
+safety guards:
+
+```bash
+nca --yolo
+nca run --prompt "..." --yolo --stream off
+nca resume SESSION_ID --yolo
+```
+
+YOLO bypasses permission modes, allow/deny/ask lists, safe-mode restrictions,
+workspace confinement, validation command allowlists, financial opt-in gates,
+MCP safe-mode restrictions, and blocking hook results. Hooks still run for
+observability. Operating-system permissions, filesystem errors, and outer
+sandbox limits still apply. `--safe --yolo` is rejected.
+
+YOLO is shown in the prompt, system context, session metadata, and event
+stream, but it is never saved as a future launch default. Profiles, skills,
+and `/permissions` cannot downgrade it. Child sessions inherit the parent's
+authorization context; a normal non-interactive child fails loudly if it
+needs approval.
+
+For normal policy lists, precedence is `deny > ask > allow`. The
+`bypass-permissions` mode remains distinct: it skips prompts but preserves
+explicit denies and safe-mode restrictions.
+
 ## Headless/CI Mode
 
 For non-interactive usage (CI pipelines, scripts, automation):

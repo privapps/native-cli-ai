@@ -38,7 +38,7 @@ impl ToolExecutor for CreateDirectoryTool {
             Err(_) => self.workspace_root.clone(),
         };
 
-        if !canonical_parent.starts_with(&self.workspace_root) {
+        if !super::yolo_enabled() && !canonical_parent.starts_with(&self.workspace_root) {
             return ToolResult {
                 call_id: call.id.clone(),
                 success: false,

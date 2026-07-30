@@ -10,6 +10,7 @@ use nca_common::config::{
     NcaConfig, PermissionMode, resolve_last_session_path, resolve_memory_path, resolve_sessions_dir,
 };
 use nca_common::event::{AgentCommand, AgentEvent, EndReason, EventEnvelope, QuestionSelection};
+use nca_common::execution::ExecutionContext;
 use nca_common::session::{
     OrchestrationContext, SessionMeta, SessionSnapshot, SessionState, SessionStatus,
 };
@@ -70,6 +71,8 @@ pub struct Supervisor {
     /// Authoritative session todo list (shared with `update_todos` tool).
     todos: Arc<Mutex<Vec<AgentTodo>>>,
     config: NcaConfig,
+    execution: ExecutionContext,
+    safe_mode: bool,
     hooks: Option<HookRunner>,
     context_manager: ContextManager,
     last_summary_at_tokens: usize,
@@ -84,6 +87,7 @@ pub struct SupervisorConfig {
     pub session_id: Option<String>,
     pub approval_handler: Option<Arc<dyn ApprovalHandler>>,
     pub orchestration_context: Option<OrchestrationContext>,
+    pub execution: ExecutionContext,
 }
 
 /// A handle returned to callers for interacting with a running supervisor.
@@ -150,17 +154,20 @@ impl Supervisor {
             .map_err(|e| ProviderError::Configuration(format!("invalid workspace root: {e}")))?;
 
         let mut config = cfg.config;
-        if cfg.safe_mode {
+        if cfg.safe_mode && !cfg.execution.yolo {
             config.permissions.deny.push("execute_bash".into());
         }
 
         let provider = build_provider(&config)?;
-        let mut tools = if cfg.safe_mode {
+        let mut tools = if cfg.safe_mode && !cfg.execution.yolo {
             ToolRegistry::with_default_readonly_tools(workspace_root.clone(), config.web.clone())
         } else {
             ToolRegistry::with_default_full_tools(workspace_root.clone(), config.web.clone())
         };
-        if !config.mcp.servers.is_empty() && (!cfg.safe_mode || config.mcp.expose_in_safe_mode) {
+        tools.set_yolo(cfg.execution.yolo);
+        if !config.mcp.servers.is_empty()
+            && (cfg.execution.yolo || !cfg.safe_mode || config.mcp.expose_in_safe_mode)
+        {
             match load_mcp_tools(&workspace_root, &config.mcp.servers) {
                 Ok(mcp_tools) => {
                     for tool in mcp_tools {
@@ -176,7 +183,7 @@ impl Supervisor {
 
         let (spawn_tx, spawn_rx) = mpsc::channel::<SpawnRequest>(16);
         let recent_skills = RecentSkillHints::default();
-        if !cfg.safe_mode {
+        if !cfg.safe_mode || cfg.execution.yolo {
             tools.register(Box::new(SpawnSubagentTool::new(
                 spawn_tx,
                 recent_skills.clone(),
@@ -188,18 +195,22 @@ impl Supervisor {
             match cfg.approval_handler {
                 Some(handler) => {
                     approval_pending = None;
-                    ApprovalPolicy::new(config.permissions.clone()).with_handler(handler)
+                    ApprovalPolicy::new(config.permissions.clone())
+                        .with_yolo(cfg.execution.yolo)
+                        .with_handler(handler)
                 }
                 None => {
                     let ipc_handler = IpcApprovalHandler::new();
                     approval_pending = Some(ipc_handler.pending());
                     ApprovalPolicy::new(config.permissions.clone())
+                        .with_yolo(cfg.execution.yolo)
                         .with_handler(ipc_handler as Arc<dyn ApprovalHandler>)
                 }
             }
         } else {
             approval_pending = None;
             ApprovalPolicy::new(config.permissions.clone())
+                .with_yolo(cfg.execution.yolo)
                 .fail_on_ask()
                 .with_handler(Arc::new(AutoDenyHandler) as Arc<dyn ApprovalHandler>)
         };
@@ -278,6 +289,8 @@ impl Supervisor {
             orchestration: cfg.orchestration_context,
             todos,
             config,
+            execution: cfg.execution,
+            safe_mode: cfg.safe_mode,
             hooks: hook_runner,
             context_manager,
             last_summary_at_tokens: 0,
@@ -318,6 +331,13 @@ impl Supervisor {
                 })
                 .ok()
         });
+        let _ = sup.agent.event_sender().and_then(|event_tx| {
+            event_tx
+                .try_send(AgentEvent::AuthorizationContext {
+                    yolo: sup.execution.yolo,
+                })
+                .ok()
+        });
         Ok(sup)
     }
 
@@ -330,6 +350,7 @@ impl Supervisor {
         interactive_approvals: bool,
         session_id: &str,
         approval_handler: Option<Arc<dyn ApprovalHandler>>,
+        execution: ExecutionContext,
     ) -> Result<Self, ProviderError> {
         let store = SessionStore::new(resolve_sessions_dir(&config, workspace_root));
         let loaded = store
@@ -351,6 +372,7 @@ impl Supervisor {
                 session_id: Some(loaded.meta.id.clone()),
                 approval_handler,
                 orchestration_context: None,
+                execution,
             },
             Some(loaded),
         )
@@ -390,6 +412,59 @@ impl Supervisor {
     pub async fn run_turn(&mut self, prompt: &str) -> Result<String, ProviderError> {
         self.run_turn_with_images_at(prompt, &[], Utc::now().date_naive())
             .await
+    }
+
+    /// Execute the REPL direct shell command through the same authorization
+    /// policy and tool implementation as model-requested shell commands.
+    pub async fn run_direct_bash(&self, command: &str) -> Result<String, String> {
+        let call = nca_common::tool::ToolCall {
+            id: format!("direct-bash-{}", Utc::now().timestamp_micros()),
+            name: "execute_bash".into(),
+            input: json!({ "command": command }),
+        };
+        let allowed = match self
+            .agent
+            .approval
+            .check("execute_bash", &call.input.to_string())
+        {
+            nca_common::tool::PermissionTier::Denied => {
+                return Err("direct shell command denied by policy".into());
+            }
+            nca_common::tool::PermissionTier::Ask => {
+                let verdict = self
+                    .agent
+                    .approval
+                    .resolve(&call, "Direct shell command requires approval")
+                    .await;
+                if !verdict.is_approved() {
+                    return Err("direct shell command was not approved".into());
+                }
+                true
+            }
+            nca_common::tool::PermissionTier::Allowed => true,
+        };
+        if allowed {
+            if let Some(hooks) = &self.hooks {
+                let payload = json!({
+                    "call_id": call.id.clone(),
+                    "tool": call.name.clone(),
+                    "input": call.input.clone(),
+                });
+                if self.execution.yolo {
+                    hooks
+                        .run_best_effort(HookEventKind::PreToolUse, Some(&call.name), &payload)
+                        .await;
+                } else {
+                    hooks
+                        .run(HookEventKind::PreToolUse, Some(&call.name), &payload)
+                        .await?;
+                }
+            }
+            let result = self.agent.tools.execute(&call).await;
+            result.error.map_or_else(|| Ok(result.output), Err)
+        } else {
+            Err("direct shell command was not authorized".into())
+        }
     }
 
     /// Run one turn against an explicit temporal boundary.
@@ -717,6 +792,7 @@ impl Supervisor {
                 spawn_reason: self.spawn_reason.clone(),
                 session_summary: self.session_summary.clone(),
                 orchestration: self.orchestration.clone(),
+                execution: self.execution,
             },
             messages: self.agent.messages.clone(),
             total_input_tokens: self.agent.cost_tracker.input_tokens,
@@ -806,6 +882,7 @@ impl Supervisor {
             git_branch: detect_git_branch(&self.workspace_root),
             model: self.model.clone(),
             permission_mode: permission_mode_label(self.config.permissions.mode),
+            yolo: self.execution.yolo,
             agent_profile: None,
             memory_notes: self.load_memory_notes_for_harness(),
             todos,
@@ -931,6 +1008,14 @@ impl Supervisor {
 
     pub fn event_tx(&self) -> Option<tokio::sync::mpsc::Sender<AgentEvent>> {
         self.agent.event_sender()
+    }
+
+    pub fn execution_context(&self) -> ExecutionContext {
+        self.execution
+    }
+
+    pub fn safe_mode(&self) -> bool {
+        self.safe_mode
     }
 
     pub fn session_store(&self) -> &SessionStore {
@@ -1319,11 +1404,14 @@ pub async fn cleanup_stale_sessions(session_store: &SessionStore) {
 
 /// Spawns a background task that consumes spawn requests from the sub-agent tool
 /// and runs child sessions. Each child session inherits parent context.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_subagent_consumer(
     mut spawn_rx: mpsc::Receiver<SpawnRequest>,
     parent_session_id: String,
     workspace_root: PathBuf,
     config: NcaConfig,
+    execution: ExecutionContext,
+    safe_mode: bool,
     parent_messages: Vec<nca_common::message::Message>,
     event_tx: Option<tokio::sync::mpsc::Sender<AgentEvent>>,
 ) -> tokio::task::JoinHandle<()> {
@@ -1374,6 +1462,8 @@ pub fn spawn_subagent_consumer(
                 use_worktree: req.use_worktree,
                 focus_files: req.focus_files,
                 skills: resolved_skills,
+                execution,
+                safe_mode,
             };
 
             tokio::spawn(async move {
@@ -1532,6 +1622,8 @@ pub struct ChildSessionConfig {
     pub use_worktree: bool,
     pub focus_files: Vec<String>,
     pub skills: Vec<String>,
+    pub execution: ExecutionContext,
+    pub safe_mode: bool,
 }
 
 /// Result of a spawned child session.
@@ -1583,20 +1675,19 @@ pub async fn spawn_child_session(
     cfg: ChildSessionConfig,
     event_tx: Option<tokio::sync::mpsc::Sender<AgentEvent>>,
 ) -> Result<ChildSessionResult, String> {
-    // Child sessions are non-interactive and already authorized by the parent
-    // approval. Elevate to BypassPermissions so sub-agents can write files,
-    // run tools, and spawn their own children without being auto-denied.
-    let mut child_config = cfg.config.clone();
-    child_config.permissions.mode = nca_common::config::PermissionMode::BypassPermissions;
+    // Child sessions inherit the parent's invocation context. In particular,
+    // a normal parent must not silently turn a child into bypass mode.
+    let child_config = cfg.config.clone();
 
     let mut sup = Supervisor::create(SupervisorConfig {
         config: child_config,
         workspace_root: cfg.workspace_root.clone(),
-        safe_mode: false,
+        safe_mode: cfg.safe_mode,
         interactive_approvals: false,
         session_id: None,
         approval_handler: Some(Arc::new(AutoDenyHandler) as Arc<dyn ApprovalHandler>),
         orchestration_context: None,
+        execution: cfg.execution,
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -1833,6 +1924,7 @@ mod tests {
                 spawn_reason: None,
                 session_summary: None,
                 orchestration: None,
+                execution: Default::default(),
             },
             messages: vec![Message::user("hello")],
             total_input_tokens: 0,
@@ -1925,6 +2017,7 @@ mod tests {
             session_id: Some("fake-clock-test".into()),
             approval_handler: None,
             orchestration_context: None,
+            execution: ExecutionContext::normal(),
         })
         .await
         .expect("create supervisor");
@@ -1971,6 +2064,7 @@ mod tests {
             session_id: Some("prompt-refresh-test".into()),
             approval_handler: None,
             orchestration_context: None,
+            execution: ExecutionContext::normal(),
         })
         .await
         .expect("create supervisor");
@@ -2053,6 +2147,7 @@ mod tests {
             false,
             "resume-state-test",
             None,
+            ExecutionContext::normal(),
         )
         .await
         .expect("resume supervisor");
@@ -2251,6 +2346,8 @@ mod tests {
             "parent-1".into(),
             temp.path().to_path_buf(),
             NcaConfig::default(),
+            ExecutionContext::normal(),
+            false,
             vec![],
             None,
         );

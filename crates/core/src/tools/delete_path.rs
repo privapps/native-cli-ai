@@ -35,7 +35,7 @@ impl ToolExecutor for DeletePathTool {
         let full_path = self.workspace_root.join(path);
 
         let canonical = match full_path.canonicalize() {
-            Ok(path) if path.starts_with(&self.workspace_root) => path,
+            Ok(path) if super::yolo_enabled() || path.starts_with(&self.workspace_root) => path,
             _ => {
                 return ToolResult {
                     call_id: call.id.clone(),

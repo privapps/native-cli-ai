@@ -25,7 +25,7 @@ fn canonicalize_workspace_path(
     let canonical = full_path
         .canonicalize()
         .map_err(|err| format!("Failed to resolve path '{path}': {err}"))?;
-    if canonical.starts_with(&canonical_root) {
+    if super::yolo_enabled() || canonical.starts_with(&canonical_root) {
         Ok(canonical)
     } else {
         Err("Path is outside the workspace".into())

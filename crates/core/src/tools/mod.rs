@@ -42,11 +42,23 @@ use nca_common::tool::{ToolCall, ToolDefinition, ToolResult};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+tokio::task_local! {
+    static EXECUTION_YOLO: bool;
+}
+
+/// Returns whether the current tool invocation is running under yolo.
+/// Tool implementations use this to bypass nca-level guards while retaining
+/// actual OS and subprocess errors.
+pub fn yolo_enabled() -> bool {
+    EXECUTION_YOLO.try_with(|value| *value).unwrap_or(false)
+}
+
 /// Registry of available tools the agent can invoke.
 pub struct ToolRegistry {
     tools: Vec<Box<dyn ToolExecutor>>,
     research_context: Arc<ResearchContext>,
     financial_research_enabled: Arc<AtomicBool>,
+    yolo: bool,
 }
 
 impl ToolRegistry {
@@ -55,6 +67,7 @@ impl ToolRegistry {
             tools: Vec::new(),
             research_context: Arc::new(ResearchContext::new(Utc::now().date_naive())),
             financial_research_enabled: Arc::new(AtomicBool::new(false)),
+            yolo: false,
         }
     }
 
@@ -73,6 +86,17 @@ impl ToolRegistry {
     pub fn enable_financial_research(&self) {
         self.financial_research_enabled
             .store(true, Ordering::Release);
+    }
+
+    pub fn set_yolo(&mut self, yolo: bool) {
+        self.yolo = yolo;
+        if yolo {
+            self.enable_financial_research();
+        }
+    }
+
+    pub fn is_yolo(&self) -> bool {
+        self.yolo
     }
 
     pub fn with_default_readonly_tools(
@@ -156,7 +180,7 @@ impl ToolRegistry {
         self.tools
             .iter()
             .filter(|tool| {
-                !is_financial_tool(&tool.definition())
+                (self.yolo || !is_financial_tool(&tool.definition()))
                     || self.financial_research_enabled.load(Ordering::Acquire)
             })
             .map(|t| t.definition())
@@ -164,7 +188,8 @@ impl ToolRegistry {
     }
 
     pub async fn execute(&self, call: &ToolCall) -> ToolResult {
-        if is_financial_tool_name(&call.name)
+        if !self.yolo
+            && is_financial_tool_name(&call.name)
             && !self.financial_research_enabled.load(Ordering::Acquire)
         {
             return ToolResult {
@@ -179,7 +204,7 @@ impl ToolRegistry {
         }
         for tool in &self.tools {
             if tool.definition().name == call.name {
-                return tool.execute(call).await;
+                return EXECUTION_YOLO.scope(self.yolo, tool.execute(call)).await;
             }
         }
 
@@ -216,4 +241,33 @@ impl Default for ToolRegistry {
 pub trait ToolExecutor: Send + Sync {
     fn definition(&self) -> ToolDefinition;
     async fn execute(&self, call: &ToolCall) -> ToolResult;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn yolo_allows_registry_tools_to_use_external_paths() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        let target = outside.path().join("created.txt");
+        let mut registry = ToolRegistry::with_default_full_tools(
+            workspace.path().to_path_buf(),
+            WebConfig::default(),
+        );
+        registry.set_yolo(true);
+        let result = registry
+            .execute(&ToolCall {
+                id: "yolo-write".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({
+                    "path": target,
+                    "content": "yolo",
+                }),
+            })
+            .await;
+        assert!(result.success, "{result:?}");
+        assert_eq!(tokio::fs::read_to_string(target).await.unwrap(), "yolo");
+    }
 }

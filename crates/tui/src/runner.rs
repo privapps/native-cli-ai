@@ -1,6 +1,7 @@
 use crate::ipc_pending::{ApprovalPendingMap, QuestionPendingMap};
 use nca_common::config::{NcaConfig, PermissionMode, resolve_sessions_dir};
 use nca_common::event::{AgentEvent, EndReason, QuestionSelection};
+use nca_common::execution::ExecutionContext;
 use nca_common::session::{OrchestrationContext, SessionSnapshot};
 use nca_core::approval::{ApprovalHandler, ApprovalVerdict};
 use nca_core::provider::ProviderError;
@@ -69,6 +70,10 @@ impl SessionRuntime {
 
     pub async fn run_turn(&mut self, prompt: &str) -> Result<String, ProviderError> {
         self.supervisor.run_turn(prompt).await
+    }
+
+    pub async fn run_direct_bash(&self, command: &str) -> Result<String, String> {
+        self.supervisor.run_direct_bash(command).await
     }
 
     pub async fn run_turn_with_images(
@@ -156,8 +161,18 @@ impl SessionRuntime {
         self.supervisor.agent().approval.mode()
     }
 
+    pub fn execution_context(&self) -> ExecutionContext {
+        self.supervisor.execution_context()
+    }
+
+    pub fn safe_mode(&self) -> bool {
+        self.supervisor.safe_mode()
+    }
+
     pub fn set_permission_mode(&mut self, mode: PermissionMode) {
-        self.supervisor.agent_mut().approval.set_mode(mode);
+        if !self.supervisor.execution_context().yolo {
+            self.supervisor.agent_mut().approval.set_mode(mode);
+        }
     }
 
     pub fn request_cancel(&self) {
@@ -232,10 +247,12 @@ impl SessionRuntime {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn build_session_runtime(
     config: NcaConfig,
     workspace_root: &Path,
     safe_mode: bool,
+    yolo: bool,
     interactive_approvals: bool,
     session_id: Option<String>,
     ipc_approval_handler: Option<Arc<dyn ApprovalHandler>>,
@@ -251,6 +268,7 @@ pub async fn build_session_runtime(
         session_id,
         approval_handler,
         orchestration_context,
+        execution: ExecutionContext { yolo },
     })
     .await?;
 
@@ -268,6 +286,7 @@ pub async fn build_resumed_session_runtime(
     config: NcaConfig,
     workspace_root: &Path,
     safe_mode: bool,
+    yolo: bool,
     interactive_approvals: bool,
     session_id: &str,
     approval_handler: Option<Arc<dyn ApprovalHandler>>,
@@ -279,6 +298,7 @@ pub async fn build_resumed_session_runtime(
         interactive_approvals,
         session_id,
         approval_handler,
+        ExecutionContext { yolo },
     )
     .await?;
     let mut handle = supervisor.take_handle();

@@ -224,12 +224,13 @@ pub struct Repl {
 
 impl Repl {
     pub fn new(runtime: SessionRuntime, safe_mode: bool, run_mode: bool) -> Self {
+        let yolo = runtime.execution_context().yolo;
         let history_path = runtime.workspace_root().join(".nca/.history");
         let agent_profile = AgentProfile::default();
         let current_agent_label = format!("@{}", agent_profile.label());
         Self {
             runtime,
-            prompt: NcaPrompt::new(safe_mode, run_mode),
+            prompt: NcaPrompt::new(safe_mode, run_mode, yolo),
             run_mode,
             history_path,
             agent_profile,
@@ -263,6 +264,8 @@ impl Repl {
                     self.runtime.session_id().to_string(),
                     self.runtime.workspace_root().to_path_buf(),
                     self.runtime.config().clone(),
+                    self.runtime.execution_context(),
+                    self.runtime.safe_mode(),
                     self.runtime.messages().to_vec(),
                     event_tx,
                 ))
@@ -397,34 +400,15 @@ impl Repl {
 
         eprintln!("[bash] {cmd}");
 
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await;
+        let output = self.runtime.run_direct_bash(cmd).await;
 
         match output {
-            Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let stderr = String::from_utf8_lossy(&out.stderr);
-
-                if !stdout.is_empty() {
-                    println!("{stdout}");
-                }
-                if !stderr.is_empty() {
-                    eprintln!("[stderr] {stderr}");
-                }
-                if out.status.success() {
-                    eprintln!("[bash] completed (exit 0)");
-                } else {
-                    eprintln!("[bash] failed (exit {})", out.status.code().unwrap_or(-1));
+            Ok(output) => {
+                if !output.is_empty() {
+                    println!("{output}");
                 }
             }
-            Err(e) => {
-                eprintln!("[bash] failed to execute: {e}");
-            }
+            Err(e) => eprintln!("[bash] failed to execute: {e}"),
         }
     }
 
@@ -2112,7 +2096,11 @@ impl Repl {
     pub async fn run_with_tui(&mut self) -> anyhow::Result<()> {
         let session_id = self.runtime.session_id().to_string();
         let model = self.runtime.model().to_string();
-        let perm = format!("{:?}", self.runtime.permission_mode());
+        let perm = if self.runtime.execution_context().yolo {
+            "YOLO".to_string()
+        } else {
+            format!("{:?}", self.runtime.permission_mode())
+        };
         let shared_state = SharedTuiState::new(TuiSessionState::new(
             session_id,
             model,
@@ -2177,6 +2165,8 @@ impl Repl {
                     self.runtime.session_id().to_string(),
                     self.runtime.workspace_root().to_path_buf(),
                     self.runtime.config().clone(),
+                    self.runtime.execution_context(),
+                    self.runtime.safe_mode(),
                     self.runtime.messages().to_vec(),
                     event_tx,
                 ))
@@ -3180,6 +3170,7 @@ mod tests {
         let runtime = build_session_runtime(
             config,
             workspace.path(),
+            false,
             false,
             false,
             Some(format!(

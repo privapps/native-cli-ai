@@ -35,7 +35,7 @@ impl ToolExecutor for RunValidationTool {
         let cwd = call.input["cwd"].as_str().unwrap_or(".");
         let timeout_secs = call.input["timeout_secs"].as_u64().unwrap_or(120);
 
-        if !is_safe_validation_command(command) {
+        if !super::yolo_enabled() && !is_safe_validation_command(command) {
             return ToolResult {
                 call_id: call.id.clone(),
                 success: false,
@@ -46,7 +46,7 @@ impl ToolExecutor for RunValidationTool {
 
         let full_cwd = self.workspace_root.join(cwd);
         let canonical_cwd = match full_cwd.canonicalize() {
-            Ok(path) if path.starts_with(&self.workspace_root) => path,
+            Ok(path) if super::yolo_enabled() || path.starts_with(&self.workspace_root) => path,
             _ => {
                 return ToolResult {
                     call_id: call.id.clone(),

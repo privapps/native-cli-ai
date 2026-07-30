@@ -66,6 +66,11 @@ pub enum AgentEvent {
         workspace: PathBuf,
         model: String,
     },
+    /// Reports invocation-scoped authorization without changing the stable
+    /// SessionStarted payload shape.
+    AuthorizationContext {
+        yolo: bool,
+    },
     MessageReceived {
         role: String,
         content: String,

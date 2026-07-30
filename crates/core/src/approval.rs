@@ -99,6 +99,7 @@ pub struct ApprovalPolicy {
     handler: Option<Arc<dyn ApprovalHandler>>,
     fail_on_ask: bool,
     pub session_allow: Vec<String>,
+    yolo: bool,
 }
 
 impl ApprovalPolicy {
@@ -108,6 +109,7 @@ impl ApprovalPolicy {
             handler: None,
             fail_on_ask: false,
             session_allow: Vec::new(),
+            yolo: false,
         }
     }
 
@@ -128,8 +130,20 @@ impl ApprovalPolicy {
         self
     }
 
+    pub fn with_yolo(mut self, yolo: bool) -> Self {
+        self.yolo = yolo;
+        self
+    }
+
+    pub fn is_yolo(&self) -> bool {
+        self.yolo
+    }
+
     /// Check the permission tier for a given tool name and input description.
     pub fn check(&self, tool_name: &str, description: &str) -> PermissionTier {
+        if self.yolo {
+            return PermissionTier::Allowed;
+        }
         let json_key = format!("{tool_name}:{description}");
 
         // Build a human-readable key by extracting meaningful text from JSON input
@@ -151,6 +165,12 @@ impl ApprovalPolicy {
                 return PermissionTier::Denied;
             }
         }
+
+        // Ask patterns intentionally take precedence over allows. Denies were
+        // checked first, giving the documented order deny > ask > allow.
+        let explicitly_asked = self.config.ask.iter().any(|pattern| {
+            wildcard_matches(pattern, &json_key) || wildcard_matches(pattern, &readable_key)
+        });
 
         // Allow check: config.allow + session_allow, match against both keys
         let explicitly_allowed = self
@@ -197,7 +217,11 @@ impl ApprovalPolicy {
             PermissionMode::BypassPermissions => PermissionTier::Allowed,
             PermissionMode::Plan => {
                 if readonly {
-                    PermissionTier::Allowed
+                    if explicitly_asked {
+                        PermissionTier::Ask
+                    } else {
+                        PermissionTier::Allowed
+                    }
                 } else {
                     PermissionTier::Denied
                 }
@@ -205,7 +229,7 @@ impl ApprovalPolicy {
             // Default and AcceptEdits: allow reads + file/dir edits; ask for shell
             // and other non-edit tools; always ask for destructive deletes.
             PermissionMode::Default | PermissionMode::AcceptEdits => {
-                if destructive {
+                if destructive || explicitly_asked {
                     PermissionTier::Ask
                 } else if explicitly_allowed || readonly || file_edit {
                     PermissionTier::Allowed
@@ -239,7 +263,9 @@ impl ApprovalPolicy {
     }
 
     pub fn set_mode(&mut self, mode: PermissionMode) {
-        self.config.mode = mode;
+        if !self.yolo {
+            self.config.mode = mode;
+        }
     }
 }
 
@@ -504,6 +530,57 @@ mod tests {
         assert_eq!(
             policy.check("delete_path", r#"{"path":"a.rs"}"#),
             PermissionTier::Ask
+        );
+    }
+
+    #[test]
+    fn yolo_overrides_denies_and_permission_modes() {
+        let policy = ApprovalPolicy::new(PermissionConfig {
+            mode: PermissionMode::Plan,
+            deny: vec!["*".into()],
+            ask: vec!["*".into()],
+            ..Default::default()
+        })
+        .with_yolo(true);
+        assert_eq!(
+            policy.check("execute_bash", r#"{"command":"rm -rf /"}"#),
+            PermissionTier::Allowed
+        );
+    }
+
+    #[test]
+    fn deny_ask_allow_precedence_is_stable() {
+        let policy = ApprovalPolicy::new(PermissionConfig {
+            mode: PermissionMode::Default,
+            allow: vec!["execute_bash:git *".into()],
+            ask: vec!["execute_bash:git *".into()],
+            deny: vec!["execute_bash:git push *".into()],
+        });
+        assert_eq!(
+            policy.check("execute_bash", r#"{"command":"git status"}"#),
+            PermissionTier::Ask
+        );
+        assert_eq!(
+            policy.check("execute_bash", r#"{"command":"git push origin main"}"#),
+            PermissionTier::Denied
+        );
+    }
+
+    #[test]
+    fn bypass_keeps_explicit_denies_but_skips_asks() {
+        let policy = ApprovalPolicy::new(PermissionConfig {
+            mode: PermissionMode::BypassPermissions,
+            deny: vec!["execute_bash:*".into()],
+            ask: vec!["write_file:*".into()],
+            ..Default::default()
+        });
+        assert_eq!(
+            policy.check("execute_bash", r#"{"command":"pwd"}"#),
+            PermissionTier::Denied
+        );
+        assert_eq!(
+            policy.check("write_file", r#"{"path":"a"}"#),
+            PermissionTier::Allowed
         );
     }
 }

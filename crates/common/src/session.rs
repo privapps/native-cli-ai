@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::path::PathBuf;
 
+use crate::execution::ExecutionContext;
 use crate::message::Message;
 
 /// Metadata for a persisted session.
@@ -44,6 +45,10 @@ pub struct SessionMeta {
     /// External orchestration metadata for headless worker runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestration: Option<OrchestrationContext>,
+    /// Authorization context active for this invocation. This is metadata,
+    /// not a persisted launch default.
+    #[serde(default)]
+    pub execution: ExecutionContext,
 }
 
 /// Full session state, including conversation history and cost tracking.
@@ -88,6 +93,8 @@ pub struct SessionSnapshot {
     pub session_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestration: Option<OrchestrationContext>,
+    #[serde(default)]
+    pub execution: ExecutionContext,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub estimated_cost_usd: f64,
@@ -134,6 +141,7 @@ impl SessionState {
             spawn_reason: self.meta.spawn_reason.clone(),
             session_summary: self.meta.session_summary.clone(),
             orchestration: self.meta.orchestration.clone(),
+            execution: self.meta.execution,
             total_input_tokens: self.total_input_tokens,
             total_output_tokens: self.total_output_tokens,
             estimated_cost_usd: self.estimated_cost_usd,
@@ -261,6 +269,7 @@ mod tests {
         let state: SessionState = serde_json::from_str(raw).expect("deserialize");
         assert!(state.todos.is_empty());
         assert!(state.snapshot().todos.is_empty());
+        assert!(!state.meta.execution.yolo);
     }
 
     #[test]
@@ -285,6 +294,7 @@ mod tests {
                 spawn_reason: None,
                 session_summary: None,
                 orchestration: None,
+                execution: Default::default(),
             },
             messages: Vec::new(),
             total_input_tokens: 0,
@@ -301,5 +311,41 @@ mod tests {
         let back: SessionState = serde_json::from_str(&json).unwrap();
         assert_eq!(back.todos.len(), 1);
         assert_eq!(back.snapshot().todos[0].content, "Ship it");
+    }
+
+    #[test]
+    fn yolo_metadata_roundtrips_without_becoming_a_launch_default() {
+        let now = Utc::now();
+        let state = SessionState {
+            meta: SessionMeta {
+                id: "yolo".into(),
+                created_at: now,
+                updated_at: now,
+                workspace: PathBuf::from("/tmp"),
+                model: "m".into(),
+                status: SessionStatus::Completed,
+                pid: None,
+                socket_path: None,
+                worktree_path: None,
+                branch: None,
+                base_branch: None,
+                parent_session_id: None,
+                child_session_ids: Vec::new(),
+                inherited_summary: None,
+                spawn_reason: None,
+                session_summary: None,
+                orchestration: None,
+                execution: crate::execution::ExecutionContext::yolo(),
+            },
+            messages: Vec::new(),
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            estimated_cost_usd: 0.0,
+            todos: Vec::new(),
+        };
+        let encoded = serde_json::to_string(&state).expect("serialize");
+        let decoded: SessionState = serde_json::from_str(&encoded).expect("deserialize");
+        assert!(decoded.meta.execution.yolo);
+        assert!(!crate::execution::ExecutionContext::default().yolo);
     }
 }

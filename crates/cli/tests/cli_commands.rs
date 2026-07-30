@@ -49,6 +49,7 @@ fn write_session(
             spawn_reason: None,
             session_summary: None,
             orchestration: None,
+            execution: Default::default(),
         },
         messages: vec![Message::user("hello")],
         total_input_tokens: 0,

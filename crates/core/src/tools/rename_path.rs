@@ -45,7 +45,7 @@ pub(super) async fn rename_impl(
     let to_path = workspace_root.join(to);
 
     let canonical_from = match from_path.canonicalize() {
-        Ok(path) if path.starts_with(workspace_root) => path,
+        Ok(path) if super::yolo_enabled() || path.starts_with(workspace_root) => path,
         _ => {
             return ToolResult {
                 call_id: call.id.clone(),
@@ -66,7 +66,7 @@ pub(super) async fn rename_impl(
             };
         }
         let canonical_parent = match parent.canonicalize() {
-            Ok(path) if path.starts_with(workspace_root) => path,
+            Ok(path) if super::yolo_enabled() || path.starts_with(workspace_root) => path,
             _ => {
                 return ToolResult {
                     call_id: call.id.clone(),

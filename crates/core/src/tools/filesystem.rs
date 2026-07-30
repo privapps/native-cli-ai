@@ -37,7 +37,9 @@ impl ToolExecutor for ReadFileTool {
 
         // Verify the path stays inside the workspace
         match full_path.canonicalize() {
-            Ok(canonical) if canonical.starts_with(&self.workspace_root) => {
+            Ok(canonical)
+                if super::yolo_enabled() || canonical.starts_with(&self.workspace_root) =>
+            {
                 match tokio::fs::read_to_string(&canonical).await {
                     Ok(content) => ToolResult {
                         call_id: call.id.clone(),

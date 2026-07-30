@@ -355,7 +355,7 @@ Spawn a child agent session for parallel task delegation.
 - `focus_files` (string[], optional) — File paths the sub-agent should focus on
 - `use_worktree` (bool, optional, default: true) — Run in an isolated git worktree
 
-**Behavior:** Creates a new child session that inherits conversation context. The child runs with `bypass-permissions` mode and no interactive approvals. Returns a JSON response with `child_session_id`, `status`, `output`, `workspace`, `branch`, and `worktree_path`. Times out after 600 seconds.
+**Behavior:** Creates a new child session that inherits conversation context and the parent's authorization context, with no interactive approvals. A non-YOLO child fails loudly if its inherited policy requires approval; a YOLO child remains YOLO. Returns a JSON response with `child_session_id`, `status`, `output`, `workspace`, `branch`, and `worktree_path`. Times out after 600 seconds.
 
 See [Sub-Agents](./advanced.md#sub-agents) for details.
 

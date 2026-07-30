@@ -3,14 +3,16 @@ use reedline::Prompt;
 pub struct NcaPrompt {
     pub safe_mode: bool,
     pub run_mode: bool,
+    pub yolo: bool,
     pub agent_label: String,
 }
 
 impl NcaPrompt {
-    pub fn new(safe_mode: bool, run_mode: bool) -> Self {
+    pub fn new(safe_mode: bool, run_mode: bool, yolo: bool) -> Self {
         Self {
             safe_mode,
             run_mode,
+            yolo,
             agent_label: "@build".to_string(),
         }
     }
@@ -31,6 +33,9 @@ impl NcaPrompt {
         }
         if self.run_mode {
             parts.push("run");
+        }
+        if self.yolo {
+            parts.push("YOLO");
         }
 
         let base = parts.join("( ");

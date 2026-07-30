@@ -65,7 +65,7 @@ fn relative_search_root(workspace_root: &Path, scope: Option<&str>) -> Result<St
     let canonical = candidate
         .canonicalize()
         .map_err(|err| format!("Failed to resolve search path '{scope}': {err}"))?;
-    if !canonical.starts_with(&canonical_root) {
+    if !super::yolo_enabled() && !canonical.starts_with(&canonical_root) {
         return Err("Search path is outside the workspace".into());
     }
     canonical

@@ -11,6 +11,7 @@ use nca_common::config::{
 };
 use nca_common::event::EndReason;
 use nca_common::event::{AgentCommand, EventEnvelope};
+use nca_common::execution::ExecutionContext;
 use nca_common::session::{OrchestrationContext, SessionSnapshot, SessionStatus};
 use nca_core::skills::SkillCatalog;
 use nca_runtime::memory_store::{MemoryNote, MemoryStore};
@@ -37,6 +38,10 @@ struct Cli {
     /// Start in read-only safe mode
     #[arg(short, long)]
     safe: bool,
+
+    /// Disable nca-level approval and safety guards for this invocation.
+    #[arg(long, global = true)]
+    yolo: bool,
 
     /// Resume the last session
     #[arg(short, long)]
@@ -421,6 +426,7 @@ async fn try_main() -> anyhow::Result<()> {
             permission_mode,
             session_id,
         }) => {
+            reject_safe_yolo(safe, cli.yolo)?;
             if let Some(model) = model {
                 config.apply_model_override(&model);
             }
@@ -435,6 +441,7 @@ async fn try_main() -> anyhow::Result<()> {
                     stream,
                     json,
                     safe,
+                    yolo: cli.yolo,
                     session_id,
                     orchestration_context: orchestration_context.clone(),
                 },
@@ -449,6 +456,7 @@ async fn try_main() -> anyhow::Result<()> {
             permission_mode,
             session_id,
         }) => {
+            reject_safe_yolo(safe, cli.yolo)?;
             if let Some(model) = model {
                 config.apply_model_override(&model);
             }
@@ -460,6 +468,7 @@ async fn try_main() -> anyhow::Result<()> {
                 prompt,
                 stream,
                 safe,
+                cli.yolo,
                 session_id,
                 orchestration_context.clone(),
             )
@@ -472,6 +481,7 @@ async fn try_main() -> anyhow::Result<()> {
             json,
             permission_mode,
         }) => {
+            reject_safe_yolo(safe, cli.yolo)?;
             let effective_mode = permission_mode.unwrap_or(CliPermissionMode::AcceptEdits);
             config.permissions.mode = effective_mode.into();
             spawn_run(
@@ -484,6 +494,7 @@ async fn try_main() -> anyhow::Result<()> {
                 safe,
                 effective_mode,
                 json,
+                cli.yolo,
             )
             .await?;
         }
@@ -528,6 +539,7 @@ async fn try_main() -> anyhow::Result<()> {
                 safe,
                 stream,
                 no_tui,
+                cli.yolo,
             )
             .await?;
         }
@@ -604,6 +616,7 @@ async fn try_main() -> anyhow::Result<()> {
             }
         },
         None => {
+            reject_safe_yolo(cli.safe, cli.yolo)?;
             if let Some(prompt) = cli.prompt.as_deref() {
                 if let Some(mode) = cli.permission_mode {
                     config.permissions.mode = mode.into();
@@ -614,6 +627,7 @@ async fn try_main() -> anyhow::Result<()> {
                         config.clone(),
                         &workspace_root,
                         cli.safe,
+                        cli.yolo,
                         true,
                         cli.session_id,
                         Some(ipc_approval.clone()),
@@ -646,6 +660,7 @@ async fn try_main() -> anyhow::Result<()> {
                             stream: cli.stream,
                             json: cli.json,
                             safe: cli.safe,
+                            yolo: cli.yolo,
                             session_id: cli.session_id,
                             orchestration_context: orchestration_context.clone(),
                         },
@@ -663,6 +678,7 @@ async fn try_main() -> anyhow::Result<()> {
                 }
 
                 if cli.resume {
+                    reject_safe_yolo(cli.safe, cli.yolo)?;
                     if let Some(mode) = cli.permission_mode {
                         config.permissions.mode = mode.into();
                     }
@@ -675,9 +691,11 @@ async fn try_main() -> anyhow::Result<()> {
                         cli.safe,
                         cli.stream,
                         cli.no_tui,
+                        cli.yolo,
                     )
                     .await?;
                 } else if cli.no_resume {
+                    reject_safe_yolo(cli.safe, cli.yolo)?;
                     // Explicitly skip auto-resume; create a fresh session.
                     if cli.run {
                         eprintln!("[run-mode] interactive run profile enabled");
@@ -700,6 +718,7 @@ async fn try_main() -> anyhow::Result<()> {
                         config.clone(),
                         &workspace_root,
                         cli.safe,
+                        cli.yolo,
                         true,
                         cli.session_id,
                         approval_handler,
@@ -732,6 +751,10 @@ async fn try_main() -> anyhow::Result<()> {
                     if let Ok(Some(session_id)) =
                         nca_runtime::supervisor::get_last_session_id(&config, &workspace_root).await
                     {
+                        reject_safe_yolo(cli.safe, cli.yolo)?;
+                        if let Some(mode) = cli.permission_mode {
+                            config.permissions.mode = mode.into();
+                        }
                         eprintln!(
                             "[session] Resuming last session {} (use --no-resume to start fresh)",
                             session_id
@@ -744,6 +767,7 @@ async fn try_main() -> anyhow::Result<()> {
                             cli.safe,
                             cli.stream,
                             cli.no_tui,
+                            cli.yolo,
                         )
                         .await?;
                     } else {
@@ -768,6 +792,7 @@ async fn try_main() -> anyhow::Result<()> {
                             config.clone(),
                             &workspace_root,
                             cli.safe,
+                            cli.yolo,
                             true,
                             cli.session_id,
                             approval_handler,
@@ -807,6 +832,7 @@ struct OneShotOptions {
     stream: StreamMode,
     json: bool,
     safe: bool,
+    yolo: bool,
     session_id: Option<String>,
     orchestration_context: Option<OrchestrationContext>,
 }
@@ -821,6 +847,7 @@ async fn run_one_shot(
         stream,
         json,
         safe,
+        yolo,
         session_id,
         orchestration_context,
     } = opts;
@@ -828,6 +855,7 @@ async fn run_one_shot(
         config.clone(),
         workspace_root,
         safe,
+        yolo,
         false,
         session_id,
         None,
@@ -854,6 +882,8 @@ async fn run_one_shot(
                 runtime.session_id().to_string(),
                 runtime.workspace_root().to_path_buf(),
                 config.clone(),
+                ExecutionContext { yolo },
+                safe,
                 runtime.messages().to_vec(),
                 None,
             )
@@ -896,12 +926,14 @@ async fn run_one_shot(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_service_session(
     config: NcaConfig,
     workspace_root: &Path,
     initial_prompt: Option<String>,
     stream: StreamMode,
     safe: bool,
+    yolo: bool,
     session_id: Option<String>,
     orchestration_context: Option<OrchestrationContext>,
 ) -> anyhow::Result<()> {
@@ -910,6 +942,7 @@ async fn run_service_session(
         config,
         workspace_root: workspace_root.to_path_buf(),
         safe_mode: safe,
+        execution: ExecutionContext { yolo },
         initial_prompt,
         orchestration_context,
         kind: nca_runtime::service::ServiceSessionKind::New { session_id },
@@ -918,6 +951,7 @@ async fn run_service_session(
     .map_err(anyhow::Error::msg)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn spawn_run(
     workspace_root: &Path,
     prompt: &str,
@@ -926,6 +960,7 @@ async fn spawn_run(
     safe: bool,
     permission_mode: CliPermissionMode,
     json: bool,
+    yolo: bool,
 ) -> anyhow::Result<()> {
     let session_id = format!("session-{}", chrono::Utc::now().timestamp_millis());
     let config = NcaConfig::load_for_workspace(workspace_root).unwrap_or_default();
@@ -944,6 +979,7 @@ async fn spawn_run(
         model.as_deref(),
         safe,
         permission_mode,
+        yolo,
     ));
 
     let child = command.stdout(stdout).stderr(stderr).spawn()?;
@@ -964,6 +1000,7 @@ async fn spawn_run(
                 socket_path: socket_path.expect("JSON spawn should publish an IPC endpoint"),
                 permission_mode: permission_mode.as_arg().to_string(),
                 safe_mode: safe,
+                yolo,
             },
             false,
         )?;
@@ -980,6 +1017,7 @@ fn spawn_command_args(
     model: Option<&str>,
     safe: bool,
     permission_mode: CliPermissionMode,
+    yolo: bool,
 ) -> Vec<String> {
     let mut args = Vec::new();
     if let Some(reasoning_effort) = reasoning_effort {
@@ -999,6 +1037,9 @@ fn spawn_command_args(
     ]);
     if safe {
         args.push("--safe".into());
+    }
+    if yolo {
+        args.push("--yolo".into());
     }
     if let Some(model) = model {
         args.push("--model".into());
@@ -1143,6 +1184,7 @@ async fn latest_session_id(config: &NcaConfig, workspace_root: &Path) -> anyhow:
         .ok_or_else(|| anyhow::anyhow!("no saved sessions found to resume"))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn resume_session(
     config: NcaConfig,
     workspace_root: &Path,
@@ -1151,7 +1193,9 @@ async fn resume_session(
     safe: bool,
     stream: StreamMode,
     no_tui: bool,
+    yolo: bool,
 ) -> anyhow::Result<()> {
+    reject_safe_yolo(safe, yolo)?;
     let use_tui = !no_tui
         && stdout().is_terminal()
         && stdin().is_terminal()
@@ -1166,6 +1210,7 @@ async fn resume_session(
         config,
         workspace_root,
         safe,
+        yolo,
         true,
         session_id,
         approval_handler,
@@ -1861,6 +1906,18 @@ fn workspace_memory_store(config: &NcaConfig, workspace_root: &Path) -> MemorySt
     MemoryStore::new(resolve_memory_path(config, workspace_root))
 }
 
+fn reject_safe_yolo(safe: bool, yolo: bool) -> anyhow::Result<()> {
+    if safe && yolo {
+        anyhow::bail!("--safe and --yolo cannot be used together");
+    }
+    if yolo {
+        eprintln!(
+            "[warning] --yolo disables nca-level approval and safety guards for this invocation; OS permissions and outer sandboxes still apply"
+        );
+    }
+    Ok(())
+}
+
 #[derive(serde::Serialize)]
 struct RunCommandOutput {
     session: SessionSnapshot,
@@ -1878,6 +1935,7 @@ struct SpawnCommandOutput {
     socket_path: PathBuf,
     permission_mode: String,
     safe_mode: bool,
+    yolo: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -2093,6 +2151,23 @@ mod tests {
     }
 
     #[test]
+    fn parses_yolo_before_and_after_subcommands() {
+        for args in [
+            vec!["nca", "--yolo", "run", "--prompt", "hello"],
+            vec!["nca", "run", "--prompt", "hello", "--yolo"],
+        ] {
+            let cli = Cli::try_parse_from(args).expect("should parse yolo placement");
+            assert!(cli.yolo);
+        }
+    }
+
+    #[test]
+    fn rejects_safe_and_yolo() {
+        assert!(reject_safe_yolo(true, true).is_err());
+        assert!(reject_safe_yolo(false, true).is_ok());
+    }
+
+    #[test]
     fn spawn_args_forward_reasoning_effort_before_subcommand() {
         let args = spawn_command_args(
             "hello",
@@ -2101,6 +2176,7 @@ mod tests {
             Some("gpt-5"),
             true,
             CliPermissionMode::AcceptEdits,
+            false,
         );
 
         assert_eq!(

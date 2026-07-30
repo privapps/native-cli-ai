@@ -731,7 +731,6 @@ fn spawn_responses_stream(
                     .get("type")
                     .and_then(Value::as_str)
                     .unwrap_or(event_name.as_str());
-
                 match event_type {
                     "response.output_text.delta" => {
                         let Some(delta) = value.get("delta").and_then(Value::as_str) else {
@@ -759,10 +758,18 @@ fn spawn_responses_stream(
                             return;
                         };
                         if item.get("type").and_then(Value::as_str) == Some("function_call") {
-                            let key = item_key(item);
+                            let key = item_key(item, value.get("output_index"));
                             let entry = tools.entry(key.clone()).or_default();
-                            if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
+                            if let Some(call_id) = item
+                                .get("call_id")
+                                .and_then(Value::as_str)
+                                .filter(|call_id| !call_id.is_empty())
+                            {
                                 entry.call_id = call_id.to_string();
+                            } else if entry.call_id.is_empty() {
+                                entry.call_id =
+                                    function_call_identity(item, value.get("output_index"))
+                                        .unwrap_or_default();
                             }
                             if let Some(name) = item.get("name").and_then(Value::as_str) {
                                 entry.name = name.to_string();
@@ -797,21 +804,12 @@ fn spawn_responses_stream(
                             .await;
                             return;
                         };
-                        let key = value
-                            .get("item_id")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                            .or_else(|| value.get("output_index").map(Value::to_string))
-                            .unwrap_or_else(|| "0".into());
-                        tools.entry(key).or_default().arguments.push_str(delta);
+                        let key = responses_argument_key(&value);
+                        let entry = tools.entry(key.clone()).or_default();
+                        entry.arguments.push_str(delta);
                     }
                     "response.function_call_arguments.done" => {
-                        let key = value
-                            .get("item_id")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                            .or_else(|| value.get("output_index").map(Value::to_string))
-                            .unwrap_or_else(|| "0".into());
+                        let key = responses_argument_key(&value);
                         if let Some(arguments) = value.get("arguments").and_then(Value::as_str) {
                             tools.entry(key.clone()).or_default().arguments = arguments.into();
                         }
@@ -914,12 +912,40 @@ fn is_known_responses_event(event_name: &str) -> bool {
     )
 }
 
-fn item_key(item: &serde_json::Map<String, Value>) -> String {
+fn item_key(item: &serde_json::Map<String, Value>, output_index: Option<&Value>) -> String {
+    output_index
+        .map(Value::to_string)
+        .or_else(|| {
+            item.get("id")
+                .and_then(Value::as_str)
+                .or_else(|| item.get("call_id").and_then(Value::as_str))
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "0".into())
+}
+
+fn responses_argument_key(value: &Value) -> String {
+    value
+        .get("output_index")
+        .map(Value::to_string)
+        .or_else(|| {
+            value
+                .get("item_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "0".into())
+}
+
+fn function_call_identity(
+    item: &serde_json::Map<String, Value>,
+    output_index: Option<&Value>,
+) -> Option<String> {
     item.get("id")
         .and_then(Value::as_str)
-        .or_else(|| item.get("call_id").and_then(Value::as_str))
-        .unwrap_or("0")
-        .to_string()
+        .filter(|identity| !identity.is_empty())
+        .map(str::to_string)
+        .or_else(|| output_index.map(Value::to_string))
 }
 
 async fn emit_responses_tool(
@@ -1924,6 +1950,8 @@ mod tests {
             "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"{\\\"path\\\":\\\"src\\\"}\"}\n\n",
             "event: response.function_call_arguments.done\n",
             "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_1\",\"arguments\":\"{\\\"path\\\":\\\"src\\\"}\"}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"name\":\"lookup\",\"arguments\":\"{\\\"path\\\":\\\"src\\\"}\"}}\n\n",
             "event: response.completed\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":4}}}\n\n"
         )
@@ -2004,6 +2032,82 @@ mod tests {
                 input_tokens: 12,
                 output_tokens: 4
             }
+        )));
+        assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
+    }
+
+    #[tokio::test]
+    async fn custom_openai_responses_provider_uses_function_item_id_when_call_id_is_omitted() {
+        let body = concat!(
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_gateway_1\",\"name\":\"lookup\",\"arguments\":\"\"}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_gateway_1\",\"delta\":\"{\\\"path\\\":\\\"src\\\"}\"}\n\n",
+            "event: response.function_call_arguments.done\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_gateway_1\",\"arguments\":\"{\\\"path\\\":\\\"src\\\"}\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+        )
+        .to_string();
+        let base_url = spawn_sse_server(body, 200, |_| {});
+
+        let mut config = NcaConfig::default();
+        config.provider.custom.api_key = Some("custom-test-key".into());
+        config.provider.custom.base_url = base_url;
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
+
+        let provider = CustomProvider::from_config(&config).expect("provider");
+        let stream = provider
+            .chat(&[Message::user("look up src")], &[], "", Path::new("."))
+            .await
+            .expect("chat stream");
+        let chunks = collect_chunks(stream).await;
+
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            StreamChunk::ToolUse(call)
+                if call.id == "fc_gateway_1"
+                    && call.name == "lookup"
+                    && call.input == json!({"path": "src"})
+        )));
+        assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
+    }
+
+    #[tokio::test]
+    async fn custom_openai_responses_provider_uses_output_index_when_item_id_changes() {
+        let body = concat!(
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"stable-item\",\"call_id\":\"call_0\",\"name\":\"lookup\",\"arguments\":\"\"}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"rotating-item-1\",\"output_index\":0,\"delta\":\"{\\\"path\\\":\"}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"rotating-item-2\",\"output_index\":0,\"delta\":\"\\\"src\\\"}\"}\n\n",
+            "event: response.function_call_arguments.done\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"rotating-item-done\",\"output_index\":0,\"arguments\":\"{\\\"path\\\":\\\"src\\\"}\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+        )
+        .to_string();
+        let base_url = spawn_sse_server(body, 200, |_| {});
+
+        let mut config = NcaConfig::default();
+        config.provider.custom.api_key = Some("custom-test-key".into());
+        config.provider.custom.base_url = base_url;
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
+
+        let provider = CustomProvider::from_config(&config).expect("provider");
+        let stream = provider
+            .chat(&[Message::user("look up src")], &[], "", Path::new("."))
+            .await
+            .expect("chat stream");
+        let chunks = collect_chunks(stream).await;
+
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            StreamChunk::ToolUse(call)
+                if call.id == "call_0"
+                    && call.name == "lookup"
+                    && call.input == json!({"path": "src"})
         )));
         assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
     }
