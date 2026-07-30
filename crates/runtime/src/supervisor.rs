@@ -128,6 +128,22 @@ impl Supervisor {
     /// Create a new supervised session. This sets up the agent loop, IPC server,
     /// event channels, and persists initial session metadata.
     pub async fn create(cfg: SupervisorConfig) -> Result<Self, ProviderError> {
+        let sup = Self::initialize(cfg, None).await?;
+        sup.save().await.map_err(ProviderError::Other)?;
+        sup.update_last_session()
+            .await
+            .map_err(ProviderError::Other)?;
+        sup.run_session_hook(HookEventKind::SessionStart, json!(sup.snapshot()))
+            .await;
+        Ok(sup)
+    }
+
+    /// Build the runtime without persisting a bootstrap state. Resumed sessions
+    /// use this path after loading their persisted state.
+    async fn initialize(
+        cfg: SupervisorConfig,
+        restored: Option<SessionState>,
+    ) -> Result<Self, ProviderError> {
         let workspace_root = cfg
             .workspace_root
             .canonicalize()
@@ -215,12 +231,6 @@ impl Supervisor {
             .await
             .map_err(|e| ProviderError::Other(e.to_string()))?;
 
-        let _ = event_tx.try_send(AgentEvent::SessionStarted {
-            session_id: session_id.clone(),
-            workspace: workspace_root.clone(),
-            model: config.model.default_model.clone(),
-        });
-
         let created_at = Utc::now();
         let hook_runner = {
             let runner = HookRunner::new(config.hooks.clone());
@@ -272,13 +282,42 @@ impl Supervisor {
             context_manager,
             last_summary_at_tokens: 0,
         };
+
+        if let Some(loaded) = restored {
+            sup.session_id = loaded.meta.id;
+            sup.workspace_root = loaded.meta.workspace;
+            sup.model = loaded.meta.model;
+            sup.agent.model = sup.model.clone();
+            sup.created_at = loaded.meta.created_at;
+            sup.status = loaded.meta.status;
+            sup.pid = Some(std::process::id());
+            sup.agent.messages = loaded.messages;
+            sup.worktree_path = loaded.meta.worktree_path;
+            sup.branch = loaded.meta.branch;
+            sup.base_branch = loaded.meta.base_branch;
+            sup.parent_session_id = loaded.meta.parent_session_id;
+            sup.child_session_ids = loaded.meta.child_session_ids;
+            sup.inherited_summary = loaded.meta.inherited_summary;
+            sup.spawn_reason = loaded.meta.spawn_reason;
+            sup.session_summary = loaded.meta.session_summary;
+            sup.orchestration = loaded.meta.orchestration;
+            sup.agent.cost_tracker.input_tokens = loaded.total_input_tokens;
+            sup.agent.cost_tracker.output_tokens = loaded.total_output_tokens;
+            if let Ok(mut guard) = sup.todos.lock() {
+                *guard = loaded.todos;
+            }
+        }
+
         sup.refresh_system_prompt();
-        sup.save().await.map_err(ProviderError::Other)?;
-        sup.update_last_session()
-            .await
-            .map_err(ProviderError::Other)?;
-        sup.run_session_hook(HookEventKind::SessionStart, json!(sup.snapshot()))
-            .await;
+        let _ = sup.agent.event_sender().and_then(|event_tx| {
+            event_tx
+                .try_send(AgentEvent::SessionStarted {
+                    session_id: sup.session_id.clone(),
+                    workspace: sup.workspace_root.clone(),
+                    model: sup.model.clone(),
+                })
+                .ok()
+        });
         Ok(sup)
     }
 
@@ -292,46 +331,36 @@ impl Supervisor {
         session_id: &str,
         approval_handler: Option<Arc<dyn ApprovalHandler>>,
     ) -> Result<Self, ProviderError> {
-        let mut sup = Self::create(SupervisorConfig {
-            config: config.clone(),
-            workspace_root: workspace_root.to_path_buf(),
-            safe_mode,
-            interactive_approvals,
-            session_id: Some(session_id.into()),
-            approval_handler,
-            orchestration_context: None,
-        })
-        .await?;
-
         let store = SessionStore::new(resolve_sessions_dir(&config, workspace_root));
         let loaded = store
             .load(session_id)
             .await
             .map_err(|e| ProviderError::Other(e.to_string()))?;
 
-        sup.session_id = loaded.meta.id.clone();
-        sup.workspace_root = loaded.meta.workspace.clone();
-        sup.model = loaded.meta.model.clone();
-        sup.agent.model = loaded.meta.model.clone();
-        sup.created_at = loaded.meta.created_at;
-        sup.status = loaded.meta.status;
-        sup.pid = Some(std::process::id());
-        sup.agent.messages = loaded.messages;
+        let mut config = config;
+        config
+            .provider
+            .set_model_for_default(loaded.meta.model.clone());
+        config.sync_default_model_from_provider();
+        let mut sup = Self::initialize(
+            SupervisorConfig {
+                config,
+                workspace_root: loaded.meta.workspace.clone(),
+                safe_mode,
+                interactive_approvals,
+                session_id: Some(loaded.meta.id.clone()),
+                approval_handler,
+                orchestration_context: None,
+            },
+            Some(loaded),
+        )
+        .await?;
         sup.session_store = store;
-        sup.worktree_path = loaded.meta.worktree_path;
-        sup.branch = loaded.meta.branch;
-        sup.base_branch = loaded.meta.base_branch;
-        sup.parent_session_id = loaded.meta.parent_session_id;
-        sup.child_session_ids = loaded.meta.child_session_ids;
-        sup.inherited_summary = loaded.meta.inherited_summary;
-        sup.spawn_reason = loaded.meta.spawn_reason;
-        sup.session_summary = loaded.meta.session_summary;
-        sup.orchestration = loaded.meta.orchestration;
-        if let Ok(mut guard) = sup.todos.lock() {
-            *guard = loaded.todos;
-        }
-        sup.context_manager = Self::make_context_manager(&sup.config, &sup.model).await;
-        sup.refresh_system_prompt();
+        sup.update_last_session()
+            .await
+            .map_err(ProviderError::Other)?;
+        sup.run_session_hook(HookEventKind::SessionStart, json!(sup.snapshot()))
+            .await;
         Ok(sup)
     }
 
@@ -1756,8 +1785,9 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
     use nca_common::config::{ProviderCompatibility, ProviderKind};
     use nca_common::event::AgentCommand;
-    use nca_common::message::Message;
+    use nca_common::message::{Message, Role};
     use nca_common::session::{SessionMeta, SessionState, SessionStatus};
+    use nca_common::todo::AgentTodo;
     use std::fs;
     use std::sync::mpsc as std_mpsc;
     use tiny_http::{Header, Response, Server};
@@ -1770,7 +1800,18 @@ mod tests {
         status: SessionStatus,
     ) {
         let config = nca_common::config::NcaConfig::default();
-        let sessions_dir = resolve_sessions_dir(&config, workspace);
+        write_session_for_test_with_config(workspace, id, updated_at, model, status, &config);
+    }
+
+    fn write_session_for_test_with_config(
+        workspace: &std::path::Path,
+        id: &str,
+        updated_at: chrono::DateTime<Utc>,
+        model: &str,
+        status: SessionStatus,
+        config: &nca_common::config::NcaConfig,
+    ) {
+        let sessions_dir = resolve_sessions_dir(config, workspace);
         std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
 
         let session = SessionState {
@@ -1802,6 +1843,36 @@ mod tests {
 
         let json = serde_json::to_string_pretty(&session).expect("serialize session");
         fs::write(sessions_dir.join(format!("{id}.json")), json).expect("write session");
+    }
+
+    fn spawn_openai_turn_server() -> (String, std_mpsc::Receiver<String>) {
+        let server = Server::http("127.0.0.1:0").expect("provider fixture");
+        let address = match server.server_addr() {
+            tiny_http::ListenAddr::IP(address) => address,
+            other => panic!("unsupported provider address: {other:?}"),
+        };
+        let (body_tx, body_rx) = std_mpsc::channel();
+        std::thread::spawn(move || {
+            let mut request = server.recv().expect("provider request");
+            let mut body = String::new();
+            request
+                .as_reader()
+                .read_to_string(&mut body)
+                .expect("read provider body");
+            body_tx.send(body).expect("capture provider body");
+            request
+                .respond(
+                    Response::from_string(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                    )
+                    .with_header(
+                        Header::from_bytes("Content-Type", "text/event-stream")
+                            .expect("content type header"),
+                    ),
+                )
+                .expect("provider response");
+        });
+        (format!("http://{address}"), body_rx)
     }
 
     #[tokio::test]
@@ -1874,6 +1945,171 @@ mod tests {
 
         supervisor.finish(EndReason::Completed).await;
         unsafe { std::env::remove_var("NCA_HOME") };
+    }
+
+    #[tokio::test]
+    async fn refreshing_harness_replaces_generated_prompt_without_reordering_history() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut config = nca_common::config::NcaConfig::default();
+        config.session.history_dir = workspace.path().join("sessions");
+        config.session.last_session_file = workspace.path().join("last-session");
+        config.memory.file_path = workspace.path().join("memory.json");
+        config.provider.default = ProviderKind::Custom;
+        config.provider.custom.base_url = "http://127.0.0.1:1".into();
+        config.provider.custom.api_key = Some("test-key".into());
+        config.provider.custom.model = "test-model".into();
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAi;
+        config.model.default_model = "test-model".into();
+        config.memory.context.auto_detect_context_window = false;
+        config.memory.context.query_provider_models_api = false;
+
+        let mut supervisor = Supervisor::create(SupervisorConfig {
+            config,
+            workspace_root: workspace.path().to_path_buf(),
+            safe_mode: true,
+            interactive_approvals: false,
+            session_id: Some("prompt-refresh-test".into()),
+            approval_handler: None,
+            orchestration_context: None,
+        })
+        .await
+        .expect("create supervisor");
+        supervisor.agent_mut().messages.extend([
+            Message::user("hello"),
+            Message::assistant("answer"),
+            Message::tool("call-1", "tool result"),
+        ]);
+
+        supervisor.refresh_system_prompt();
+        supervisor.refresh_system_prompt();
+
+        let messages = &supervisor.agent().messages;
+        assert_eq!(
+            messages.iter().filter(|m| m.role == Role::System).count(),
+            1
+        );
+        assert_eq!(messages[0].role, Role::System);
+        assert_eq!(
+            messages[1..]
+                .iter()
+                .map(|m| m.role.clone())
+                .collect::<Vec<_>>(),
+            vec![Role::User, Role::Assistant, Role::Tool]
+        );
+        assert_eq!(messages[1].content, Message::user("hello").content);
+        assert_eq!(messages[2].content, Message::assistant("answer").content);
+        assert_eq!(
+            messages[3].content,
+            Message::tool("call-1", "tool result").content
+        );
+
+        supervisor.finish(EndReason::Completed).await;
+    }
+
+    #[tokio::test]
+    async fn resume_restores_persisted_state_before_initializing_runtime() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let bootstrap_workspace = tempfile::tempdir().expect("bootstrap workspace");
+        let (base_url, body_rx) = spawn_openai_turn_server();
+        let mut config = nca_common::config::NcaConfig::default();
+        config.session.history_dir = workspace.path().join("sessions");
+        config.session.last_session_file = workspace.path().join("last-session");
+        config.memory.file_path = workspace.path().join("memory.json");
+        config.provider.default = ProviderKind::Custom;
+        config.provider.custom.base_url = base_url;
+        config.provider.custom.api_key = Some("test-key".into());
+        config.provider.custom.model = "bootstrap-model".into();
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAi;
+        config.model.default_model = "bootstrap-model".into();
+        config.memory.context.auto_detect_context_window = false;
+        config.memory.context.query_provider_models_api = false;
+        write_session_for_test_with_config(
+            workspace.path(),
+            "resume-state-test",
+            Utc::now(),
+            "restored-model",
+            SessionStatus::Running,
+            &config,
+        );
+        let store = SessionStore::new(resolve_sessions_dir(&config, workspace.path()));
+        let mut seeded = store
+            .load("resume-state-test")
+            .await
+            .expect("seeded session");
+        seeded.meta.child_session_ids = vec!["child-1".into()];
+        seeded.meta.inherited_summary = Some("inherited context".into());
+        seeded.todos = vec![AgentTodo {
+            id: "todo-1".into(),
+            content: "preserve this todo".into(),
+            status: Default::default(),
+            source: None,
+        }];
+        store.save(&seeded).await.expect("save seeded session");
+
+        let mut supervisor = Supervisor::resume(
+            config.clone(),
+            bootstrap_workspace.path(),
+            true,
+            false,
+            "resume-state-test",
+            None,
+        )
+        .await
+        .expect("resume supervisor");
+
+        assert_eq!(supervisor.model, "restored-model");
+        let messages = &supervisor.agent().messages;
+        assert_eq!(
+            messages.iter().filter(|m| m.role == Role::System).count(),
+            1
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| m.role != Role::System)
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![Message::user("hello")]
+        );
+
+        let persisted = store
+            .load("resume-state-test")
+            .await
+            .expect("persisted session");
+        assert_eq!(persisted.meta.model, "restored-model");
+        assert_eq!(persisted.messages, vec![Message::user("hello")]);
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.child_session_ids, vec!["child-1"]);
+        assert_eq!(
+            snapshot.inherited_summary.as_deref(),
+            Some("inherited context")
+        );
+        assert_eq!(snapshot.todos, seeded.todos);
+
+        let output = supervisor
+            .run_turn("continue the session")
+            .await
+            .expect("run resumed turn");
+        assert_eq!(output, "ok");
+        let request_body = body_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("resumed provider body");
+        let payload: serde_json::Value =
+            serde_json::from_str(&request_body).expect("OpenAI request JSON");
+        assert_eq!(payload["model"], "restored-model");
+        let messages = payload["messages"].as_array().expect("messages array");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message["role"] == "system")
+                .count(),
+            1
+        );
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["content"], "hello");
+        assert_eq!(messages[2]["content"], "continue the session");
+
+        supervisor.finish(EndReason::Completed).await;
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@ use chrono::NaiveDate;
 use futures_util::future::join_all;
 use nca_common::config::SmartCompactionMode;
 use nca_common::event::{AgentEvent, BusyState};
-use nca_common::message::{ContentPart, ImageAttachment, Message, MessageToolCall};
+use nca_common::message::{ContentPart, ImageAttachment, Message, MessageToolCall, Role};
 use nca_common::tool::{PermissionTier, ToolCall, ToolDefinition, ToolResult};
 use serde_json::json;
 use std::collections::HashSet;
@@ -82,9 +82,10 @@ impl AgentLoop {
         self.smart_compaction_mode
     }
 
-    /// Add a system prompt once at startup.
+    /// Replace the runtime-owned system prompt while preserving conversation history.
     pub fn set_system_prompt(&mut self, prompt: impl Into<String>) {
-        self.messages.push(Message::system(prompt));
+        self.messages.retain(|message| message.role != Role::System);
+        self.messages.insert(0, Message::system(prompt));
     }
 
     /// Replace the LLM provider (e.g. after user switches provider in-session).

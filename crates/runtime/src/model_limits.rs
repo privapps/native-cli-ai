@@ -177,8 +177,8 @@ pub const MODEL_CONTEXT_LIMITS: &[ModelContextLimits] = &[
     // Default for unknown models
     ModelContextLimits {
         pattern: "*",
-        context_window: 32_000,
-        max_output_tokens: 4096,
+        context_window: 128_000,
+        max_output_tokens: 128_000,
     },
 ];
 
@@ -193,7 +193,7 @@ pub fn detect_context_window(model: &str) -> usize {
     }
 
     // Fallback
-    32_000
+    128_000
 }
 
 /// Detect the max output tokens for a given model name.
@@ -207,7 +207,7 @@ pub fn detect_max_output_tokens(model: &str) -> usize {
     }
 
     // Fallback
-    4096
+    128_000
 }
 
 /// Get both context window and max output tokens for a model.
@@ -260,7 +260,8 @@ mod tests {
 
     #[test]
     fn test_fallback() {
-        assert_eq!(detect_context_window("unknown-model-xyz"), 32_000);
+        assert_eq!(detect_context_window("unknown-model-xyz"), 128_000);
+        assert_eq!(detect_max_output_tokens("unknown-model-xyz"), 128_000);
     }
 
     #[test]

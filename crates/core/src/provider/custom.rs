@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::Path;
+use std::path::PathBuf;
 
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use nca_common::config::{
@@ -998,6 +1001,8 @@ pub struct CustomProvider {
     config: CustomProviderConfig,
     max_tokens: u32,
     reasoning_effort: String,
+    debug_requests: bool,
+    debug_log_path: PathBuf,
 }
 
 impl CustomProvider {
@@ -1029,7 +1034,31 @@ impl CustomProvider {
             config: custom,
             max_tokens: config.model.max_tokens,
             reasoning_effort: config.model.reasoning_effort.clone(),
+            debug_requests: request_debug_enabled(),
+            debug_log_path: PathBuf::from("debug.log"),
         })
+    }
+
+    #[cfg(test)]
+    fn with_debug_log_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.debug_log_path = path.into();
+        self
+    }
+
+    #[cfg(test)]
+    fn with_debug_requests(mut self, enabled: bool) -> Self {
+        self.debug_requests = enabled;
+        self
+    }
+
+    fn emit_debug_request(&self, request: &reqwest::Request, api_key: &str, protocol: &str) {
+        let output = format_debug_request(request, api_key, protocol);
+        if let Err(error) = append_debug_log(&self.debug_log_path, &output) {
+            eprintln!(
+                "nca: failed to write custom provider request diagnostics to {}: {error}",
+                self.debug_log_path.display()
+            );
+        }
     }
 }
 
@@ -1107,12 +1136,103 @@ fn map_custom_provider_error(
 }
 
 fn sanitize_provider_error(body: &str, api_key: &str) -> String {
-    let body = body.replace(api_key, "[REDACTED]");
+    let body = redact_debug_value(body, api_key);
     let body = body.trim();
     if body.is_empty() {
         return "custom provider returned an empty error response".into();
     }
     body.chars().take(512).collect()
+}
+
+fn debug_request_enabled(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+fn request_debug_enabled() -> bool {
+    debug_request_enabled(std::env::var("NCA_DEBUG_REQUEST").ok().as_deref())
+}
+
+fn redact_debug_value(value: &str, api_key: &str) -> String {
+    if api_key.is_empty() {
+        value.to_string()
+    } else {
+        value.replace(api_key, "[REDACTED]")
+    }
+}
+
+fn append_debug_log(path: &Path, record: &str) -> std::io::Result<()> {
+    let mut file = open_debug_log(path)?;
+    file.write_all(record.as_bytes())
+}
+
+fn open_debug_log(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+fn format_debug_request(request: &reqwest::Request, api_key: &str, protocol: &str) -> String {
+    let url = redact_debug_value(request.url().as_str(), api_key);
+    let mut output = format!(
+        "[{}] custom {protocol} request\nmethod: {}\nurl: {url}\nheaders:\n",
+        chrono::Utc::now().to_rfc3339(),
+        request.method()
+    );
+
+    for (name, value) in request.headers() {
+        let value = if name.as_str().eq_ignore_ascii_case("authorization")
+            || name.as_str().eq_ignore_ascii_case("x-api-key")
+        {
+            "[REDACTED]".to_string()
+        } else {
+            redact_debug_value(value.to_str().unwrap_or("[INVALID HEADER]"), api_key)
+        };
+        output.push_str(&format!("  {name}: {value}\n"));
+    }
+
+    if let Some(body) = request.body().and_then(reqwest::Body::as_bytes) {
+        output.push_str("body:\n");
+        output.push_str(&format_debug_body(body, api_key));
+        output.push('\n');
+    }
+
+    output.push('\n');
+    output
+}
+
+fn format_debug_body(body: &[u8], api_key: &str) -> String {
+    let body = String::from_utf8_lossy(body);
+    match serde_json::from_str::<Value>(&body) {
+        Ok(mut value) => {
+            redact_debug_json_value(&mut value, api_key);
+            serde_json::to_string_pretty(&value)
+                .map(|pretty| redact_debug_value(&pretty, api_key))
+                .unwrap_or_else(|_| redact_debug_value(&body, api_key))
+        }
+        Err(_) => redact_debug_value(&body, api_key),
+    }
+}
+
+fn redact_debug_json_value(value: &mut Value, api_key: &str) {
+    match value {
+        Value::String(value) => *value = redact_debug_value(value, api_key),
+        Value::Array(values) => {
+            for value in values {
+                redact_debug_json_value(value, api_key);
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values_mut() {
+                redact_debug_json_value(value, api_key);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
 }
 
 #[async_trait::async_trait]
@@ -1146,9 +1266,23 @@ impl Provider for CustomProvider {
             &self.reasoning_effort,
             workspace_root,
         )?;
-        let response = adapter
+        let request = adapter
             .chat_request(&self.client, &self.config.base_url, body, &api_key)?
-            .send()
+            .build()
+            .map_err(|error| request_failed(&error.to_string(), &api_key))?;
+
+        if self.debug_requests
+            && matches!(
+                self.config.compatibility,
+                ProviderCompatibility::OpenAi | ProviderCompatibility::OpenAiResponses
+            )
+        {
+            self.emit_debug_request(&request, &api_key, adapter.protocol_name());
+        }
+
+        let response = self
+            .client
+            .execute(request)
             .await
             .map_err(|error| request_failed(&error.to_string(), &api_key))?;
 
@@ -1317,7 +1451,12 @@ mod tests {
         config.provider.custom.api_key = Some("custom-test-key".into());
         config.provider.custom.base_url = base_url;
 
-        let provider = CustomProvider::from_config(&config).expect("provider");
+        let debug_dir = tempfile::tempdir().expect("debug directory");
+        let debug_path = debug_dir.path().join("debug.log");
+        let provider = CustomProvider::from_config(&config)
+            .expect("provider")
+            .with_debug_log_path(&debug_path)
+            .with_debug_requests(true);
         let stream = provider
             .chat(&[Message::user("hello")], &[], "", Path::new("."))
             .await
@@ -1328,6 +1467,41 @@ mod tests {
             chunks.as_slice(),
             [StreamChunk::Error(message)] if message.contains("empty")
         ));
+        let debug_output = std::fs::read_to_string(debug_path).expect("debug log");
+        assert!(debug_output.contains("custom OpenAI-compatible request"));
+        assert!(!debug_output.contains("empty completion"));
+    }
+
+    #[tokio::test]
+    async fn request_debug_log_failure_does_not_block_custom_request() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let base_url = spawn_sse_server(body.to_string(), 200, |_| {});
+        let mut config = NcaConfig::default();
+        config.provider.custom.api_key = Some("custom-test-key".into());
+        config.provider.custom.base_url = base_url;
+
+        let debug_dir = tempfile::tempdir().expect("debug directory");
+        let debug_path = debug_dir.path().join("missing").join("debug.log");
+        let provider = CustomProvider::from_config(&config)
+            .expect("provider")
+            .with_debug_log_path(&debug_path)
+            .with_debug_requests(true);
+
+        let stream = provider
+            .chat(&[Message::user("hello")], &[], "", Path::new("."))
+            .await
+            .expect("chat stream");
+        let chunks = collect_chunks(stream).await;
+
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| matches!(chunk, StreamChunk::Done))
+        );
+        assert!(!debug_path.exists());
     }
 
     #[tokio::test]
@@ -1544,7 +1718,12 @@ mod tests {
         config.provider.custom.model = "custom-openai-model".into();
         config.model.reasoning_effort = "  low  ".into();
 
-        let provider = CustomProvider::from_config(&config).expect("provider");
+        let debug_dir = tempfile::tempdir().expect("debug directory");
+        let debug_path = debug_dir.path().join("debug.log");
+        let provider = CustomProvider::from_config(&config)
+            .expect("provider")
+            .with_debug_log_path(&debug_path)
+            .with_debug_requests(true);
         let stream = provider
             .chat(
                 &[Message::user("hello")],
@@ -1587,6 +1766,13 @@ mod tests {
                 output_tokens: 2
             }
         ));
+        let debug_output = std::fs::read_to_string(debug_path).expect("debug log");
+        assert!(debug_output.contains("custom OpenAI-compatible request"));
+        assert!(debug_output.contains("method: POST"));
+        assert!(debug_output.contains("/v1/chat/completions"));
+        assert!(debug_output.contains("\"model\": \"custom-openai-model\""));
+        assert!(debug_output.contains("authorization: [REDACTED]"));
+        assert!(!debug_output.contains("data: "));
     }
 
     #[tokio::test]
@@ -1611,7 +1797,12 @@ mod tests {
         config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
         config.provider.custom.model = "responses-model".into();
 
-        let provider = CustomProvider::from_config(&config).expect("provider");
+        let debug_dir = tempfile::tempdir().expect("debug directory");
+        let debug_path = debug_dir.path().join("debug.log");
+        let provider = CustomProvider::from_config(&config)
+            .expect("provider")
+            .with_debug_log_path(&debug_path)
+            .with_debug_requests(true);
         let stream = provider
             .chat(
                 &[Message::system("be helpful"), Message::user("hello")],
@@ -1650,6 +1841,13 @@ mod tests {
             }
         ));
         assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
+        let debug_output = std::fs::read_to_string(debug_path).expect("debug log");
+        assert!(debug_output.contains("custom OpenAI Responses request"));
+        assert!(debug_output.contains("method: POST"));
+        assert!(debug_output.contains("/v1/responses"));
+        assert!(debug_output.contains("\"model\": \"responses-model\""));
+        assert!(debug_output.contains("authorization: [REDACTED]"));
+        assert!(!debug_output.contains("event: "));
     }
 
     #[tokio::test]
@@ -2105,7 +2303,12 @@ mod tests {
         config.provider.custom.model = "custom-anthropic-model".into();
         config.model.reasoning_effort = "high".into();
 
-        let provider = CustomProvider::from_config(&config).expect("provider");
+        let debug_dir = tempfile::tempdir().expect("debug directory");
+        let debug_path = debug_dir.path().join("debug.log");
+        let provider = CustomProvider::from_config(&config)
+            .expect("provider")
+            .with_debug_log_path(&debug_path)
+            .with_debug_requests(true);
         let stream = provider
             .chat(
                 &[Message::user("hello")],
@@ -2155,6 +2358,7 @@ mod tests {
             &chunks[0],
             StreamChunk::ToolUse(call) if call.name == "lookup" && call.input == json!({"path":"src"})
         ));
+        assert!(!debug_path.exists());
     }
 
     #[tokio::test]
@@ -2242,5 +2446,77 @@ mod tests {
                 .iter()
                 .any(|chunk| matches!(chunk, StreamChunk::Done))
         );
+    }
+
+    #[test]
+    fn request_debugging_requires_exact_one_value() {
+        assert!(!debug_request_enabled(None));
+        assert!(!debug_request_enabled(Some("")));
+        assert!(!debug_request_enabled(Some("0")));
+        assert!(!debug_request_enabled(Some("true")));
+        assert!(!debug_request_enabled(Some(" 1")));
+        assert!(debug_request_enabled(Some("1")));
+    }
+
+    #[test]
+    fn request_debug_output_includes_request_and_redacts_credentials() {
+        let request = reqwest::Client::new()
+            .post("https://gateway.example/v1/chat/completions?token=request-secret")
+            .header("authorization", "Bearer request-secret")
+            .header("x-api-key", "request-secret")
+            .json(&json!({"message": "request-secret"}))
+            .build()
+            .expect("request");
+
+        let output = format_debug_request(&request, "request-secret", "OpenAI-compatible");
+
+        assert!(output.starts_with('['));
+        assert!(output.contains("] custom OpenAI-compatible request\n"));
+        assert!(output.contains("method: POST"));
+        assert!(output.contains("url: https://gateway.example/v1/chat/completions"));
+        assert!(output.contains("token=[REDACTED]"));
+        assert!(output.contains("  authorization: [REDACTED]"));
+        assert!(output.contains("  x-api-key: [REDACTED]"));
+        assert!(output.contains("body:\n{\n  \"message\": \"[REDACTED]\"\n}"));
+        assert!(!output.contains("request-secret"));
+    }
+
+    #[test]
+    fn request_debug_log_appends_records_without_logging_responses() {
+        let temp_dir = tempfile::tempdir().expect("debug directory");
+        let path = temp_dir.path().join("debug.log");
+        let request = reqwest::Client::new()
+            .post("https://gateway.example/v1/responses")
+            .json(&json!({"model": "test-model", "input": "hello"}))
+            .build()
+            .expect("request");
+
+        append_debug_log(
+            &path,
+            &format_debug_request(&request, "unused-secret", "OpenAI Responses"),
+        )
+        .expect("first log record");
+        append_debug_log(
+            &path,
+            &format_debug_request(&request, "unused-secret", "OpenAI Responses"),
+        )
+        .expect("second log record");
+
+        let output = std::fs::read_to_string(path).expect("debug log");
+        assert_eq!(output.matches("custom OpenAI Responses request").count(), 2);
+        assert!(
+            output.contains("body:\n{\n  \"input\": \"hello\",\n  \"model\": \"test-model\"\n}")
+        );
+        assert!(!output.contains("response.completed"));
+    }
+
+    #[test]
+    fn request_debug_log_failure_is_reported_without_writing_a_file() {
+        let temp_dir = tempfile::tempdir().expect("debug directory");
+        let path = temp_dir.path().join("missing").join("debug.log");
+        let error = append_debug_log(&path, "request diagnostic\n")
+            .expect_err("missing parent directory prevents log creation");
+        assert!(error.kind() == std::io::ErrorKind::NotFound);
+        assert!(!path.exists());
     }
 }

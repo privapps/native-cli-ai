@@ -124,7 +124,7 @@ impl Provider for MiniMaxProvider {
             workspace_root,
         )?;
 
-        if std::env::var("NCA_DEBUG_REQUEST").is_ok() {
+        if std::env::var("NCA_DEBUG_REQUEST").ok().as_deref() == Some("1") {
             eprintln!(
                 "[minimax:request] {}",
                 serde_json::to_string_pretty(&body).unwrap_or_default()

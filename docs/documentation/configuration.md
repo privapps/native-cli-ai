@@ -98,6 +98,21 @@ Custom providers using `compatibility = "openai-responses"` retain the shared
 in Responses requests. Some Responses models reject that parameter; omitting it
 keeps the request valid while `max_tokens` is still sent as `max_output_tokens`.
 
+### Custom provider request diagnostics
+
+Set `NCA_DEBUG_REQUEST=1` to append request-only diagnostics for custom providers
+using `compatibility = "openai"` or `compatibility = "openai-responses"` to
+`./debug.log`. Each timestamped record contains the final HTTP method, URL,
+redacted headers, and pretty-printed JSON request body. The log is append-only
+across requests and runs.
+
+Only the exact value `1` enables this behavior. Custom Anthropic requests are
+not logged. Responses, streamed events, provider errors, and completion output
+are never written to the file. Authorization and API-key values are redacted,
+but request bodies can still contain prompts, file contents, images, and tool
+schemas, so protect `debug.log` appropriately. If the file cannot be written,
+nca warns on stderr and continues the provider request.
+
 ### `[permissions]` — Permission System
 
 ```toml
@@ -175,6 +190,12 @@ smart_compaction_mode = "off"          # off | dry_run | on (provider-request vi
 ```
 
 `smart_compaction_mode` is opt-in and defaults to `off`:
+
+When context auto-detection is enabled, provider catalog values take precedence
+over the built-in model table. Unknown models use a 128,000-token fallback for
+both context-window sizing and the recommended output limit. The recommended
+output limit is model metadata; it does not change the configured
+`model.max_tokens` request budget.
 
 | Mode | Behavior |
 |------|----------|
@@ -263,10 +284,12 @@ Environment variables override config file values.
 | `NCA_MEMORY_PATH` | Override memory file path |
 | `NCA_WEB_TIMEOUT_SECS` | Override web request timeout |
 | `NCA_WEB_MAX_FETCH_CHARS` | Override max characters for web fetches |
-| `NCA_DEBUG_REQUEST` | Enable debug logging for MiniMax requests |
+| `NCA_DEBUG_REQUEST` | Set to `1` to print MiniMax request bodies to stderr or append custom OpenAI-compatible request method, URL, redacted headers, and body to `./debug.log`; response data is never logged |
 | `NCA_SKIP_CONTEXT_API` | Set to `1` to skip provider model API queries |
 | `NCA_CONTEXT_API_CACHE_TTL_SECS` | Cache TTL for model context API |
 | `XDG_RUNTIME_DIR` | IPC socket directory (fallback: `/tmp/nca/`) |
+
+Custom-provider request bodies may contain prompts, file contents, images, and tool schemas; review diagnostic output before sharing it.
 
 ### Orchestration (CI/Automation)
 

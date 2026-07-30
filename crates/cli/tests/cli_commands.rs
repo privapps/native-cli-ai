@@ -526,6 +526,63 @@ reasoning_effort = "low"
 }
 
 #[test]
+fn config_json_preserves_configured_max_tokens_without_cli_override() {
+    let temp = tempdir().expect("tempdir");
+    write_local_config_contents(
+        temp.path(),
+        r#"
+[model]
+max_tokens = 64000
+"#,
+    );
+
+    let output = Command::cargo_bin("nca")
+        .expect("binary")
+        .current_dir(temp.path())
+        .env("HOME", temp.path())
+        .env_remove("NCA_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .arg("config")
+        .arg("--json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let payload: Value = serde_json::from_slice(&output).expect("json");
+    assert_eq!(payload["model"]["max_tokens"], 64000);
+}
+
+#[test]
+fn max_tokens_cli_override_takes_precedence_over_config() {
+    let temp = tempdir().expect("tempdir");
+    write_local_config_contents(
+        temp.path(),
+        r#"
+[model]
+max_tokens = 64000
+"#,
+    );
+
+    let output = Command::cargo_bin("nca")
+        .expect("binary")
+        .current_dir(temp.path())
+        .env("HOME", temp.path())
+        .env_remove("NCA_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .args(["--max-tokens", "12345", "config", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let payload: Value = serde_json::from_slice(&output).expect("json");
+    assert_eq!(payload["model"]["max_tokens"], 12345);
+}
+
+#[test]
 fn reasoning_effort_cli_override_is_run_scoped() {
     let temp = tempdir().expect("tempdir");
     write_local_config_contents(

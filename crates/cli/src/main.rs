@@ -67,8 +67,8 @@ struct Cli {
     reasoning_effort: Option<String>,
 
     /// Max response tokens
-    #[arg(long, default_value = "8192")]
-    max_tokens: u32,
+    #[arg(long)]
+    max_tokens: Option<u32>,
 
     /// Verbose debug logging
     #[arg(short, long)]
@@ -396,7 +396,9 @@ async fn try_main() -> anyhow::Result<()> {
         config.apply_model_override(model);
     }
 
-    config.model.max_tokens = cli.max_tokens;
+    if let Some(max_tokens) = cli.max_tokens {
+        config.model.max_tokens = max_tokens;
+    }
     if cli.enable_thinking {
         config.model.enable_thinking = true;
         config.model.thinking_budget = cli.thinking_budget;

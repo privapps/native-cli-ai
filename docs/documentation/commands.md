@@ -21,13 +21,16 @@ When invoked without a subcommand, nca starts an interactive session. Behavior d
 | `--enable-thinking` | `-t` | flag | false | Enable extended thinking/reasoning |
 | `--thinking-budget` | — | u32 | 5120 | Token budget for extended thinking |
 | `--reasoning-effort` | — | string | `nil` | OpenAI-compatible Chat/Responses reasoning effort for this invocation |
-| `--max-tokens` | — | u32 | 8192 | Max response tokens |
+| `--max-tokens` | — | u32 | `[model].max_tokens` | Max response tokens for this invocation |
 | `--verbose` | `-v` | flag | false | Verbose debug logging |
 | `--json` | — | flag | false | Output structured JSON (for CI) |
 | `--stream` | — | enum | `human` | Stream format: `human`, `ndjson`, or `off` |
 | `--no-tui` | — | flag | false | Use line-oriented REPL instead of full-screen TUI |
 | `--permission-mode` | — | enum | — | Permission mode (see [Permissions](./permissions.md)) |
 | `--max-turns` | — | u32 | — | Max agent turns per run |
+
+When `--max-tokens` is omitted, the configured `[model].max_tokens` value is
+used. An explicit `--max-tokens` value overrides it for that invocation only.
 
 ### Examples
 
