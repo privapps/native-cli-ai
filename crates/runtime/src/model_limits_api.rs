@@ -889,6 +889,13 @@ mod tests {
                 if settings.provider == ProviderKind::Custom
                     && protocol == CustomCapabilityAdapter::Anthropic
         ));
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
+        assert!(matches!(
+            ProviderCapabilityAdapter::from_config(&config),
+            ProviderCapabilityAdapter::Custom { settings, protocol }
+                if settings.provider == ProviderKind::Custom
+                    && protocol == CustomCapabilityAdapter::OpenAi
+        ));
     }
 
     #[tokio::test]
@@ -1020,6 +1027,44 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("authorization: bearer custom-openai-key\r\n")
         );
+    }
+
+    #[tokio::test]
+    async fn custom_responses_discovery_requests_v1_models_and_is_best_effort() {
+        let (base_url, server) = spawn_model_fixture(
+            200,
+            r#"{"data":[{"id":"responses-zeta"},{"id":"responses-alpha"}]}"#,
+        );
+        let mut config = NcaConfig::default();
+        config.provider.default = ProviderKind::Custom;
+        config.provider.custom.base_url = format!("{base_url}/zen/v1/");
+        config.provider.custom.api_key = Some("custom-responses-key".into());
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
+
+        let ids = fetch_provider_model_ids(&config).await;
+        let request = server.join().expect("model fixture thread");
+
+        assert_eq!(ids, vec!["responses-alpha", "responses-zeta"]);
+        assert!(request.starts_with("GET /zen/v1/models HTTP/1.1\r\n"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer custom-responses-key\r\n")
+        );
+
+        for (status, body) in [
+            (200, r#"{"data":[]}"#),
+            (200, r#"{"data":"malformed"}"#),
+            (401, r#"{"error":"unauthorized"}"#),
+        ] {
+            let (base_url, server) = spawn_model_fixture(status, body);
+            config.provider.custom.base_url = base_url;
+            assert!(
+                fetch_provider_model_ids(&config).await.is_empty(),
+                "Responses discovery must remain best-effort for status {status}"
+            );
+            let _ = server.join().expect("best-effort model fixture thread");
+        }
     }
 
     #[tokio::test]
