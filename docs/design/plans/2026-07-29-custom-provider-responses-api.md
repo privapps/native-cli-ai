@@ -21,17 +21,17 @@ Add OpenAI Responses API support to the existing Custom provider without changin
 
 1. [x] Add the `OpenAI Responses` compatibility value, dispatch it through Custom provider construction, and make a basic streamed text request work with full history, bearer auth, `stream: true`, and `store: false`.
 2. [x] Add native Responses function tools, function-call argument streaming, multiple calls, function-call outputs, and tool-loop coverage.
-3. [x] Add image input mapping and generation-setting support for `max_output_tokens` and nested reasoning effort; omit model-dependent `temperature` from Responses requests.
+3. [x] Add image input mapping and generation-setting support for `max_output_tokens`, configured `temperature`, and nested reasoning effort.
 4. [x] Complete best-effort model discovery, save-anyway/setup surface coverage, diagnostics, documentation, and legacy-provider regression verification.
 5. [x] Run formatting, Clippy, focused tests, the full workspace suite, and a final requirement-by-requirement audit against the approved spec and tickets.
-6. [x] Follow up on model-specific Responses compatibility: omit the unsupported `temperature` field, add a regression fixture for the reported API error, and document the behavior.
+6. [x] Follow up on Responses generation-setting behavior: preserve configured `temperature`, add a regression fixture for provider rejection, and document the behavior.
 
 ## Invariants
 
 - Existing `openai` Custom configuration continues to mean Chat Completions.
 - Built-in OpenAI remains on its current Chat Completions path.
 - Responses requests do not use `previous_response_id` and set `store` to false.
-- Responses requests omit `temperature`; model support for that field varies and sending the configured default can make otherwise valid requests fail.
+- Responses requests preserve configured `temperature`; model support remains provider-defined, and rejected settings fail without rewriting or fallback.
 - Unsupported hosted Responses tools are not emitted or silently enabled.
 - Unknown SSE event types may be ignored, but malformed known events, provider failures, transport failures, invalid tool arguments, and empty completions fail explicitly.
 - Provider credentials and endpoint secrets are never exposed in diagnostics.

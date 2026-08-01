@@ -38,7 +38,7 @@ Existing built-in OpenAI behavior and existing Custom OpenAI-compatible Chat Com
 19. As a multimodal user, I want existing Custom image attachments mapped to Responses input-image blocks, so that image-enabled workflows remain available.
 20. As a user with an unreadable or unsupported attachment, I want a clear request error, so that nca never silently drops an image.
 21. As a user configuring a model, I want `max_tokens` mapped to `max_output_tokens`, so that the existing output budget remains meaningful.
-22. As a user connecting a Responses model, I want nca to omit unsupported generation fields, so that a model that rejects `temperature` can still receive a valid request.
+22. As a user connecting a Responses model, I want nca to preserve configured generation fields, so that the provider receives the settings I selected and can report incompatibilities explicitly.
 23. As a user configuring reasoning effort, I want the value mapped to the Responses `reasoning.effort` field, so that supported reasoning models can use the existing setting.
 24. As a user with an unsupported reasoning or generation setting, I want the provider rejection surfaced normally, so that nca does not conceal incompatibilities through silent retries.
 25. As a user with a provider that supports model listing, I want `/models` discovery to continue working, so that I can inspect available model IDs.
@@ -65,7 +65,7 @@ Existing built-in OpenAI behavior and existing Custom OpenAI-compatible Chat Com
 - Expose only existing nca function tools. Do not support OpenAI-hosted tools or other Responses tool types in this feature.
 - Map text and existing image attachments to the corresponding Responses input content blocks. Reuse current attachment loading, workspace-root resolution, and vision-capability checks.
 - Send `stream: true` and `store: false` on every Responses inference request. There is no non-streaming fallback.
-- Map the existing output-token budget to `max_output_tokens`. Omit `temperature` from Responses requests because model support varies; keep the configured value for the existing Chat Completions and Anthropic-compatible paths. Do not infer model capabilities or automatically retry after provider rejection.
+- Map the existing output-token budget to `max_output_tokens` and preserve configured `temperature` in Responses requests. Do not infer model capabilities or automatically retry after provider rejection.
 - When reasoning effort is configured and is not empty or `nil`, send it as `reasoning: { effort: <value> }`; omit the field otherwise. Preserve configured values unchanged and surface provider rejection normally.
 - Parse the official Responses streaming events needed by nca, including text deltas, function-call argument deltas/completion, usage, response completion, and response failure. Ignore unknown event types for forward compatibility.
 - A completed response must yield text or at least one valid function call. Malformed known events, explicit provider failure events, transport failures, invalid function arguments, and empty completions become explicit provider errors.
@@ -76,8 +76,8 @@ Existing built-in OpenAI behavior and existing Custom OpenAI-compatible Chat Com
 ## Testing Decisions
 
 - Prefer the highest existing seam: exercise the public Custom provider chat contract against deterministic local HTTP fixtures and assert externally observable requests, headers, streamed events, and provider outcomes. Add only narrow unit coverage for pure request/event transformations where the public seam cannot isolate malformed inputs.
-- Extend the existing Custom-provider request-capture tests with Responses endpoint construction, `/v1` path prefixes, bearer authentication, `stream`, `store`, model, token-budget, omitted-temperature, and reasoning fields.
-- Include a regression fixture where the gateway returns `Unsupported parameter: 'temperature' is not supported with this model.` when that field is present, and assert the request succeeds without it.
+- Extend the existing Custom-provider request-capture tests with Responses endpoint construction, `/v1` path prefixes, bearer authentication, `stream`, `store`, model, token-budget, preserved temperature, and reasoning fields.
+- Include a regression fixture where the gateway rejects a configured `temperature`, and assert that the original provider error is surfaced without rewriting or retrying the request.
 - Verify native input mapping for system, user, assistant, tool, text, image, function-call, and function-call-output items, including full-history replay and multiple tool calls.
 - Verify function-tool declarations use the Responses shape and that unsupported built-in tool types are rejected rather than emitted.
 - Feed deterministic SSE fixtures containing text deltas, split function arguments, multiple function calls, usage, completion, unknown events, malformed known events, provider failures, transport failures, and empty responses. Assert the existing `StreamChunk` behavior and explicit errors.

@@ -532,6 +532,7 @@ fn responses_request_body(
     reasoning_effort: &str,
     workspace_root: &Path,
 ) -> Result<Value, ProviderError> {
+    let responses_tools = responses_tool_definitions(tools)?;
     let mut input = Vec::new();
     for message in messages {
         match message.role {
@@ -579,20 +580,8 @@ fn responses_request_body(
         "temperature": temperature,
     });
 
-    if !tools.is_empty() {
-        body["tools"] = Value::Array(
-            tools
-                .iter()
-                .map(|tool| {
-                    serde_json::json!({
-                        "type": "function",
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.parameters,
-                    })
-                })
-                .collect(),
-        );
+    if !responses_tools.is_empty() {
+        body["tools"] = Value::Array(responses_tools);
     }
 
     let reasoning_effort = reasoning_effort.trim();
@@ -601,6 +590,24 @@ fn responses_request_body(
     }
 
     Ok(body)
+}
+
+fn responses_tool_definitions(tools: &[ToolDefinition]) -> Result<Vec<Value>, ProviderError> {
+    let mut definitions = Vec::with_capacity(tools.len());
+    for tool in tools {
+        if let Some(tool_type) = tool.hosted_tool_type() {
+            return Err(ProviderError::RequestFailed(format!(
+                "OpenAI Responses does not support hosted tool `{tool_type}`; only native function tools are supported"
+            )));
+        }
+        definitions.push(serde_json::json!({
+            "type": "function",
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": tool.parameters,
+        }));
+    }
+    Ok(definitions)
 }
 
 fn message_content_text(content: &MessageContent) -> String {
@@ -2453,6 +2460,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn custom_openai_responses_rejects_hosted_tools_before_transmission() {
+        let mut config = NcaConfig::default();
+        config.provider.custom.api_key = Some("custom-test-key".into());
+        config.provider.custom.base_url = "http://127.0.0.1:1".into();
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
+        let provider = CustomProvider::from_config(&config).expect("provider");
+        let hosted_tool = ToolDefinition::hosted(
+            "web_search_preview",
+            "Search the web",
+            json!({"search_context_size": "medium"}),
+        );
+
+        let error = provider
+            .chat(
+                &[Message::user("search for this")],
+                &[hosted_tool],
+                "",
+                Path::new("."),
+            )
+            .await
+            .expect_err("hosted tools are unsupported by the Responses adapter");
+
+        assert!(matches!(error, ProviderError::RequestFailed(message)
+            if message.contains("hosted tool")
+                && message.contains("web_search_preview")
+                && message.contains("native function tools")));
+    }
+
+    #[tokio::test]
     async fn custom_openai_responses_rejects_function_calls_without_identity() {
         let body = concat!(
             "event: response.output_item.added\n",
@@ -2593,6 +2629,82 @@ mod tests {
             chunks.as_slice(),
             [StreamChunk::Error(message)] if message.contains("missing a string delta")
         ));
+    }
+
+    #[tokio::test]
+    async fn custom_openai_responses_surfaces_response_failed_events() {
+        let body = concat!(
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"upstream failed\"}}}\n\n"
+        )
+        .to_string();
+        let base_url = spawn_sse_server(body, 200, |_| {});
+        let mut config = NcaConfig::default();
+        config.provider.custom.api_key = Some("custom-test-key".into());
+        config.provider.custom.base_url = base_url;
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
+
+        let provider = CustomProvider::from_config(&config).expect("provider");
+        let stream = provider
+            .chat(&[Message::user("hello")], &[], "", Path::new("."))
+            .await
+            .expect("chat stream");
+        let chunks = collect_chunks(stream).await;
+
+        assert!(matches!(
+            chunks.as_slice(),
+            [StreamChunk::Error(message)]
+                if message.contains("upstream failed") && message.contains("Responses")
+        ));
+    }
+
+    #[tokio::test]
+    async fn custom_openai_responses_appends_to_versioned_path_prefix() {
+        let body = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+        )
+        .to_string();
+        let (request_tx, request_rx) = mpsc::channel();
+        let origin = spawn_sse_server(body, 200, move |request| {
+            request_tx
+                .send(capture_chat_request(request))
+                .expect("capture Responses request");
+        });
+
+        let mut config = NcaConfig::default();
+        config.provider.custom.api_key = Some("custom-test-key".into());
+        config.provider.custom.base_url = format!("{origin}/zen/v1");
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
+        config.provider.custom.model = "versioned-responses-model".into();
+
+        let provider = CustomProvider::from_config(&config).expect("provider");
+        let stream = provider
+            .chat(
+                &[Message::system("be concise"), Message::user("hello")],
+                &[],
+                "",
+                Path::new("."),
+            )
+            .await
+            .expect("chat stream");
+        let chunks = collect_chunks(stream).await;
+        let request = request_rx.recv().expect("Responses request");
+        let payload: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+
+        assert_eq!(request.url, "/zen/v1/responses");
+        assert_eq!(
+            request.authorization.as_deref(),
+            Some("Bearer custom-test-key")
+        );
+        assert_eq!(payload["model"], "versioned-responses-model");
+        assert_eq!(payload["stream"], true);
+        assert_eq!(payload["store"], false);
+        assert_eq!(payload["input"].as_array().unwrap().len(), 2);
+        assert!(payload.get("previous_response_id").is_none());
+        assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
     }
 
     #[tokio::test]

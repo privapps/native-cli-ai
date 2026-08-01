@@ -51,7 +51,7 @@ compatibility = "openai"   # "openai" | "openai-responses" | "anthropic"
 base_url = "https://gateway.example"
 api_key_env = "CUSTOM_PROVIDER_API_KEY"
 model = "gateway-model"
-temperature = 0.7           # Responses mode intentionally omits this field
+temperature = 0.7           # Preserved in Responses requests
 ```
 
 ### `[model]` — Model Settings
@@ -93,10 +93,11 @@ value as `reasoning.effort`. The setting is independent of
 MiniMax, Anthropic, or a Custom provider using the Anthropic-compatible
 protocol.
 
-Custom providers using `compatibility = "openai-responses"` retain the shared
-`temperature` setting for configuration compatibility, but do not serialize it
-in Responses requests. Some Responses models reject that parameter; omitting it
-keeps the request valid while `max_tokens` is still sent as `max_output_tokens`.
+Custom providers using `compatibility = "openai-responses"` preserve the shared
+`temperature` setting in Responses requests. If a selected model or gateway
+rejects that parameter, nca surfaces the provider error without rewriting the
+request or falling back to another temperature; `max_tokens` is sent as
+`max_output_tokens`.
 
 ### Custom provider request diagnostics
 

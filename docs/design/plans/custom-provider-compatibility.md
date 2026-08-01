@@ -33,7 +33,7 @@ The Custom slot contains `compatibility`, `base_url`, `api_key_env`, optional in
 ## Protocol and activation behavior
 
 - OpenAI-compatible probes call `GET <base path>/models` with Bearer authentication; chat calls `POST <base path>/chat/completions` with streaming and OpenAI tool-call shapes.
-- OpenAI Responses probes use the same Bearer-authenticated model listing; chat calls `POST <base path>/responses` with `stream: true`, `store: false`, native Responses items, and Responses SSE events. The shared temperature setting is omitted because model support varies.
+- OpenAI Responses probes use the same Bearer-authenticated model listing; chat calls `POST <base path>/responses` with `stream: true`, `store: false`, native Responses items, and Responses SSE events. The configured temperature is preserved, and provider rejection is surfaced without fallback.
 - Anthropic-compatible probes send a minimal `POST <base path>/messages` with `x-api-key` and `anthropic-version: 2023-06-01`; chat uses the same endpoint and headers with streaming and Anthropic tool-use shapes.
 - Malformed URLs, invalid environment-variable names, and missing credentials block setup.
 - Network, authentication, protocol, and endpoint probe failures offer **Retry**, **Save anyway**, or **Cancel**. Save anyway activates the manually configured provider and, during onboarding, completes onboarding.

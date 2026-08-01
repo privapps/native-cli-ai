@@ -1,12 +1,15 @@
 use async_trait::async_trait;
 use nca_common::config::{NcaConfig, PermissionConfig, ProviderCompatibility};
+use nca_common::event::{AgentEvent, BusyState};
 use nca_common::tool::{ToolCall, ToolDefinition, ToolResult};
 use nca_core::agent::AgentLoop;
 use nca_core::approval::ApprovalPolicy;
 use nca_core::provider::custom::CustomProvider;
 use nca_core::tools::{ToolExecutor, ToolRegistry};
 use serde_json::Value;
+use std::sync::atomic::Ordering;
 use std::thread::JoinHandle;
+use std::time::Duration;
 use tiny_http::{Header, Request, Response, Server, StatusCode};
 
 const FUNCTION_CALL_RESPONSE: &str = concat!(
@@ -167,4 +170,82 @@ async fn custom_responses_fixture_completes_agent_tool_result_loop() {
             && item["call_id"] == "call_1"
             && item["output"] == "echoed: \"hello\""
     }));
+}
+
+#[tokio::test]
+async fn custom_responses_request_cancellation_is_prompt() {
+    let server = Server::http("127.0.0.1:0").expect("start pending Responses fixture");
+    let base_url = match server.server_addr() {
+        tiny_http::ListenAddr::IP(address) => format!("http://{address}"),
+        other => panic!("unsupported fixture address: {other:?}"),
+    };
+    let (request_started_tx, request_started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let fixture = std::thread::spawn(move || {
+        let request = server.recv().expect("receive pending Responses request");
+        let _ = request_started_tx.send(());
+        let _ = release_rx.recv();
+        let _ = request.respond(Response::from_string("").with_status_code(StatusCode(200)));
+    });
+
+    let mut config = NcaConfig::default();
+    config.provider.custom.api_key = Some("responses-cancel-secret".into());
+    config.provider.custom.base_url = base_url;
+    config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
+    let provider = CustomProvider::from_config(&config).expect("custom Responses provider");
+
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+    let mut agent = AgentLoop::new(
+        Box::new(provider),
+        ToolRegistry::new(),
+        ApprovalPolicy::new(PermissionConfig::default()).with_yolo(true),
+        "responses-cancel-model".into(),
+        event_tx,
+        4,
+        4,
+        1,
+        None,
+    );
+    let cancel = agent.cancel_handle();
+    let workspace = tempfile::tempdir().expect("agent workspace");
+    let turn = tokio::spawn(async move {
+        agent
+            .run_turn("cancel this request", workspace.path(), &[])
+            .await
+    });
+
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("agent should enter Thinking")
+            .expect("event channel should remain open");
+        if matches!(
+            event,
+            AgentEvent::BusyStateChanged {
+                state: BusyState::Thinking
+            }
+        ) {
+            break;
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(1), request_started_rx)
+        .await
+        .expect("Responses request should start")
+        .expect("fixture should receive the Responses request");
+
+    cancel.store(true, Ordering::SeqCst);
+    let result = tokio::time::timeout(Duration::from_millis(150), turn)
+        .await
+        .expect("Responses cancellation should terminate the pending request")
+        .expect("agent task should not panic");
+    assert!(matches!(
+        result,
+        Err(nca_core::provider::ProviderError::Other(message))
+            if message == "run cancelled while waiting for model"
+    ));
+
+    release_tx
+        .send(())
+        .expect("release pending Responses fixture");
+    fixture.join().expect("Responses fixture thread");
 }
