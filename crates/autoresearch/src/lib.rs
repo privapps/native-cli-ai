@@ -23,19 +23,37 @@
 //! println!("val_bpb: {}", result.metric_value);
 //! ```
 
+pub mod agent;
+pub mod analysis;
+pub mod constraints;
 pub mod experiment;
 pub mod git_integration;
 pub mod loop_runner;
 pub mod metric_parser;
+pub mod parallel;
 pub mod program;
+pub mod progress;
 pub mod result;
+pub mod session;
 
+pub use agent::{
+    AGENT_CONTRACT_VERSION, AGENT_SKILL_COMMAND, AgentResultRecord, ContinuationPolicy,
+    ProgramSummary, discover_programs, load_agent_results, summarize_program,
+};
+pub use analysis::{AnalysisOptions, AnalysisReport, BestKnown, Regression, analyze_results};
+pub use constraints::{
+    ConstrainedDecision, ConstraintEvaluation, ConstraintKind, ConstraintOperator, ConstraintSet,
+    ConstraintViolation, SecondaryConstraint,
+};
 pub use experiment::{ExperimentConfig, ExperimentRunner};
 pub use git_integration::GitManager;
 pub use loop_runner::AutoResearchLoop;
 pub use metric_parser::MetricParser;
-pub use program::{EditableFile, FixedFile, MetricCommand, ResearchProgram};
-pub use result::{ExperimentResult, ExperimentStatus};
+pub use parallel::{ParallelExperiment, ParallelOutcome, ParallelScheduleError, ParallelScheduler};
+pub use program::{EditableFile, FixedFile, MetricCommand, MetricGoal, ResearchProgram};
+pub use progress::{ProgressPoint, ProgressReport};
+pub use result::{ExperimentDecision, ExperimentResult, ExperimentStatus};
+pub use session::{SessionState, SessionStatus, SessionStore};
 
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 
+use crate::constraints::ConstraintViolation;
+use crate::program::MetricGoal;
+
 /// Experiment status in the research loop
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -19,6 +22,93 @@ pub enum ExperimentStatus {
     Discard,
     /// Experiment crashed or timed out
     Crash,
+}
+
+/// How the experiment process terminated. This is kept separate from
+/// `ExperimentStatus` for compatibility with the existing loop API: a
+/// timeout is a crash-like non-keep outcome, but remains distinguishable in
+/// the audit record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExperimentTermination {
+    Completed,
+    TimedOut,
+    Crashed,
+    MalformedMetrics,
+    PolicyViolation,
+}
+
+/// The policy decision made after a metric is evaluated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExperimentDecision {
+    Keep,
+    Discard,
+    #[default]
+    Failure,
+}
+
+/// Decide whether a candidate metric should be retained.
+pub fn decide_metric(
+    goal: MetricGoal,
+    baseline: Option<f64>,
+    candidate: Option<f64>,
+) -> ExperimentDecision {
+    let Some(candidate) = candidate else {
+        return ExperimentDecision::Failure;
+    };
+    if !candidate.is_finite() {
+        return ExperimentDecision::Failure;
+    }
+
+    let baseline = match baseline {
+        None => return ExperimentDecision::Keep,
+        Some(value) if value.is_finite() => value,
+        Some(_) => return ExperimentDecision::Failure,
+    };
+
+    let improved = match goal {
+        MetricGoal::Minimize => candidate < baseline,
+        MetricGoal::Maximize => candidate > baseline,
+    };
+
+    if improved {
+        ExperimentDecision::Keep
+    } else {
+        ExperimentDecision::Discard
+    }
+}
+
+/// Durable audit evidence for one isolated experiment.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ExperimentRecord {
+    pub experiment_id: String,
+    pub commit: String,
+    pub metric_value: Option<f64>,
+    pub status: ExperimentStatus,
+    pub termination: ExperimentTermination,
+    /// The decision made from the primary metric before policy constraints.
+    #[serde(default)]
+    pub primary_decision: ExperimentDecision,
+    pub decision: ExperimentDecision,
+    /// Independent policy evidence that can turn a primary Keep into a
+    /// final Discard without being confused with a metric regression.
+    #[serde(default)]
+    pub constraint_violations: Vec<ConstraintViolation>,
+    pub memory_gb: f64,
+    pub training_seconds: f64,
+    pub total_seconds: f64,
+    pub peak_vram_mb: Option<f64>,
+    pub mfu_percent: Option<f64>,
+    pub total_tokens_m: Option<f64>,
+    pub num_steps: Option<u64>,
+    pub num_params_m: Option<f64>,
+    pub description: String,
+    pub stdout: String,
+    pub stderr: String,
+    pub changed_files: Vec<String>,
+    pub workspace: String,
+    pub timestamp: DateTime<Utc>,
 }
 
 impl std::fmt::Display for ExperimentStatus {
@@ -32,7 +122,7 @@ impl std::fmt::Display for ExperimentStatus {
 }
 
 /// Result of a single experiment run
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ExperimentResult {
     /// Short git commit hash (7 chars)
     pub commit: String,
@@ -178,6 +268,11 @@ impl ResultsLogger {
         &self.path
     }
 
+    /// Sidecar JSONL path containing complete audit records.
+    pub fn audit_path(&self) -> PathBuf {
+        self.path.with_extension("audit.jsonl")
+    }
+
     /// Initialize the results file with header
     pub fn init(&self) -> Result<()> {
         if self.path.exists() {
@@ -212,6 +307,50 @@ impl ResultsLogger {
             .with_context(|| "Failed to write result to results file")?;
 
         Ok(())
+    }
+
+    /// Append a complete experiment audit record without changing the legacy
+    /// TSV contract used by the existing loop.
+    pub fn append_record(&self, record: &ExperimentRecord) -> Result<()> {
+        let audit_path = self.audit_path();
+        if let Some(parent) = audit_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&audit_path)
+            .with_context(|| format!("Failed to open audit file: {audit_path:?}"))?;
+        serde_json::to_writer(&mut file, record).context("Failed to serialize audit record")?;
+        file.write_all(b"\n")
+            .context("Failed to terminate audit record")?;
+        Ok(())
+    }
+
+    /// Load complete audit records in append order.
+    pub fn load_records(&self) -> Result<Vec<ExperimentRecord>> {
+        let audit_path = self.audit_path();
+        if !audit_path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let file = File::open(&audit_path)
+            .with_context(|| format!("Failed to open audit file: {audit_path:?}"))?;
+        let reader = BufReader::new(file);
+        reader
+            .lines()
+            .enumerate()
+            .filter_map(|(line_number, line)| match line {
+                Ok(line) if line.trim().is_empty() => None,
+                Ok(line) => {
+                    Some(serde_json::from_str(&line).with_context(|| {
+                        format!("Invalid audit record on line {}", line_number + 1)
+                    }))
+                }
+                Err(error) => Some(Err(error.into())),
+            })
+            .collect()
     }
 
     /// Load all results from the log
@@ -256,7 +395,7 @@ impl ResultsLogger {
 
         let best = results
             .into_iter()
-            .filter(|r| r.status != ExperimentStatus::Crash)
+            .filter(|r| r.status == ExperimentStatus::Keep)
             .min_by(|a, b| {
                 if minimize {
                     a.metric_value
@@ -292,11 +431,14 @@ impl ResultsLogger {
 
         let best = results
             .iter()
-            .filter(|r| r.status != ExperimentStatus::Crash)
+            .filter(|r| r.status == ExperimentStatus::Keep)
             .map(|r| r.metric_value)
             .reduce(|a, b| if minimize { a.min(b) } else { a.max(b) });
 
-        let baseline = results.first().map(|r| r.metric_value);
+        let baseline = results
+            .iter()
+            .find(|result| result.status == ExperimentStatus::Keep)
+            .map(|result| result.metric_value);
 
         Ok(ResultsSummary {
             total_experiments: total,
@@ -380,6 +522,7 @@ pub struct ResultsSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::program::MetricGoal;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -425,5 +568,100 @@ mod tests {
         let summary = logger.summary(true).unwrap();
         assert_eq!(summary.total_experiments, 1);
         assert_eq!(summary.kept, 1);
+    }
+
+    #[test]
+    fn metric_decisions_respect_direction_and_missing_values() {
+        assert_eq!(
+            decide_metric(MetricGoal::Minimize, Some(1.0), Some(0.9)),
+            ExperimentDecision::Keep
+        );
+        assert_eq!(
+            decide_metric(MetricGoal::Minimize, Some(1.0), Some(1.1)),
+            ExperimentDecision::Discard
+        );
+        assert_eq!(
+            decide_metric(MetricGoal::Maximize, Some(1.0), Some(1.1)),
+            ExperimentDecision::Keep
+        );
+        assert_eq!(
+            decide_metric(MetricGoal::Maximize, Some(1.0), Some(0.9)),
+            ExperimentDecision::Discard
+        );
+        assert_eq!(
+            decide_metric(MetricGoal::Minimize, Some(1.0), None),
+            ExperimentDecision::Failure
+        );
+        assert_eq!(
+            decide_metric(MetricGoal::Minimize, None, Some(1.0)),
+            ExperimentDecision::Keep
+        );
+    }
+
+    #[test]
+    fn audit_records_persist_output_and_resource_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let logger = ResultsLogger::new(temp.path().join("results.tsv"));
+        let record = ExperimentRecord {
+            experiment_id: "exp-1".into(),
+            commit: "abc1234".into(),
+            metric_value: Some(0.9),
+            status: ExperimentStatus::Keep,
+            termination: ExperimentTermination::Completed,
+            primary_decision: ExperimentDecision::Keep,
+            decision: ExperimentDecision::Keep,
+            constraint_violations: Vec::new(),
+            memory_gb: 2.5,
+            training_seconds: 1.2,
+            total_seconds: 1.5,
+            peak_vram_mb: Some(2048.0),
+            mfu_percent: Some(42.0),
+            total_tokens_m: Some(3.0),
+            num_steps: Some(12),
+            num_params_m: Some(7.0),
+            description: "lower learning rate".into(),
+            stdout: "val_bpb: 0.9".into(),
+            stderr: "warning: slow".into(),
+            changed_files: vec!["train.py".into()],
+            workspace: "/tmp/exp-1".into(),
+            timestamp: Utc::now(),
+        };
+
+        logger.append_record(&record).unwrap();
+
+        let loaded = logger.load_records().unwrap();
+        assert_eq!(loaded, vec![record]);
+        assert!(logger.audit_path().exists());
+    }
+
+    #[test]
+    fn best_result_never_promotes_a_discarded_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let logger = ResultsLogger::new(temp.path().join("results.tsv"));
+        logger
+            .append(&ExperimentResult::new(
+                "keep".into(),
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                ExperimentStatus::Keep,
+                "baseline".into(),
+            ))
+            .unwrap();
+        logger
+            .append(&ExperimentResult::new(
+                "discard".into(),
+                0.5,
+                0.0,
+                0.0,
+                0.0,
+                ExperimentStatus::Discard,
+                "regression".into(),
+            ))
+            .unwrap();
+
+        assert_eq!(logger.best(true).unwrap().unwrap().commit, "keep");
+        assert_eq!(logger.summary(true).unwrap().best_metric, Some(1.0));
     }
 }

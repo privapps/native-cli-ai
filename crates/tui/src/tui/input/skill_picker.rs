@@ -224,14 +224,23 @@ mod tests {
 
     #[test]
     fn escape_and_q_close_without_changing_draft() {
-        let mut state = state();
-        state.input_buffer = "draft".into();
+        let mut q_state = state();
+        q_state.input_buffer = "draft".into();
         handle_skill_picker_key(
-            &mut state,
+            &mut q_state,
             KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
         );
-        assert!(!state.skill_picker_open());
-        assert_eq!(state.input_buffer, "draft");
+        assert!(!q_state.skill_picker_open());
+        assert_eq!(q_state.input_buffer, "draft");
+
+        let mut escape_state = state();
+        escape_state.input_buffer = "draft".into();
+        handle_skill_picker_key(
+            &mut escape_state,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert!(!escape_state.skill_picker_open());
+        assert_eq!(escape_state.input_buffer, "draft");
     }
 
     #[test]

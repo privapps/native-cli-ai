@@ -150,9 +150,12 @@ impl MessageContent {
     /// Preview for user-authored content. Expanded ` ```file:path ` blocks are compacted back to
     /// `@path` so the transcript stays readable while the model still receives full file contents.
     pub fn user_event_preview(&self) -> String {
-        collapse_expanded_file_blocks(&self.event_preview())
-            .trim()
-            .to_string()
+        let preview = self.event_preview();
+        if preview.contains("```file:") {
+            collapse_expanded_file_blocks(&preview)
+        } else {
+            preview
+        }
     }
 
     /// Plain text only; images become placeholders (for summary prompts).
@@ -447,5 +450,11 @@ mod tests {
             msg.event_preview(),
             "compare @Cargo.toml and @README.md please"
         );
+    }
+
+    #[test]
+    fn user_event_preview_preserves_submitted_whitespace() {
+        let submitted = "\n  first line\n\nlast line  \n";
+        assert_eq!(Message::user(submitted).event_preview(), submitted);
     }
 }

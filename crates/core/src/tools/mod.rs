@@ -1,5 +1,6 @@
 pub mod apply_patch;
 pub mod ask_question;
+pub mod autoresearch;
 pub mod bash;
 pub mod code_intel_tool;
 pub mod copy_path;
@@ -28,6 +29,7 @@ pub mod write_file;
 pub mod write_validated_financial_report;
 
 pub use ask_question::AskQuestionTool;
+pub use autoresearch::AutoresearchTool;
 pub use invoke_skill::InvokeSkillTool;
 pub use resolve_latest_financial_report::ResolveLatestFinancialReportTool;
 pub use skill_hints::RecentSkillHints;
@@ -58,6 +60,7 @@ pub struct ToolRegistry {
     tools: Vec<Box<dyn ToolExecutor>>,
     research_context: Arc<ResearchContext>,
     financial_research_enabled: Arc<AtomicBool>,
+    autoresearch_authorized: Arc<AtomicBool>,
     yolo: bool,
 }
 
@@ -67,6 +70,7 @@ impl ToolRegistry {
             tools: Vec::new(),
             research_context: Arc::new(ResearchContext::new(Utc::now().date_naive())),
             financial_research_enabled: Arc::new(AtomicBool::new(false)),
+            autoresearch_authorized: Arc::new(AtomicBool::new(false)),
             yolo: false,
         }
     }
@@ -95,6 +99,17 @@ impl ToolRegistry {
         }
     }
 
+    /// Mark autoresearch execution as explicitly selected by the user or a
+    /// parent session.  Discovery and inspection remain available without
+    /// this capability; execution tools enforce it at their own boundary.
+    pub fn authorize_autoresearch(&self) {
+        self.autoresearch_authorized.store(true, Ordering::Release);
+    }
+
+    pub fn autoresearch_authorized(&self) -> Arc<AtomicBool> {
+        self.autoresearch_authorized.clone()
+    }
+
     pub fn is_yolo(&self) -> bool {
         self.yolo
     }
@@ -104,6 +119,10 @@ impl ToolRegistry {
         web_config: WebConfig,
     ) -> Self {
         let mut registry = Self::new();
+        registry.register(Box::new(AutoresearchTool::new_with_authorization(
+            workspace_root.clone(),
+            registry.autoresearch_authorized.clone(),
+        )));
         registry.register(Box::new(filesystem::ReadFileTool::new(
             workspace_root.clone(),
         )));

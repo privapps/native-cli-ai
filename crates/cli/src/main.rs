@@ -244,7 +244,7 @@ enum Command {
         #[command(subcommand)]
         command: AutoresearchCmd,
     },
-    /// Build or show a cached CLI index under ~/.nca/workspaces/<id>/ (for agents and tooling).
+    /// Build or show a cached CLI index under the product home's workspaces/<id>/ directory (for agents and tooling).
     Index {
         #[command(subcommand)]
         command: IndexCmd,
@@ -269,6 +269,65 @@ enum IndexCmd {
 
 #[derive(clap::Subcommand, Debug)]
 enum AutoresearchCmd {
+    /// Start and persist a new autoresearch session.
+    Start {
+        /// Path to the research program markdown file.
+        #[arg(long)]
+        program: PathBuf,
+        /// Workspace for the session (defaults to the current directory).
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Stable session identifier; one is generated when omitted.
+        #[arg(long, alias = "id")]
+        session_id: Option<String>,
+        /// Output the durable session state as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect a persisted autoresearch session.
+    Status {
+        /// Session id; the newest session is used when omitted.
+        session_id: Option<String>,
+        /// Workspace for the session (defaults to the current directory).
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Output the durable session state as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop a running autoresearch session without deleting its evidence.
+    Stop {
+        /// Session id; the newest session is used when omitted.
+        session_id: Option<String>,
+        /// Workspace for the session (defaults to the current directory).
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Output the durable session state as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resume a stopped autoresearch session.
+    Resume {
+        /// Session id; the newest session is used when omitted.
+        session_id: Option<String>,
+        /// Workspace for the session (defaults to the current directory).
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Output the durable session state as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List persisted results without rerunning the research program.
+    Results {
+        /// Session id; the newest session is used when omitted.
+        session_id: Option<String>,
+        /// Workspace for the session (defaults to the current directory).
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Output the session and results as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Run the program's metric shell command once and print the parsed metric.
     Once {
         /// Path to research program markdown (e.g. `docs/research/cli-dx-research.md`)
@@ -610,6 +669,47 @@ async fn try_main() -> anyhow::Result<()> {
             }
         },
         Some(Command::Autoresearch { command }) => match command {
+            AutoresearchCmd::Start {
+                program,
+                workspace,
+                session_id,
+                json,
+            } => {
+                let workspace = resolve_autoresearch_workspace(workspace, &workspace_root);
+                autoresearch_start(program, workspace, session_id, json)?;
+            }
+            AutoresearchCmd::Status {
+                session_id,
+                workspace,
+                json,
+            } => {
+                let workspace = resolve_autoresearch_workspace(workspace, &workspace_root);
+                autoresearch_status(workspace, session_id, json)?;
+            }
+            AutoresearchCmd::Stop {
+                session_id,
+                workspace,
+                json,
+            } => {
+                let workspace = resolve_autoresearch_workspace(workspace, &workspace_root);
+                autoresearch_stop(workspace, session_id, json)?;
+            }
+            AutoresearchCmd::Resume {
+                session_id,
+                workspace,
+                json,
+            } => {
+                let workspace = resolve_autoresearch_workspace(workspace, &workspace_root);
+                autoresearch_resume(workspace, session_id, json)?;
+            }
+            AutoresearchCmd::Results {
+                session_id,
+                workspace,
+                json,
+            } => {
+                let workspace = resolve_autoresearch_workspace(workspace, &workspace_root);
+                autoresearch_results(workspace, session_id, json)?;
+            }
             AutoresearchCmd::Once { program, workspace } => {
                 let ws = workspace.unwrap_or_else(|| workspace_root.clone());
                 autoresearch_once(program, ws).await?;
@@ -982,9 +1082,12 @@ async fn spawn_run(
         yolo,
     ));
 
-    let child = command.stdout(stdout).stderr(stderr).spawn()?;
+    let mut child = command.stdout(stdout).stderr(stderr).spawn()?;
     let socket_path = if json {
-        Some(wait_for_spawned_socket_path(&sessions_dir, &session_id, child.id()).await?)
+        Some(
+            wait_for_spawned_socket_path(&sessions_dir, &session_id, &mut child, &spawn_log)
+                .await?,
+        )
     } else {
         None
     };
@@ -1051,16 +1154,36 @@ fn spawn_command_args(
 async fn wait_for_spawned_socket_path(
     sessions_dir: &Path,
     session_id: &str,
-    child_pid: u32,
+    child: &mut std::process::Child,
+    spawn_log: &Path,
 ) -> anyhow::Result<PathBuf> {
-    const PUBLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    // Spawning a child while the full test suite or a busy workstation is
+    // under load can delay runtime initialization before the IPC endpoint is
+    // persisted. Keep the wait bounded, but leave enough startup headroom for
+    // the CLI's machine-readable spawn contract.
+    const PUBLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
     let store = nca_runtime::session_store::SessionStore::new(sessions_dir);
     let deadline = tokio::time::Instant::now() + PUBLISH_TIMEOUT;
     loop {
+        if let Some(status) = child.try_wait()? {
+            let details = std::fs::read_to_string(spawn_log)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            anyhow::bail!(
+                "spawned session {session_id} exited with {status} before publishing its IPC endpoint{}",
+                if details.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {details}")
+                }
+            );
+        }
+
         if let Ok(session) = store.load(session_id).await
-            && session.meta.pid == Some(child_pid)
+            && session.meta.pid == Some(child.id())
             && let Some(socket_path) = session.meta.socket_path
         {
             return Ok(socket_path);
@@ -1326,6 +1449,7 @@ async fn cancel_session(
     let store =
         nca_runtime::session_store::SessionStore::new(resolve_sessions_dir(config, workspace_root));
     let mut session = store.load(session_id).await.map_err(anyhow::Error::msg)?;
+    let socket_path = session.meta.socket_path.clone();
 
     if let Some(socket_path) = session.meta.socket_path.clone() {
         let client = nca_runtime::ipc::IpcClient::new(socket_path);
@@ -1334,6 +1458,20 @@ async fn cancel_session(
 
     if let Some(pid) = session.meta.pid {
         terminate_process(pid).await?;
+    }
+
+    #[cfg(unix)]
+    if let Some(socket_path) = socket_path {
+        match tokio::fs::remove_file(&socket_path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "failed to remove IPC endpoint {}: {error}",
+                    socket_path.display()
+                ));
+            }
+        }
     }
 
     session.meta.status = SessionStatus::Cancelled;
@@ -1794,6 +1932,8 @@ async fn autoresearch_once(program: PathBuf, workspace: PathBuf) -> anyhow::Resu
     use nca_autoresearch::program::ResearchProgram;
 
     let prog = ResearchProgram::from_file(&program).map_err(|e| anyhow::anyhow!("{e}"))?;
+    prog.validate()
+        .map_err(|e| anyhow::anyhow!("invalid research program: {e}"))?;
     let shell_cmd = prog
         .metric_command
         .command
@@ -1840,6 +1980,119 @@ async fn autoresearch_once(program: PathBuf, workspace: PathBuf) -> anyhow::Resu
     println!("metric value: {metric}");
     println!("experiment status: {:?}", output.status);
     println!("---");
+    Ok(())
+}
+
+fn resolve_autoresearch_workspace(workspace: Option<PathBuf>, current: &Path) -> PathBuf {
+    let workspace = workspace.unwrap_or_else(|| current.to_path_buf());
+    if workspace.is_absolute() {
+        workspace
+    } else {
+        current.join(workspace)
+    }
+}
+
+fn autoresearch_start(
+    program: PathBuf,
+    workspace: PathBuf,
+    session_id: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let store = nca_autoresearch::SessionStore::for_workspace(&workspace);
+    let state = store.start(session_id.as_deref(), program, &workspace)?;
+    print_autoresearch_state(&state, json)
+}
+
+fn autoresearch_status(
+    workspace: PathBuf,
+    session_id: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let store = nca_autoresearch::SessionStore::for_workspace(&workspace);
+    let state = store.resolve(session_id.as_deref())?;
+    print_autoresearch_state(&state, json)
+}
+
+fn autoresearch_stop(
+    workspace: PathBuf,
+    session_id: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let store = nca_autoresearch::SessionStore::for_workspace(&workspace);
+    let current = store.resolve(session_id.as_deref())?;
+    let state = store.stop(&current.session_id)?;
+    print_autoresearch_state(&state, json)
+}
+
+fn autoresearch_resume(
+    workspace: PathBuf,
+    session_id: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let store = nca_autoresearch::SessionStore::for_workspace(&workspace);
+    let current = store.resolve(session_id.as_deref())?;
+    let state = store.resume(&current.session_id)?;
+    print_autoresearch_state(&state, json)
+}
+
+fn autoresearch_results(
+    workspace: PathBuf,
+    session_id: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let store = nca_autoresearch::SessionStore::for_workspace(&workspace);
+    let state = store.resolve(session_id.as_deref())?;
+    let results = store.results(&state.session_id)?;
+    if json {
+        print_json(
+            &AutoresearchResultsOutput {
+                session: state,
+                results,
+            },
+            false,
+        )
+    } else {
+        print_autoresearch_state(&state, false)?;
+        for result in results {
+            println!(
+                "{}\tmetric={}\tstatus={}\tdescription={}",
+                result.timestamp.to_rfc3339(),
+                result.metric_value,
+                result.status,
+                result.description
+            );
+        }
+        Ok(())
+    }
+}
+
+fn print_autoresearch_state(
+    state: &nca_autoresearch::SessionState,
+    json: bool,
+) -> anyhow::Result<()> {
+    if json {
+        print_json(state, false)?;
+    } else {
+        let baseline = state
+            .baseline_metric
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        let best = state
+            .best_result
+            .as_ref()
+            .map(|result| result.metric_value.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        println!(
+            "{} status={} program={} workspace={} iterations={} baseline={} best={}",
+            state.session_id,
+            state.status,
+            state.program_name,
+            state.workspace.display(),
+            state.iteration_count,
+            baseline,
+            best
+        );
+    }
     Ok(())
 }
 
@@ -1951,6 +2204,12 @@ struct SessionListOutput {
 struct CancelCommandOutput {
     session: SessionSnapshot,
     cancelled: bool,
+}
+
+#[derive(serde::Serialize)]
+struct AutoresearchResultsOutput {
+    session: nca_autoresearch::SessionState,
+    results: Vec<nca_autoresearch::ExperimentResult>,
 }
 
 #[derive(serde::Serialize)]

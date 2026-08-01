@@ -8,10 +8,11 @@ alwaysApply: false
 
 ## Structure
 
-- `docs/prd.md` is the source of truth for product scope, personas, and MVP definition.
-- `docs/tech-stack.md` records every dependency choice with rationale and rejected alternatives.
-- `docs/architecture.md` defines crate boundaries, data flows, IPC protocol, and security model.
-- The root `README.md` is a quick-start guide. It links to the docs folder for details.
+- `docs/product/prd.md` is the source of truth for product scope, personas, and MVP definition.
+- `docs/reference/tech-stack.md` records every dependency choice with rationale and rejected alternatives.
+- `docs/reference/architecture.md` defines crate boundaries, data flows, IPC protocol, and security model.
+- `docs/README.md` is the documentation hub; the root `README.md` remains the quick-start guide.
+- User-facing behavior belongs in `docs/user/`; plans and specifications belong in `docs/design/`.
 
 ## Writing Style
 
@@ -22,9 +23,9 @@ alwaysApply: false
 
 ## Consistency
 
-- When a dependency is added or removed, update `docs/tech-stack.md` in the same commit.
-- When a crate boundary changes, update `docs/architecture.md` in the same commit.
-- When MVP scope changes, update `docs/prd.md` in the same commit.
+- When a dependency is added or removed, update `docs/reference/tech-stack.md` in the same commit.
+- When a crate boundary changes, update `docs/reference/architecture.md` in the same commit.
+- When MVP scope changes, update `docs/product/prd.md` in the same commit.
 - Cursor rules in `.cursor/rules/` must stay in sync with architectural decisions in the docs.
 
 ## Versioning

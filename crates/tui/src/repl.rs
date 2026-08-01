@@ -61,6 +61,47 @@ fn parse_custom_provider_command(
     }))
 }
 
+fn render_event_log_export(session_id: &str, raw: &str) -> String {
+    let mut md_lines = vec![format!("# Session {session_id}"), String::new()];
+    for line in raw.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let event = value.get("event").unwrap_or(&value);
+        let kind = event
+            .get("type")
+            .or_else(|| event.get("kind"))
+            .or_else(|| value.get("kind"))
+            .and_then(|value| value.as_str());
+        match kind {
+            Some("MessageReceived") => {
+                let role = event
+                    .get("role")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("?");
+                let content = event
+                    .get("content")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                md_lines.push(format!("## {role}"));
+                md_lines.push(String::new());
+                md_lines.push(content.to_string());
+                md_lines.push(String::new());
+            }
+            Some("ToolCallStarted") => {
+                let tool = event
+                    .get("tool")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("?");
+                md_lines.push(format!("### tool: {tool}"));
+                md_lines.push(String::new());
+            }
+            _ => {}
+        }
+    }
+    md_lines.join("\n")
+}
+
 fn open_skill_picker_for_query(
     state: &Arc<Mutex<TuiSessionState>>,
     workspace_root: &Path,
@@ -330,16 +371,27 @@ impl Repl {
                         continue;
                     }
 
-                    // Bash mode: ! prefix runs shell command directly
-                    if input.starts_with('!') {
-                        let cmd = input.trim_start_matches('!');
+                    let trimmed_input = input.trim_start();
+
+                    // Bash mode: ! prefix runs shell command directly. A
+                    // multiline draft is always ordinary user content, even
+                    // when its first line starts with a command prefix.
+                    if crate::tui::composer::is_single_line_command(&input)
+                        && trimmed_input.starts_with('!')
+                    {
+                        let cmd = trimmed_input.trim_start_matches('!');
                         self.run_bash_command(cmd).await;
                         continue;
                     }
 
                     // Slash commands
-                    if input.starts_with('/') {
-                        if !self.handle_command(&input, ReplOutput::Stdio).await? {
+                    if crate::tui::composer::is_single_line_command(&input)
+                        && trimmed_input.starts_with('/')
+                    {
+                        if !self
+                            .handle_command(trimmed_input, ReplOutput::Stdio)
+                            .await?
+                        {
                             break;
                         }
                         continue;
@@ -532,6 +584,115 @@ impl Repl {
             Err(e) => out.eprintln(&format!("[provider] {e}")),
         }
         Ok(())
+    }
+
+    /// Dispatch the custom-provider commands emitted by the production full-screen
+    /// event loop. Keeping this bridge in the Repl makes acceptance tests exercise
+    /// the same command path as the running TUI instead of calling setup helpers
+    /// directly.
+    async fn dispatch_custom_provider_tui_command(
+        &mut self,
+        cmd: TuiCmd,
+        tui_state: &Arc<Mutex<TuiSessionState>>,
+    ) -> anyhow::Result<bool> {
+        match cmd {
+            TuiCmd::ApplyDefaultProvider(ProviderKind::Custom) if self.custom_setup_required() => {
+                if let Ok(mut g) = tui_state.lock() {
+                    g.open_custom_provider_setup_from_config(
+                        &self.runtime.config().provider.custom,
+                    );
+                    g.blocks.push(DisplayBlock::System(
+                        "[provider] configure the custom endpoint to continue".into(),
+                    ));
+                    g.mark_transcript_dirty();
+                }
+                Ok(true)
+            }
+            TuiCmd::ApplyModelProvider(ProviderKind::Custom) => {
+                self.apply_provider_in_session(ProviderKind::Custom, ReplOutput::Tui(tui_state))
+                    .await?;
+                Ok(true)
+            }
+            TuiCmd::ConfigureCustomProvider => {
+                if let Ok(mut g) = tui_state.lock() {
+                    g.open_custom_provider_setup_from_config(
+                        &self.runtime.config().provider.custom,
+                    );
+                    g.blocks.push(DisplayBlock::System(
+                        "[connect] custom provider setup opened".into(),
+                    ));
+                    g.mark_transcript_dirty();
+                }
+                Ok(true)
+            }
+            TuiCmd::ApplyCustomProviderSetup {
+                compatibility,
+                base_url,
+                api_key_env,
+                api_key,
+                model,
+            } => {
+                self.finish_custom_setup_submission(
+                    CustomProviderSetupSubmission {
+                        compatibility,
+                        base_url,
+                        api_key_env,
+                        api_key,
+                        model,
+                    },
+                    tui_state,
+                    true,
+                )
+                .await?;
+                Ok(true)
+            }
+            TuiCmd::CustomProviderProbeAction(action) => {
+                match action {
+                    CustomProviderProbeAction::Cancel => {
+                        self.pending_custom_setup = None;
+                        if let Ok(mut g) = tui_state.lock() {
+                            g.close_custom_provider_setup();
+                        }
+                    }
+                    CustomProviderProbeAction::Retry => {
+                        if let Some(submission) = self.pending_custom_setup.clone() {
+                            self.finish_custom_setup_submission(submission, tui_state, true)
+                                .await?;
+                        }
+                    }
+                    CustomProviderProbeAction::SaveAnyway => {
+                        if let Some(submission) = self.pending_custom_setup.clone() {
+                            self.finish_custom_setup_submission(submission, tui_state, false)
+                                .await?;
+                        }
+                    }
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Keep slash-command submissions on the same async command seam used by
+    /// `run_with_tui`; this is also the seam used by the app-loop acceptance
+    /// tests for `/provider custom`.
+    async fn dispatch_tui_slash_command(
+        &mut self,
+        line: &str,
+        tui_state: &Arc<Mutex<TuiSessionState>>,
+    ) -> anyhow::Result<bool> {
+        if self
+            .handle_command(line, ReplOutput::Tui(tui_state))
+            .await?
+        {
+            Ok(true)
+        } else {
+            if let Ok(mut g) = tui_state.lock() {
+                g.should_exit = true;
+                g.mark_dirty();
+            }
+            Ok(false)
+        }
     }
 
     /// Save custom provider fields, switch default to Custom, and persist workspace config.
@@ -811,15 +972,30 @@ impl Repl {
     }
 
     fn build_editor(&self) -> anyhow::Result<Reedline> {
+        Self::build_line_editor(Some(self.history_path.clone()))
+    }
+
+    /// Build the production line editor with optional persistent history.
+    ///
+    /// This small public seam lets a real terminal harness exercise the same
+    /// Reedline configuration used by the interactive REPL.
+    pub fn build_line_editor(history_path: Option<PathBuf>) -> anyhow::Result<Reedline> {
         let mut builder = Reedline::create()
             .with_quick_completions(true)
             .with_partial_completions(true)
-            .with_ansi_colors(true);
+            .with_ansi_colors(true)
+            // Keep a pasted paragraph in Reedline's buffer. Without this,
+            // newline-delimited paste input can be validated/submitted one
+            // physical line at a time.
+            .use_bracketed_paste(true);
 
         // Try to load history from disk
-        if let Some(parent) = self.history_path.parent() {
-            std::fs::create_dir_all(parent).ok();
-            if let Ok(history) = FileBackedHistory::with_file(100, self.history_path.clone()) {
+        if let Some(history_path) = history_path {
+            let parent = history_path.parent();
+            if let Some(parent) = parent {
+                std::fs::create_dir_all(parent).ok();
+            }
+            if let Ok(history) = FileBackedHistory::with_file(100, history_path) {
                 builder = builder.with_history(Box::new(history));
             }
         }
@@ -1939,36 +2115,7 @@ impl Repl {
                 let snapshot = self.runtime.snapshot();
                 let events = self.runtime.event_log_path();
                 let md = match tokio::fs::read_to_string(&events).await {
-                    Ok(raw) => {
-                        let mut md_lines = vec![
-                            format!("# Session {}", snapshot.id),
-                            String::new(),
-                        ];
-                        for line in raw.lines() {
-                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line)
-                                && let Some(kind) = val.get("kind").and_then(|v| v.as_str())
-                            {
-                                match kind {
-                                    "MessageReceived" => {
-                                        let role = val.get("role").and_then(|v| v.as_str()).unwrap_or("?");
-                                        let content =
-                                            val.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                                        md_lines.push(format!("## {role}"));
-                                        md_lines.push(String::new());
-                                        md_lines.push(content.to_string());
-                                        md_lines.push(String::new());
-                                    }
-                                    "ToolCallStarted" => {
-                                        let tool = val.get("tool").and_then(|v| v.as_str()).unwrap_or("?");
-                                        md_lines.push(format!("### tool: {tool}"));
-                                        md_lines.push(String::new());
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                        md_lines.join("\n")
-                    }
+                    Ok(raw) => render_event_log_export(&snapshot.id, &raw),
                     Err(e) => {
                         out.eprintln(&format!("[export] failed to read event log: {e}"));
                         return Ok(true);
@@ -2096,6 +2243,10 @@ impl Repl {
         else {
             return Ok(false);
         };
+
+        if skill.command == nca_core::tools::autoresearch::AGENT_SKILL_COMMAND {
+            self.runtime.authorize_autoresearch();
+        }
 
         if let Some(model) = &skill.model {
             self.runtime
@@ -2403,60 +2554,24 @@ impl Repl {
                         .await?;
                 }
                 TuiCmd::ApplyDefaultProvider(p) => {
-                    self.apply_provider_in_session(p, ReplOutput::Tui(&tui_state))
+                    if !self
+                        .dispatch_custom_provider_tui_command(
+                            TuiCmd::ApplyDefaultProvider(p),
+                            &tui_state,
+                        )
+                        .await?
+                    {
+                        self.apply_provider_in_session(p, ReplOutput::Tui(&tui_state))
+                            .await?;
+                    }
+                }
+                cmd @ (TuiCmd::ConfigureCustomProvider
+                | TuiCmd::ApplyCustomProviderSetup { .. }
+                | TuiCmd::CustomProviderProbeAction(_)) => {
+                    let _ = self
+                        .dispatch_custom_provider_tui_command(cmd, &tui_state)
                         .await?;
                 }
-                TuiCmd::ConfigureCustomProvider => {
-                    if let Ok(mut g) = tui_state.lock() {
-                        g.open_custom_provider_setup_from_config(
-                            &self.runtime.config().provider.custom,
-                        );
-                        g.blocks.push(DisplayBlock::System(
-                            "[connect] custom provider setup opened".into(),
-                        ));
-                        g.mark_transcript_dirty();
-                    }
-                }
-                TuiCmd::ApplyCustomProviderSetup {
-                    compatibility,
-                    base_url,
-                    api_key_env,
-                    api_key,
-                    model,
-                } => {
-                    self.finish_custom_setup_submission(
-                        CustomProviderSetupSubmission {
-                            compatibility,
-                            base_url,
-                            api_key_env,
-                            api_key,
-                            model,
-                        },
-                        &tui_state,
-                        true,
-                    )
-                    .await?;
-                }
-                TuiCmd::CustomProviderProbeAction(action) => match action {
-                    CustomProviderProbeAction::Cancel => {
-                        self.pending_custom_setup = None;
-                        if let Ok(mut g) = tui_state.lock() {
-                            g.close_custom_provider_setup();
-                        }
-                    }
-                    CustomProviderProbeAction::Retry => {
-                        if let Some(submission) = self.pending_custom_setup.clone() {
-                            self.finish_custom_setup_submission(submission, &tui_state, true)
-                                .await?;
-                        }
-                    }
-                    CustomProviderProbeAction::SaveAnyway => {
-                        if let Some(submission) = self.pending_custom_setup.clone() {
-                            self.finish_custom_setup_submission(submission, &tui_state, false)
-                                .await?;
-                        }
-                    }
-                },
                 TuiCmd::PromptApiKey(p, connect_after_save) => {
                     if let Ok(mut g) = tui_state.lock() {
                         if p == ProviderKind::Custom && self.custom_setup_required() {
@@ -2508,8 +2623,16 @@ impl Repl {
                     }
                 }
                 TuiCmd::ApplyModelProvider(p) => {
-                    self.apply_provider_in_session(p, ReplOutput::Tui(&tui_state))
-                        .await?;
+                    if !self
+                        .dispatch_custom_provider_tui_command(
+                            TuiCmd::ApplyModelProvider(p),
+                            &tui_state,
+                        )
+                        .await?
+                    {
+                        self.apply_provider_in_session(p, ReplOutput::Tui(&tui_state))
+                            .await?;
+                    }
                 }
                 TuiCmd::ApplyPermission(idx) => {
                     let mode = permission_mode_from_index(idx);
@@ -2896,13 +3019,9 @@ impl Repl {
                         && trimmed_line.starts_with('/')
                     {
                         if !self
-                            .handle_command(&trimmed_line, ReplOutput::Tui(&tui_state))
+                            .dispatch_tui_slash_command(&trimmed_line, &tui_state)
                             .await?
                         {
-                            if let Ok(mut g) = tui_state.lock() {
-                                g.should_exit = true;
-                                g.mark_dirty();
-                            }
                             break;
                         }
                         continue;
@@ -3073,7 +3192,17 @@ impl Completer for Repl {
                 if skill_cmd.starts_with(line) {
                     suggestions.push(Suggestion {
                         value: skill_cmd,
-                        description: skill.description,
+                        description: Some(format!(
+                            "{} — {} [{}]{}",
+                            skill.display_label(),
+                            skill.presentation_description(),
+                            skill.directory.display(),
+                            if skill.is_manual_only() {
+                                " · manual-only"
+                            } else {
+                                ""
+                            }
+                        )),
                         extra: None,
                         span: reedline::Span { start: 0, end: 0 },
                         append_whitespace: true,
@@ -3190,11 +3319,13 @@ fn parse_permission_mode(raw: &str) -> Option<PermissionMode> {
 mod tests {
     use super::*;
     use crate::runner::build_session_runtime;
+    use crate::tui::app::dispatch_custom_provider_key;
     use crate::tui::input::{ConnectModalKeyResult, handle_connect_modal_key};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+    use tiny_http::{Header, Response, Server, StatusCode};
 
     static NEXT_TEST_RUNTIME_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -3235,6 +3366,258 @@ mod tests {
         (Repl::new(runtime, false, false), state, workspace)
     }
 
+    fn app_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn type_setup_text(
+        state: &mut TuiSessionState,
+        cmd_tx: &tokio::sync::mpsc::Sender<TuiCmd>,
+        text: &str,
+    ) {
+        for character in text.chars() {
+            assert!(dispatch_custom_provider_key(
+                state,
+                app_key(KeyCode::Char(character)),
+                cmd_tx,
+            ));
+        }
+    }
+
+    fn clear_setup_input(state: &mut TuiSessionState, cmd_tx: &tokio::sync::mpsc::Sender<TuiCmd>) {
+        let count = state.custom_setup_input().chars().count();
+        for _ in 0..count {
+            assert!(dispatch_custom_provider_key(
+                state,
+                app_key(KeyCode::Backspace),
+                cmd_tx,
+            ));
+        }
+    }
+
+    fn spawn_custom_probe_fixture() -> (
+        String,
+        std::sync::mpsc::Receiver<(String, String, Option<String>)>,
+    ) {
+        let server = Server::http("127.0.0.1:0").expect("start custom probe fixture");
+        let base_url = match server.server_addr() {
+            tiny_http::ListenAddr::IP(address) => format!("http://{address}"),
+            other => panic!("unsupported fixture address: {other:?}"),
+        };
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut request = server.recv().expect("receive custom probe request");
+            let mut body = String::new();
+            request
+                .as_reader()
+                .read_to_string(&mut body)
+                .expect("read custom probe body");
+            let authorization = request
+                .headers()
+                .iter()
+                .find(|header| {
+                    header
+                        .field
+                        .as_str()
+                        .as_str()
+                        .eq_ignore_ascii_case("authorization")
+                })
+                .map(|header| header.value.as_str().to_string());
+            request_tx
+                .send((
+                    request.method().as_str().to_string(),
+                    request.url().to_string(),
+                    authorization,
+                ))
+                .expect("capture custom probe request");
+            request
+                .respond(
+                    Response::from_string(r#"{"data":[{"id":"gateway-model"}]}"#)
+                        .with_status_code(StatusCode(200))
+                        .with_header(
+                            Header::from_bytes("content-type", "application/json")
+                                .expect("content type header"),
+                        ),
+                )
+                .expect("respond to custom probe");
+        });
+        (base_url, request_rx)
+    }
+
+    #[tokio::test]
+    async fn production_event_loop_completes_connect_custom_setup_and_editing() {
+        let (mut repl, state, workspace) = test_repl(false).await;
+        let (base_url, request_rx) = spawn_custom_probe_fixture();
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(4);
+
+        {
+            let mut state = state.lock().expect("state lock");
+            state.open_connect_modal();
+            state.connect_search_mut().unwrap().push_str("custom");
+            assert!(dispatch_custom_provider_key(
+                &mut state,
+                app_key(KeyCode::Enter),
+                &cmd_tx,
+            ));
+        }
+        let command = cmd_rx.try_recv().expect("connect emits custom command");
+        assert!(matches!(command, TuiCmd::ConfigureCustomProvider));
+        assert!(
+            repl.dispatch_custom_provider_tui_command(command, &state)
+                .await
+                .expect("dispatch connect command")
+        );
+
+        {
+            let mut state = state.lock().expect("state lock");
+            assert!(state.custom_provider_setup_open());
+            assert!(dispatch_custom_provider_key(
+                &mut state,
+                app_key(KeyCode::Enter),
+                &cmd_tx,
+            ));
+            type_setup_text(&mut state, &cmd_tx, &base_url);
+            assert!(dispatch_custom_provider_key(
+                &mut state,
+                app_key(KeyCode::Enter),
+                &cmd_tx,
+            ));
+            clear_setup_input(&mut state, &cmd_tx);
+            type_setup_text(&mut state, &cmd_tx, "GATEWAY_API_KEY");
+            assert!(dispatch_custom_provider_key(
+                &mut state,
+                app_key(KeyCode::Tab),
+                &cmd_tx,
+            ));
+            type_setup_text(&mut state, &cmd_tx, "inline-secret");
+            assert!(dispatch_custom_provider_key(
+                &mut state,
+                app_key(KeyCode::Enter),
+                &cmd_tx,
+            ));
+            assert!(dispatch_custom_provider_key(
+                &mut state,
+                app_key(KeyCode::Enter),
+                &cmd_tx,
+            ));
+        }
+
+        let command = cmd_rx
+            .try_recv()
+            .expect("custom setup emits an apply command");
+        assert!(matches!(
+            &command,
+            TuiCmd::ApplyCustomProviderSetup {
+                api_key: Some(api_key),
+                model,
+                ..
+            } if api_key == "inline-secret" && model == "custom-model"
+        ));
+        assert!(
+            repl.dispatch_custom_provider_tui_command(command, &state)
+                .await
+                .expect("dispatch custom setup command")
+        );
+
+        let request = request_rx
+            .recv()
+            .expect("local fixture receives the setup probe");
+        assert_eq!(request.0, "GET");
+        assert_eq!(request.1, "/v1/models");
+        assert_eq!(request.2.as_deref(), Some("Bearer inline-secret"));
+        assert_eq!(repl.runtime.config().provider.default, ProviderKind::Custom);
+        assert_eq!(repl.runtime.model(), "custom-model");
+        assert!(
+            !state
+                .lock()
+                .expect("state lock")
+                .custom_provider_setup_open()
+        );
+
+        let saved = std::fs::read_to_string(workspace.path().join(".nca/config.local.toml"))
+            .expect("workspace custom config");
+        assert!(saved.contains("custom-model"));
+        assert!(saved.contains("inline-secret"));
+        assert!(!saved.contains("test-minimax-key"));
+
+        repl.dispatch_custom_provider_tui_command(TuiCmd::ConfigureCustomProvider, &state)
+            .await
+            .expect("open explicit custom editing");
+        let state_guard = state.lock().expect("state lock");
+        assert_eq!(state_guard.custom_setup_base_url(), base_url);
+        assert_eq!(state_guard.custom_setup_model_hint(), "custom-model");
+        assert!(state_guard.custom_setup_api_key().is_empty());
+    }
+
+    #[tokio::test]
+    async fn production_event_loop_handles_onboarding_and_unconfigured_picker_recovery() {
+        let (mut repl, state, _workspace) = test_repl(false).await;
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(4);
+
+        {
+            let mut state = state.lock().expect("state lock");
+            state.onboarding_mode = true;
+            state.open_connect_modal();
+            state.connect_search_mut().unwrap().push_str("custom");
+            assert!(dispatch_custom_provider_key(
+                &mut state,
+                app_key(KeyCode::Enter),
+                &cmd_tx,
+            ));
+        }
+        let command = cmd_rx.try_recv().expect("onboarding emits custom command");
+        assert!(matches!(command, TuiCmd::ConfigureCustomProvider));
+        repl.dispatch_custom_provider_tui_command(command, &state)
+            .await
+            .expect("dispatch onboarding custom command");
+        assert!(
+            state
+                .lock()
+                .expect("state lock")
+                .custom_provider_setup_open()
+        );
+
+        repl.dispatch_custom_provider_tui_command(
+            TuiCmd::CustomProviderProbeAction(CustomProviderProbeAction::Cancel),
+            &state,
+        )
+        .await
+        .expect("cancel onboarding setup");
+
+        repl.dispatch_custom_provider_tui_command(
+            TuiCmd::ApplyModelProvider(ProviderKind::Custom),
+            &state,
+        )
+        .await
+        .expect("recover unconfigured picker selection");
+        let state = state.lock().expect("state lock");
+        assert!(state.custom_provider_setup_open());
+        assert!(state
+            .blocks
+            .iter()
+            .any(|block| matches!(block, DisplayBlock::System(message) if message.contains("configure the custom endpoint"))));
+    }
+
+    #[tokio::test]
+    async fn production_event_loop_dispatches_provider_custom_submission() {
+        let (mut repl, state, workspace) = test_repl(true).await;
+        assert!(
+            repl.dispatch_tui_slash_command("/provider custom", &state)
+                .await
+                .expect("dispatch provider command")
+        );
+        assert_eq!(repl.runtime.config().provider.default, ProviderKind::Custom);
+        assert!(workspace.path().join(".nca/config.local.toml").exists());
+        assert_eq!(
+            state
+                .lock()
+                .expect("state lock")
+                .custom_provider_host
+                .as_deref(),
+            Some("gateway.example")
+        );
+    }
+
     #[test]
     fn parses_permission_aliases() {
         assert_eq!(
@@ -3265,6 +3648,58 @@ mod tests {
         config.provider.custom.api_key = None;
         config.provider.custom.api_key_env = "not-portable".into();
         assert!(Repl::custom_provider_setup_required(&config));
+    }
+
+    #[test]
+    fn line_editor_history_round_trips_one_multiline_entry() {
+        use reedline::{History, SearchDirection, SearchQuery};
+
+        let workspace = tempfile::tempdir().expect("history workspace");
+        let history_path = workspace.path().join(".nca/.history");
+        let draft = "first paragraph\n\nsecond paragraph\n";
+
+        {
+            let mut history =
+                FileBackedHistory::with_file(100, history_path.clone()).expect("history file");
+            history
+                .save(reedline::HistoryItem::from_command_line(draft))
+                .expect("save multiline history entry");
+            history.sync().expect("sync multiline history entry");
+        }
+
+        let history = FileBackedHistory::with_file(100, history_path).expect("reload history file");
+        let entries = history
+            .search(SearchQuery::everything(SearchDirection::Forward, None))
+            .expect("search history");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].command_line, draft);
+    }
+
+    #[test]
+    fn event_log_export_reads_envelopes_and_preserves_message_whitespace() {
+        let submitted = "  first line\n\nlast line  \n";
+        let raw = serde_json::json!({
+            "id": 1,
+            "event": {
+                "type": "MessageReceived",
+                "role": "user",
+                "content": submitted,
+            }
+        })
+        .to_string();
+
+        let export = render_event_log_export("session-1", &raw);
+        assert!(export.starts_with("# Session session-1\n\n## user\n\n"));
+        assert!(export.contains(submitted));
+    }
+
+    #[test]
+    fn line_editor_multiline_command_prefix_is_message_content() {
+        assert!(crate::tui::composer::is_single_line_command(" /help"));
+        assert!(crate::tui::composer::is_single_line_command("!echo hi"));
+        assert!(!crate::tui::composer::is_single_line_command("/help\nmore"));
+        assert!(!crate::tui::composer::is_single_line_command("!echo\nmore"));
     }
 
     #[test]
@@ -3608,6 +4043,15 @@ mod tests {
                     .iter()
                     .any(|entry| entry.command == "nca-acceptance-picker")
             );
+            let entry = state
+                .skill_picker_entries()
+                .iter()
+                .find(|entry| entry.command == "nca-acceptance-picker")
+                .expect("picker entry");
+            assert_eq!(entry.display_name, "Picker Review");
+            assert_eq!(entry.description, "Review from picker");
+            assert_eq!(entry.source, "filesystem");
+            assert!(!entry.manual_only);
             assert!(state.blocks.is_empty());
         }
 
@@ -3620,6 +4064,34 @@ mod tests {
         assert!(!state.skill_picker_open());
         assert_eq!(state.input_buffer, "/nca-acceptance-picker ");
         assert!(state.blocks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn skill_completion_uses_catalog_presentation_and_source_metadata() {
+        let (mut repl, _state, workspace) = test_repl(false).await;
+        let skill_dir = workspace.path().join(".agents/skills/catalog-presentation");
+        std::fs::create_dir_all(skill_dir.join("agents")).expect("skill directory");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: Review\ncommand: catalog-presentation\ndescription: Long body description\n---\nReview.\n",
+        )
+        .expect("skill file");
+        std::fs::write(
+            skill_dir.join("agents/openai.yaml"),
+            "interface:\n  display_name: Review Changes\n  short_description: Inspect a diff\npolicy:\n  allow_implicit_invocation: false\n",
+        )
+        .expect("metadata file");
+
+        let suggestions = repl.complete("/catalog", 7);
+        let suggestion = suggestions
+            .iter()
+            .find(|suggestion| suggestion.value == "/catalog-presentation")
+            .expect("skill completion");
+        let description = suggestion.description.as_deref().unwrap_or_default();
+        assert!(description.contains("Review Changes"));
+        assert!(description.contains("Inspect a diff"));
+        assert!(description.contains(".agents/skills/catalog-presentation"));
+        assert!(description.contains("manual-only"));
     }
 
     #[test]

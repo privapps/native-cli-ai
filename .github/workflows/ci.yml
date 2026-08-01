@@ -40,3 +40,29 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  windows-runtime:
+    name: Windows native runtime acceptance
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-runtime
+
+      - name: Clippy
+        run: cargo clippy --workspace --locked -- -D warnings
+
+      - name: Native Windows runtime and IPC tests
+        run: cargo test --workspace --locked
+
+      - name: Native Windows release build
+        run: cargo build --release -p nca-cli --locked
+
+      - name: CLI process smoke test
+        run: .\target\release\nca.exe --help

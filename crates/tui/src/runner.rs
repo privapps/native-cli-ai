@@ -169,6 +169,12 @@ impl SessionRuntime {
         self.supervisor.safe_mode()
     }
 
+    /// Authorize the manual-only autoresearch workflow after the user selects
+    /// it through the normal skill command surface.
+    pub fn authorize_autoresearch(&self) {
+        self.supervisor.authorize_autoresearch();
+    }
+
     pub fn set_permission_mode(&mut self, mode: PermissionMode) {
         if !self.supervisor.execution_context().yolo {
             self.supervisor.agent_mut().approval.set_mode(mode);

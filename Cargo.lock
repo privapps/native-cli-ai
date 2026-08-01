@@ -2053,6 +2053,7 @@ dependencies = [
  "criterion",
  "futures-util",
  "genai",
+ "nca-autoresearch",
  "nca-common",
  "regex",
  "reqwest 0.12.28",
@@ -2105,6 +2106,7 @@ dependencies = [
  "nca-common",
  "nca-core",
  "nca-runtime",
+ "portable-pty",
  "pulldown-cmark",
  "ratatui",
  "reedline",
@@ -2113,8 +2115,10 @@ dependencies = [
  "similar",
  "syntect",
  "tempfile",
+ "tiny_http",
  "tokio",
  "tracing",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]

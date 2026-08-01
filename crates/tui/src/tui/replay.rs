@@ -105,4 +105,37 @@ mod tests {
             content: "a".into(),
         }));
     }
+
+    #[tokio::test]
+    async fn replays_multiline_user_content_without_trimming() {
+        let dir = tempfile::tempdir().expect("event-log directory");
+        let log_path = dir.path().join("session.events.jsonl");
+        let submitted = "  first line\n\nlast line  \n";
+        let envelope = serde_json::to_string(&EventEnvelope::new(
+            1,
+            AgentEvent::MessageReceived {
+                role: "user".into(),
+                content: submitted.into(),
+            },
+        ))
+        .expect("serialize event envelope");
+        tokio::fs::write(&log_path, format!("{envelope}\n"))
+            .await
+            .expect("write event log");
+
+        let state = std::sync::Arc::new(std::sync::Mutex::new(TuiSessionState::new(
+            "session-1".into(),
+            "model".into(),
+            "@build".into(),
+            "default".into(),
+            dir.path().to_path_buf(),
+        )));
+        replay_event_log_into_state(&log_path, &state).await;
+
+        let state = state.lock().expect("state lock");
+        assert!(state
+            .blocks
+            .iter()
+            .any(|block| matches!(block, crate::tui::state::DisplayBlock::User(content) if content == submitted)));
+    }
 }

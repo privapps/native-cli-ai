@@ -59,9 +59,13 @@ impl IpcServer {
     pub async fn start(&self) -> Result<IpcHandle, IpcError> {
         #[cfg(unix)]
         if let Some(parent) = self.socket_path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|err| IpcError::ConnectionFailed(err.to_string()))?;
+            tokio::fs::create_dir_all(parent).await.map_err(|err| {
+                IpcError::ConnectionFailed(format!(
+                    "failed to prepare IPC directory {} for endpoint {}: {err}",
+                    parent.display(),
+                    self.socket_path.display()
+                ))
+            })?;
         }
         #[cfg(unix)]
         if self.socket_path.exists() {
@@ -181,7 +185,12 @@ pub enum IpcError {
 
 #[cfg(unix)]
 async fn bind_listener(endpoint: &Path) -> Result<IpcListener, IpcError> {
-    IpcListener::bind(endpoint).map_err(|err| IpcError::ConnectionFailed(err.to_string()))
+    IpcListener::bind(endpoint).map_err(|err| {
+        IpcError::ConnectionFailed(format!(
+            "failed to bind IPC endpoint {}: {err}",
+            endpoint.display()
+        ))
+    })
 }
 
 #[cfg(windows)]
@@ -312,6 +321,20 @@ mod tests {
                 .await
                 .expect("IPC command should arrive promptly");
         assert!(matches!(command, Some(AgentCommand::Shutdown)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_bind_failures_report_endpoint_context() {
+        let temp = tempfile::tempdir().expect("temporary IPC directory should be created");
+        let endpoint = temp.path().join("occupied.sock");
+        std::fs::create_dir(&endpoint).expect("endpoint collision fixture should be created");
+
+        let result = bind_listener(&endpoint).await;
+        let error = result
+            .err()
+            .expect("binding an occupied endpoint should fail");
+        assert!(error.to_string().contains(&endpoint.display().to_string()));
     }
 
     #[cfg(windows)]

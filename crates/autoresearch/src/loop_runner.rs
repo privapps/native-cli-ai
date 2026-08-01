@@ -127,6 +127,7 @@ impl AutoResearchLoop {
         experiment_command: &str,
         experiment_args: Vec<String>,
     ) -> Result<Self> {
+        program.validate()?;
         let workspace = workspace.as_ref();
         let results_path = workspace.join("results.tsv");
 

@@ -13,6 +13,7 @@ use nca_core::skills::{SkillCatalog, SkillSource};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::path::{Path, PathBuf};
+use unicode_width::UnicodeWidthChar;
 
 pub const SLASH_PANEL_MAX_ROWS: usize = 8;
 pub const COMPOSER_MAX_DRAFT_ROWS: usize = 8;
@@ -57,8 +58,12 @@ pub fn cursor_line_column(buffer: &str, cursor_char_idx: usize) -> (usize, usize
     (line, column)
 }
 
-/// Move vertically while preserving the current column as far as the target
-/// line allows. The cursor stays at the nearest edge at the first/last line.
+/// Move vertically while preserving the current logical-line column.
+///
+/// This compatibility wrapper retains the original newline-based behavior for
+/// callers that do not have terminal width available. Full-screen input should
+/// use [`move_cursor_vertical_with_width`] so wrapped rows participate in
+/// movement.
 pub fn move_cursor_vertical(buffer: &str, cursor_char_idx: usize, down: bool) -> usize {
     let (line, column) = cursor_line_column(buffer, cursor_char_idx);
     let lines: Vec<&str> = buffer.split('\n').collect();
@@ -74,6 +79,32 @@ pub fn move_cursor_vertical(buffer: &str, cursor_char_idx: usize, down: bool) ->
         .map(|line| line.chars().count() + 1)
         .sum::<usize>()
         + target_column
+}
+
+/// Move vertically through display rows while preserving the current display
+/// column as far as the target row allows. The cursor stays at the nearest
+/// edge at the first/last row.
+pub fn move_cursor_vertical_with_width(
+    buffer: &str,
+    cursor_char_idx: usize,
+    down: bool,
+    max_width: usize,
+) -> usize {
+    let content_width = max_width.saturating_sub(2).max(1);
+    let rows = visual_rows(buffer, content_width);
+    let cursor_char_idx = cursor_char_idx.min(buffer.chars().count());
+    let current_row = visual_row_for_cursor(&rows, cursor_char_idx);
+    let target_row = if down {
+        (current_row + 1).min(rows.len().saturating_sub(1))
+    } else {
+        current_row.saturating_sub(1)
+    };
+    if target_row == current_row {
+        return cursor_char_idx;
+    }
+
+    let current_col = cursor_display_column(&rows[current_row], cursor_char_idx);
+    cursor_at_display_column(&rows[target_row], current_col)
 }
 
 pub fn move_cursor_home(buffer: &str, cursor_char_idx: usize) -> usize {
@@ -371,34 +402,46 @@ pub fn composer_render_model(
     cursor_char_idx: usize,
     max_visible_rows: usize,
 ) -> ComposerRenderModel {
-    let lines: Vec<&str> = buffer.split('\n').collect();
-    let total_rows = lines.len().max(1);
-    let (cursor_row, cursor_col) = cursor_line_column(buffer, cursor_char_idx);
-    let cursor_row = cursor_row.min(total_rows.saturating_sub(1));
+    composer_render_model_with_width(buffer, cursor_char_idx, max_visible_rows, usize::MAX)
+}
+
+/// Build the visible draft rows using terminal display-cell width.
+///
+/// `max_width` is the full composer width, including the two-cell prompt or
+/// continuation prefix. A zero width uses the smallest practical content
+/// width so a wide character is never dropped.
+pub fn composer_render_model_with_width(
+    buffer: &str,
+    cursor_char_idx: usize,
+    max_visible_rows: usize,
+    max_width: usize,
+) -> ComposerRenderModel {
+    let content_width = max_width.saturating_sub(2).max(1);
+    let visual_rows = visual_rows(buffer, content_width);
+    let total_rows = visual_rows.len().max(1);
+    let cursor_char_idx = cursor_char_idx.min(buffer.chars().count());
+    let cursor_row = visual_row_for_cursor(&visual_rows, cursor_char_idx);
+    let cursor_col = visual_rows
+        .get(cursor_row)
+        .map(|row| 2 + cursor_display_column(row, cursor_char_idx))
+        .unwrap_or(2);
     let draft_height = total_rows.min(max_visible_rows.max(1));
     let first_row = cursor_row
         .saturating_sub(draft_height.saturating_sub(1))
         .min(total_rows.saturating_sub(draft_height));
-    let initial_line_start = lines
-        .iter()
-        .take(first_row)
-        .map(|line| line.chars().count() + 1)
-        .sum::<usize>();
-    let rows = lines
+    let rows = visual_rows
         .iter()
         .enumerate()
         .skip(first_row)
         .take(draft_height)
-        .scan(initial_line_start, |line_start, (row, line)| {
-            let current_start = *line_start;
-            *line_start += line.chars().count() + usize::from(row + 1 < total_rows);
-            Some(composer_line_at(
+        .map(|(row, visual)| {
+            composer_line_at(
                 buffer,
-                line,
-                current_start,
-                cursor_char_idx.min(buffer.chars().count()),
+                visual.text,
+                visual.start_char,
+                cursor_char_idx,
                 row == first_row,
-            ))
+            )
         })
         .collect();
 
@@ -413,10 +456,110 @@ pub fn composer_render_model(
     }
 }
 
+#[derive(Debug, Clone)]
+struct VisualRow<'a> {
+    text: &'a str,
+    start_char: usize,
+    end_char: usize,
+    logical_end_char: usize,
+}
+
+fn visual_row_for_cursor(rows: &[VisualRow<'_>], cursor_char_idx: usize) -> usize {
+    rows.iter()
+        .position(|row| {
+            cursor_char_idx >= row.start_char
+                && cursor_char_idx <= row.logical_end_char
+                && (cursor_char_idx < row.end_char || row.end_char == row.logical_end_char)
+        })
+        .unwrap_or_else(|| rows.len().saturating_sub(1))
+}
+
+fn cursor_display_column(row: &VisualRow<'_>, cursor_char_idx: usize) -> usize {
+    row.text
+        .chars()
+        .take(cursor_char_idx.saturating_sub(row.start_char))
+        .map(|ch| ch.width().unwrap_or(0))
+        .sum()
+}
+
+fn cursor_at_display_column(row: &VisualRow<'_>, desired_col: usize) -> usize {
+    let mut best_idx = row.start_char;
+    let mut best_distance = desired_col;
+    let mut display_col: usize = 0;
+
+    for (offset, ch) in row.text.chars().enumerate() {
+        display_col = display_col.saturating_add(ch.width().unwrap_or(0));
+        let distance = display_col.abs_diff(desired_col);
+        if distance < best_distance {
+            best_distance = distance;
+            best_idx = row.start_char + offset + 1;
+        }
+    }
+
+    best_idx
+}
+
+fn visual_rows(buffer: &str, content_width: usize) -> Vec<VisualRow<'_>> {
+    let mut rows = Vec::new();
+    let mut logical_start = 0;
+
+    for line in buffer.split('\n') {
+        let chars: Vec<char> = line.chars().collect();
+        let logical_end = logical_start + chars.len();
+        if chars.is_empty() {
+            rows.push(VisualRow {
+                text: line,
+                start_char: logical_start,
+                end_char: logical_end,
+                logical_end_char: logical_end,
+            });
+        } else {
+            let mut chunk_start = 0;
+            while chunk_start < chars.len() {
+                let mut chunk_end = chunk_start;
+                let mut width: usize = 0;
+                while chunk_end < chars.len() {
+                    let char_width = chars[chunk_end].width().unwrap_or(0);
+                    if chunk_end > chunk_start && width.saturating_add(char_width) > content_width {
+                        break;
+                    }
+                    width = width.saturating_add(char_width);
+                    chunk_end += 1;
+                }
+                if chunk_end == chunk_start {
+                    chunk_end += 1;
+                }
+                let start_byte = chars[..chunk_start].iter().map(|ch| ch.len_utf8()).sum();
+                let end_byte = chars[..chunk_end].iter().map(|ch| ch.len_utf8()).sum();
+                rows.push(VisualRow {
+                    text: &line[start_byte..end_byte],
+                    start_char: logical_start + chunk_start,
+                    end_char: logical_start + chunk_end,
+                    logical_end_char: logical_end,
+                });
+                chunk_start = chunk_end;
+            }
+        }
+        logical_start = logical_end + 1;
+    }
+
+    rows
+}
+
 /// Height of the bordered composer, including its hint and optional auxiliary
 /// rows such as staged-image status.
 pub fn composer_input_height(buffer: &str, auxiliary_rows: usize) -> u16 {
-    let draft_rows = buffer.matches('\n').count().saturating_add(1);
+    composer_input_height_with_width(buffer, auxiliary_rows, usize::MAX)
+}
+
+/// Height of the bordered composer using terminal display-cell rows.
+pub fn composer_input_height_with_width(
+    buffer: &str,
+    auxiliary_rows: usize,
+    max_width: usize,
+) -> u16 {
+    let content_width = max_width.saturating_sub(2).max(1);
+    let draft_rows = visual_rows(buffer, content_width).len().max(1);
     (draft_rows.min(COMPOSER_MAX_DRAFT_ROWS) + auxiliary_rows + 3) as u16
 }
 
@@ -730,6 +873,16 @@ mod tests {
     }
 
     #[test]
+    fn vertical_cursor_movement_follows_wrapped_display_rows() {
+        let draft = "abcdef\nxy";
+        // Full width 4 leaves two content cells, so the logical first line is
+        // displayed as `ab`, `cd`, `ef`.
+        assert_eq!(move_cursor_vertical_with_width(draft, 4, true, 4), 7);
+        assert_eq!(move_cursor_vertical_with_width(draft, 2, true, 4), 4);
+        assert_eq!(move_cursor_vertical_with_width(draft, 4, false, 4), 2);
+    }
+
+    #[test]
     fn home_and_end_move_within_the_current_line() {
         let buffer = "first\nsecond\nthird";
         assert_eq!(move_cursor_home(buffer, 9), 6);
@@ -774,6 +927,56 @@ mod tests {
     }
 
     #[test]
+    fn display_width_wraps_long_lines_without_losing_logical_text() {
+        let model = composer_render_model_with_width("abcdefgh", 8, 8, 4);
+        let rendered = model
+            .rows
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(model.total_rows, 4);
+        assert_eq!(rendered, "❯ ab   cd   ef   gh ");
+    }
+
+    #[test]
+    fn display_width_accounts_for_wide_unicode_and_cursor_following() {
+        let draft = "a界bc";
+        let model = composer_render_model_with_width(draft, draft.chars().count(), 1, 4);
+
+        assert_eq!(model.total_rows, 3);
+        assert_eq!(model.first_row, 2);
+        assert_eq!(model.cursor_row, 2);
+        assert_eq!(model.cursor_col, 4);
+        let rendered = model.rows[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(rendered, "❯ bc ");
+    }
+
+    #[test]
+    fn display_width_keeps_combining_marks_and_empty_drafts_usable() {
+        let draft = "e\u{301}xyz";
+        let model = composer_render_model_with_width(draft, 2, 8, 4);
+        assert_eq!(model.total_rows, 2);
+        assert_eq!(model.cursor_row, 0);
+        assert_eq!(model.cursor_col, 3);
+
+        let empty = composer_render_model_with_width("", 0, 8, 1);
+        assert_eq!(empty.total_rows, 1);
+        assert!(empty.cursor_visible);
+    }
+
+    #[test]
+    fn composer_height_counts_visual_rows() {
+        assert_eq!(composer_input_height_with_width("abcdefgh", 0, 4), 7);
+        assert_eq!(composer_input_height_with_width("one\ntwo", 0, 8), 5);
+    }
+
+    #[test]
     fn configured_agents_skill_is_in_inline_completion_and_builtins_stay_distinct() {
         let dir = tempfile::tempdir().unwrap();
         let skill_dir = dir.path().join(".agents/skills/review");
@@ -795,6 +998,30 @@ mod tests {
             entries
                 .iter()
                 .any(|entry| { matches!(entry, SlashEntry::Command("/help")) })
+        );
+    }
+
+    #[test]
+    fn inline_completion_uses_a_custom_configured_skill_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("configured-skills/custom-review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: Custom Review\ncommand: custom-review\ndescription: Inspect configured roots\n---\nReview.\n",
+        )
+        .unwrap();
+
+        let entries = load_slash_entries(dir.path(), &[PathBuf::from("configured-skills")]);
+        let skill = entries
+            .iter()
+            .find(|entry| entry.command_str() == "/custom-review")
+            .unwrap();
+        assert!(skill.display_text().contains("Inspect configured roots"));
+        assert!(
+            skill
+                .display_text()
+                .contains("configured-skills/custom-review")
         );
     }
 }

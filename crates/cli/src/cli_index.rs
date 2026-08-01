@@ -264,7 +264,7 @@ fn default_rules() -> Vec<String> {
     vec![
         "New top-level subcommand: add variant to Command in main.rs, match arm in try_main, optional test in cli_commands.rs.".into(),
         "New AgentEvent: update crates/common/src/event.rs, emit in runtime, render in stream.rs and tui/; check tui/replay.rs.".into(),
-        "Session persistence: SessionStore under workspace .nca/sessions; paths from SessionConfig in config.rs.".into(),
-        "CLI index cache: ~/.nca/workspaces/<workspace-id>/cli-index.json via nca_common::config helpers.".into(),
+        "Session persistence: SessionStore under the product home's workspaces/<workspace-id>/sessions; paths from SessionConfig in config.rs.".into(),
+        "CLI index cache: product-home/workspaces/<workspace-id>/cli-index.json via nca_common::config helpers.".into(),
     ]
 }

@@ -4,10 +4,10 @@ use crate::file_mentions;
 use crate::tui::composer::{
     PaletteRow, SLASH_PANEL_MAX_ROWS, apply_at_completion, apply_selected_at_completion,
     at_completion_active, at_completion_matches, branch_picker_enter_command,
-    composer_chrome_height, composer_input_height, composer_render_model,
+    composer_chrome_height, composer_input_height_with_width, composer_render_model_with_width,
     delete_completed_at_mention, filter_palette_rows, filter_slash_entries,
     filtered_branch_indices, insert_text_at_cursor, load_slash_entries, move_cursor_end,
-    move_cursor_home, move_cursor_vertical, normalize_paste, palette_command_for_label,
+    move_cursor_home, move_cursor_vertical_with_width, normalize_paste, palette_command_for_label,
     palette_selectable_indices, sanitize_single_line_paste, slash_panel_visible,
 };
 use crate::tui::connect_modal::{
@@ -221,7 +221,7 @@ fn approval_shortcut_action(
 /// Keeping this seam in `app.rs` makes acceptance tests observe both overlay
 /// ownership and the command emitted to the runtime bridge. The lower-level
 /// input handlers remain responsible only for interpreting their key events.
-fn dispatch_custom_provider_key(
+pub(crate) fn dispatch_custom_provider_key(
     state: &mut TuiSessionState,
     key: KeyEvent,
     cmd_tx: &Sender<TuiCmd>,
@@ -455,7 +455,13 @@ pub fn run_blocking(
                     g.cursor_char_idx,
                 );
                 let auxiliary_rows = usize::from(!g.staged_image_attachments.is_empty()) + 1;
-                let input_h = composer_input_height(&g.input_buffer, auxiliary_rows);
+                let preview_area = Rect::new(0, 0, cur_size.0, cur_size.1);
+                let (preview_main_area, _) = layout_with_sidebar(preview_area);
+                let input_h = composer_input_height_with_width(
+                    &g.input_buffer,
+                    auxiliary_rows,
+                    preview_main_area.width as usize,
+                );
 
                 terminal.draw(|frame| {
                 let area = frame.area();
@@ -969,12 +975,13 @@ pub fn run_blocking(
                     }
                 }
 
-                let render_model = composer_render_model(
+                let render_model = composer_render_model_with_width(
                     &g.input_buffer,
                     g.cursor_char_idx,
                     inp_r.height
                         .saturating_sub(2 + auxiliary_rows as u16)
                         .max(1) as usize,
+                    inp_r.width as usize,
                 );
 
                 let hint = if g.active_approval.is_some() {
@@ -2087,9 +2094,10 @@ pub fn run_blocking(
                         &g.input_buffer,
                         g.cursor_char_idx,
                     );
-                    let input_h = composer_input_height(
+                    let input_h = composer_input_height_with_width(
                         &g.input_buffer,
                         usize::from(!g.staged_image_attachments.is_empty()) + 1,
+                        main_area.width as usize,
                     );
                     let (tr, _, slash_r, _) = layout_chunks(main_area, sh, input_h);
 
@@ -3072,9 +3080,10 @@ pub fn run_blocking(
                                         &g.input_buffer,
                                         g.cursor_char_idx,
                                     );
-                                    let input_h = composer_input_height(
+                                    let input_h = composer_input_height_with_width(
                                         &g.input_buffer,
                                         usize::from(!g.staged_image_attachments.is_empty()) + 1,
+                                        main_area.width as usize,
                                     );
                                     let (tr, _, _, _) = layout_chunks(main_area, sh, input_h);
                                     let total =
@@ -3111,10 +3120,19 @@ pub fn run_blocking(
                                 {
                                     g.slash_menu_index = g.slash_menu_index.saturating_sub(1);
                                 } else if !g.input_buffer.is_empty() {
-                                    g.cursor_char_idx = move_cursor_vertical(
+                                    let composer_width = terminal
+                                        .size()
+                                        .ok()
+                                        .map(|sz| {
+                                            let area = Rect::new(0, 0, sz.width, sz.height);
+                                            layout_with_sidebar(area).0.width as usize
+                                        })
+                                        .unwrap_or(usize::MAX);
+                                    g.cursor_char_idx = move_cursor_vertical_with_width(
                                         &g.input_buffer,
                                         g.cursor_char_idx,
                                         false,
+                                        composer_width,
                                     );
                                 } else {
                                     g.transcript_follow_tail = false;
@@ -3142,10 +3160,19 @@ pub fn run_blocking(
                                     let n = slash_filtered.len();
                                     g.slash_menu_index = (g.slash_menu_index + 1) % n;
                                 } else if !g.input_buffer.is_empty() {
-                                    g.cursor_char_idx = move_cursor_vertical(
+                                    let composer_width = terminal
+                                        .size()
+                                        .ok()
+                                        .map(|sz| {
+                                            let area = Rect::new(0, 0, sz.width, sz.height);
+                                            layout_with_sidebar(area).0.width as usize
+                                        })
+                                        .unwrap_or(usize::MAX);
+                                    g.cursor_char_idx = move_cursor_vertical_with_width(
                                         &g.input_buffer,
                                         g.cursor_char_idx,
                                         true,
+                                        composer_width,
                                     );
                                 } else {
                                     let sz = terminal.size().ok();
@@ -3158,9 +3185,10 @@ pub fn run_blocking(
                                             &g.input_buffer,
                                             g.cursor_char_idx,
                                         );
-                                        let input_h = composer_input_height(
+                                        let input_h = composer_input_height_with_width(
                                             &g.input_buffer,
                                             usize::from(!g.staged_image_attachments.is_empty()) + 1,
+                                            main_area.width as usize,
                                         );
                                         let (tr, _, _, _) = layout_chunks(main_area, sh, input_h);
                                         let lines =

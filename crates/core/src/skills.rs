@@ -61,9 +61,15 @@ impl SkillCatalog {
             }
             let entries = std::fs::read_dir(&root)
                 .map_err(|err| format!("failed to read skills dir {}: {err}", root.display()))?;
-            for entry in entries {
-                let entry = entry.map_err(|err| err.to_string())?;
-                let path = entry.path();
+            let mut paths = entries
+                .map(|entry| {
+                    entry
+                        .map(|entry| entry.path())
+                        .map_err(|err| err.to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            paths.sort();
+            for path in paths {
                 let skill_file = if path.is_dir() {
                     path.join("SKILL.md")
                 } else if path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md") {
@@ -163,6 +169,11 @@ fn discovery_roots(
             workspace_root.join(directory)
         }
     }));
+    // Workspace-compatible skills remain discoverable even when a custom
+    // config replaces (rather than extends) the configured directory list.
+    // Keep explicit configured roots ahead of this fallback so existing
+    // configured-source precedence remains intact.
+    roots.push(workspace_root.join(".agents/skills"));
     roots
 }
 
@@ -220,11 +231,12 @@ impl Skill {
             self.short_description =
                 non_empty(interface.short_description).or(self.short_description.take());
         }
-        if metadata
-            .policy
-            .and_then(|policy| policy.allow_implicit_invocation)
-            == Some(false)
-        {
+        let allow_implicit_invocation = metadata.allow_implicit_invocation.or_else(|| {
+            metadata
+                .policy
+                .and_then(|policy| policy.allow_implicit_invocation)
+        });
+        if allow_implicit_invocation == Some(false) {
             self.allow_implicit_invocation = false;
         }
     }
@@ -242,10 +254,7 @@ impl Skill {
     }
 
     pub fn manifest_summary(&self) -> String {
-        let description = self
-            .description
-            .as_deref()
-            .unwrap_or("No description provided.");
+        let description = self.presentation_description();
         let model = self.model.as_deref().unwrap_or("inherit");
         let permission_mode = self
             .permission_mode
@@ -255,8 +264,13 @@ impl Skill {
             SkillSource::AgentsMd => " [AGENTS.md]",
             SkillSource::FileSystem => "",
         };
+        let label = if self.display_name.is_some() {
+            format!(" ({})", self.display_label())
+        } else {
+            String::new()
+        };
         format!(
-            "- /{}: {}{}\n  model={model} permission_mode={permission_mode} context={:?}",
+            "- /{}{label}: {}{}\n  model={model} permission_mode={permission_mode} context={:?}",
             self.command, description, source_tag, self.context
         )
     }
@@ -397,6 +411,7 @@ struct SkillFrontmatter {
 struct SkillMetadata {
     interface: Option<SkillInterfaceMetadata>,
     policy: Option<SkillPolicyMetadata>,
+    allow_implicit_invocation: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -769,6 +784,8 @@ mod tests {
         assert_eq!(skill.display_label(), "Review Changes");
         assert_eq!(skill.presentation_description(), "Inspect a diff");
         assert!(skill.is_manual_only());
+        assert!(skill.manifest_summary().contains("Review Changes"));
+        assert!(skill.manifest_summary().contains("Inspect a diff"));
     }
 
     #[test]
@@ -835,6 +852,103 @@ mod tests {
                 .name,
             "Configured Review"
         );
+    }
+
+    #[test]
+    fn discovers_workspace_agents_catalog_when_configured_roots_are_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".agents/skills/review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: Workspace Review\ncommand: review\n---\nReview.\n",
+        )
+        .unwrap();
+
+        let skills = SkillCatalog::discover(dir.path(), &[PathBuf::from("custom")]).unwrap();
+        assert!(skills.iter().any(|skill| skill.command == "review"));
+    }
+
+    #[test]
+    fn catalog_regression_covers_legacy_sources_and_duplicate_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("AGENTS.md"),
+            "## Shared\n\nAGENTS.md wins.\n\n## Agents Only\n\nWorkspace instructions.\n",
+        )
+        .unwrap();
+
+        let roots = [
+            (".nca/skills", "nca-only"),
+            (".claude/skills", "claude-only"),
+            ("configured-skills", "configured-only"),
+            (".agents/skills", "agents-only"),
+        ];
+        for (root, command) in roots {
+            let skill_dir = dir.path().join(root).join(command);
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                format!("---\nname: {command}\ncommand: {command}\n---\n{command} body.\n"),
+            )
+            .unwrap();
+        }
+
+        for root in [
+            ".nca/skills",
+            ".claude/skills",
+            "configured-skills",
+            ".agents/skills",
+        ] {
+            let skill_dir = dir.path().join(root).join("shared");
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                "---\nname: Filesystem Shared\ncommand: shared\n---\nFilesystem loses.\n",
+            )
+            .unwrap();
+        }
+
+        let skills = SkillCatalog::discover(
+            dir.path(),
+            &[
+                PathBuf::from(".nca/skills"),
+                PathBuf::from(".claude/skills"),
+                PathBuf::from("configured-skills"),
+                PathBuf::from(".agents/skills"),
+            ],
+        )
+        .unwrap();
+
+        for command in ["nca-only", "claude-only", "configured-only", "agents-only"] {
+            assert!(skills.iter().any(|skill| skill.command == command));
+        }
+        let shared = skills
+            .iter()
+            .find(|skill| skill.command == "shared")
+            .unwrap();
+        assert_eq!(shared.source, SkillSource::AgentsMd);
+        assert!(shared.body.contains("AGENTS.md wins"));
+    }
+
+    #[test]
+    fn top_level_metadata_policy_can_make_a_skill_manual_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("review");
+        std::fs::create_dir_all(skill_dir.join("agents")).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: Review\ncommand: review\n---\nReview.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            skill_dir.join("agents/openai.yaml"),
+            "allow_implicit_invocation: false\n",
+        )
+        .unwrap();
+
+        let skill = parse_skill_file(&skill_dir.join("SKILL.md")).unwrap();
+        assert!(skill.is_manual_only());
     }
 
     #[test]

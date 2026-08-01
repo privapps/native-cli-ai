@@ -168,6 +168,13 @@ impl Supervisor {
             ToolRegistry::with_default_full_tools(workspace_root.clone(), config.web.clone())
         };
         tools.set_yolo(cfg.execution.yolo);
+        if cfg
+            .explicitly_requested_skills
+            .iter()
+            .any(|skill| skill == nca_core::tools::autoresearch::AGENT_SKILL_COMMAND)
+        {
+            tools.authorize_autoresearch();
+        }
         if !config.mcp.servers.is_empty()
             && (cfg.execution.yolo || !cfg.safe_mode || config.mcp.expose_in_safe_mode)
         {
@@ -937,6 +944,12 @@ impl Supervisor {
 
     pub fn agent(&self) -> &AgentLoop {
         &self.agent
+    }
+
+    /// Authorize the agent-facing autoresearch tool after the user selects
+    /// its manual-only skill from the normal skill surface.
+    pub fn authorize_autoresearch(&self) {
+        self.agent.tools.authorize_autoresearch();
     }
 
     pub fn agent_mut(&mut self) -> &mut AgentLoop {
@@ -2052,6 +2065,11 @@ mod tests {
     #[tokio::test]
     async fn refreshing_harness_replaces_generated_prompt_without_reordering_history() {
         let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(
+            workspace.path().join("AGENTS.md"),
+            "initial workspace guidance",
+        )
+        .expect("write initial AGENTS.md");
         let mut config = nca_common::config::NcaConfig::default();
         config.session.history_dir = workspace.path().join("sessions");
         config.session.last_session_file = workspace.path().join("last-session");
@@ -2078,6 +2096,16 @@ mod tests {
         })
         .await
         .expect("create supervisor");
+        assert!(matches!(
+            &supervisor.agent().messages[0].content,
+            nca_common::message::MessageContent::Text(text)
+                if text.contains("initial workspace guidance")
+        ));
+        std::fs::write(
+            workspace.path().join("AGENTS.md"),
+            "refreshed workspace guidance",
+        )
+        .expect("write refreshed AGENTS.md");
         supervisor.agent_mut().messages.extend([
             Message::user("hello"),
             Message::assistant("answer"),
@@ -2088,6 +2116,16 @@ mod tests {
         supervisor.refresh_system_prompt();
 
         let messages = &supervisor.agent().messages;
+        assert!(matches!(
+            &messages[0].content,
+            nca_common::message::MessageContent::Text(text)
+                if text.contains("refreshed workspace guidance")
+        ));
+        assert!(matches!(
+            &messages[0].content,
+            nca_common::message::MessageContent::Text(text)
+                if !text.contains("initial workspace guidance")
+        ));
         assert_eq!(
             messages.iter().filter(|m| m.role == Role::System).count(),
             1
@@ -2417,6 +2455,11 @@ mod tests {
     async fn spawned_child_receives_explicit_manual_only_skill_context() {
         let (base_url, body_rx) = spawn_openai_turn_server();
         let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(
+            workspace.path().join("AGENTS.md"),
+            "Child workspace guidance must remain in the system prompt.",
+        )
+        .expect("write child AGENTS.md");
         let mut config = NcaConfig::default();
         config.provider.default = ProviderKind::Custom;
         config.provider.custom.base_url = base_url;
@@ -2453,6 +2496,9 @@ mod tests {
         let request_body = body_rx
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("child provider request");
+        assert!(
+            request_body.contains("Child workspace guidance must remain in the system prompt.")
+        );
         assert!(request_body.contains("## Recommended Skills"));
         assert!(request_body.contains("- manual"));
     }

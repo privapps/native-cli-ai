@@ -6,6 +6,7 @@ license.workspace = true
 description = "Agent loop, provider abstraction, tool protocol, and approval policy"
 
 [dependencies]
+nca-autoresearch = { workspace = true }
 nca-common = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

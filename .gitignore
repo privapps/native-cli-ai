@@ -31,5 +31,6 @@ for-test/
 
 .agents
 .scratch/
+.archive/
 skills
 graphify-out/

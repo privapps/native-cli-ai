@@ -393,6 +393,7 @@ fn spawn_json_reports_machine_paths() {
     write_local_config(temp.path());
     let nca_home = temp.path().join("nca-home");
     let runtime_dir = temp.path().join("runtime");
+    fs::create_dir_all(runtime_dir.join("nca")).expect("create isolated runtime directory");
 
     let output = Command::cargo_bin("nca")
         .expect("binary")
@@ -438,6 +439,12 @@ fn spawn_json_reports_machine_paths() {
         .expect("spawned child pid")
         .try_into()
         .expect("pid should fit in u32");
+    let socket_path = Path::new(
+        payload["socket_path"]
+            .as_str()
+            .expect("socket path should be present"),
+    )
+    .to_path_buf();
     let cancel = Command::cargo_bin("nca")
         .expect("binary")
         .current_dir(temp.path())
@@ -456,10 +463,53 @@ fn spawn_json_reports_machine_paths() {
     assert_eq!(cancelled["cancelled"], true);
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while process_is_alive(pid) && std::time::Instant::now() < deadline {
+    while (process_is_alive(pid) || socket_path.exists()) && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
     assert!(!process_is_alive(pid), "spawned child should be terminated");
+    assert!(
+        !socket_path.exists(),
+        "spawned child IPC endpoint should be removed: {}",
+        socket_path.display()
+    );
+}
+
+#[test]
+fn spawn_startup_failure_reports_ipc_context() {
+    let temp = tempdir().expect("tempdir");
+    write_local_config(temp.path());
+    let nca_home = temp.path().join("nca-home");
+    let runtime_dir = temp.path().join("runtime");
+    fs::write(&runtime_dir, "runtime path is occupied by a file")
+        .expect("runtime collision fixture should be created");
+
+    let assertion = Command::cargo_bin("nca")
+        .expect("binary")
+        .current_dir(temp.path())
+        .env("HOME", temp.path())
+        .env("NCA_HOME", &nca_home)
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env_remove("MINIMAX_API_KEY")
+        .arg("spawn")
+        .arg("--prompt")
+        .arg("hello")
+        .arg("--json")
+        .assert()
+        .failure();
+
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr);
+    assert!(stderr.contains("spawned session session-"));
+    assert!(stderr.contains("failed to prepare IPC directory"));
+    assert!(stderr.contains(&runtime_dir.join("nca").display().to_string()));
+    assert!(stderr.contains(".sock"));
+    assert!(
+        runtime_dir.is_file(),
+        "runtime collision fixture should remain"
+    );
+    assert!(
+        !runtime_dir.join("nca").exists(),
+        "startup failure should not leave an IPC endpoint directory"
+    );
 }
 
 #[test]

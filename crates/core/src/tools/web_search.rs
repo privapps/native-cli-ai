@@ -5,6 +5,7 @@ use crate::research::{
 use chrono::{DateTime, Utc};
 use nca_common::config::WebConfig;
 use nca_common::tool::{ToolCall, ToolDefinition, ToolResult};
+use reqwest::StatusCode;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +20,16 @@ pub struct WebSearchTool {
     client: reqwest::Client,
     config: WebConfig,
     context: Arc<ResearchContext>,
+    search_url: String,
+}
+
+/// Returns whether a search error is a definitive provider outcome rather than
+/// a transient request or parser failure that may be worth retrying.
+pub(crate) fn is_non_retryable_search_failure(error: Option<&str>) -> bool {
+    error.is_some_and(|error| {
+        error.starts_with("search provider blocked the request")
+            || error == "no search results found for the query"
+    })
 }
 
 impl WebSearchTool {
@@ -28,10 +39,24 @@ impl WebSearchTool {
             .user_agent(config.user_agent.clone())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
+        Self::with_client_and_endpoint(config, context, client, "https://html.duckduckgo.com/html/")
+    }
+
+    /// Construct a search tool with an injected HTTP client and endpoint.
+    ///
+    /// The runtime uses [`Self::new`]. This seam keeps fixture tests local and
+    /// deterministic while exercising the same HTTP and parsing boundary.
+    pub fn with_client_and_endpoint(
+        config: WebConfig,
+        context: Arc<ResearchContext>,
+        client: reqwest::Client,
+        search_url: impl Into<String>,
+    ) -> Self {
         Self {
             client,
             config,
             context,
+            search_url: search_url.into(),
         }
     }
 }
@@ -82,23 +107,26 @@ impl ToolExecutor for WebSearchTool {
         let query = add_domain_hints(query, &call.input["domains"]);
         let response = self
             .client
-            .get("https://html.duckduckgo.com/html/")
+            .get(&self.search_url)
             .query(&[("q", query.as_str())])
             .send()
             .await;
 
-        let body = match response {
-            Ok(response) => match response.text().await {
-                Ok(body) => body,
-                Err(err) => {
-                    return ToolResult {
-                        call_id: call.id.clone(),
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!("failed to read search response: {err}")),
-                    };
+        let (status, body) = match response {
+            Ok(response) => {
+                let status = response.status();
+                match response.text().await {
+                    Ok(body) => (status, body),
+                    Err(err) => {
+                        return ToolResult {
+                            call_id: call.id.clone(),
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!("failed to read search response: {err}")),
+                        };
+                    }
                 }
-            },
+            }
             Err(err) => {
                 return ToolResult {
                     call_id: call.id.clone(),
@@ -111,13 +139,12 @@ impl ToolExecutor for WebSearchTool {
 
         let rows = parse_search_results(&body, limit);
 
-        if rows.is_empty() {
-            let fallback = html_fragment_text(&body);
+        if let Some(error) = classify_search_failure(status, &body, rows.is_empty()) {
             return ToolResult {
                 call_id: call.id.clone(),
                 success: false,
-                output: fallback.chars().take(self.config.max_fetch_chars).collect(),
-                error: Some("no structured search results parsed".into()),
+                output: String::new(),
+                error: Some(error),
             };
         }
 
@@ -237,9 +264,95 @@ fn classed_divisions(html: &str, class_name: &str) -> Vec<String> {
     html_elements_with_class_any_tag(html, class_name)
 }
 
+fn classify_search_failure(
+    status: StatusCode,
+    body: &str,
+    no_structured_results: bool,
+) -> Option<String> {
+    if !no_structured_results {
+        if !status.is_success() {
+            return Some(format!(
+                "search provider returned HTTP status {}",
+                status.as_u16()
+            ));
+        }
+        return None;
+    }
+
+    let body_lower = body.to_ascii_lowercase();
+    if body_lower.contains("anomaly-modal")
+        || body_lower.contains("challenge-form")
+        || body_lower.contains("unfortunately, bots use duckduckgo too")
+    {
+        return Some(format!(
+            "search provider blocked the request (HTTP {}): DuckDuckGo returned an anti-bot challenge",
+            status.as_u16()
+        ));
+    }
+
+    if !status.is_success() {
+        return Some(format!(
+            "search provider returned HTTP status {}",
+            status.as_u16()
+        ));
+    }
+
+    if body_lower.contains("no results found") {
+        return Some("no search results found for the query".into());
+    }
+
+    Some(format!(
+        "search response contained no recognized structured results (HTTP {})",
+        status.as_u16()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{classed_divisions, parse_search_results};
+    use super::{classed_divisions, classify_search_failure, parse_search_results};
+    use reqwest::StatusCode;
+
+    #[test]
+    fn classifies_duckduckgo_antibot_challenge_with_status() {
+        let error = classify_search_failure(
+            StatusCode::ACCEPTED,
+            r#"<div class="anomaly-modal__title">Unfortunately, bots use DuckDuckGo too.</div>"#,
+            true,
+        )
+        .expect("challenge should be classified");
+
+        assert_eq!(
+            error,
+            "search provider blocked the request (HTTP 202): DuckDuckGo returned an anti-bot challenge"
+        );
+    }
+
+    #[test]
+    fn classifies_legitimate_empty_results_separately() {
+        let error = classify_search_failure(
+            StatusCode::OK,
+            "No results found for the requested query",
+            true,
+        )
+        .expect("empty results should be classified");
+
+        assert_eq!(error, "no search results found for the query");
+    }
+
+    #[test]
+    fn classifies_unrecognized_result_markup_separately() {
+        let error = classify_search_failure(
+            StatusCode::OK,
+            "<html><body>Unexpected layout</body></html>",
+            true,
+        )
+        .expect("unrecognized markup should be classified");
+
+        assert_eq!(
+            error,
+            "search response contained no recognized structured results (HTTP 200)"
+        );
+    }
 
     #[test]
     fn finds_nested_search_result_divisions() {

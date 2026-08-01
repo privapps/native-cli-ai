@@ -8,7 +8,8 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 /// Metric optimization goal
@@ -38,6 +39,34 @@ pub struct MetricCommand {
     pub command: String,
     /// Regex with one capture group to extract the numeric value
     pub parse_regex: String,
+}
+
+impl MetricCommand {
+    /// Validate the command and metric extraction contract before execution.
+    ///
+    /// Parsing a Markdown program intentionally supplies a general numeric
+    /// fallback when no regex is declared.  Validation belongs at the
+    /// execution boundary so callers that construct a program directly and
+    /// callers that load one from disk receive the same loud failure.
+    pub fn validate(&self) -> Result<()> {
+        if self.command.trim().is_empty() {
+            bail!("research program has an empty metric command");
+        }
+        if self.parse_regex.trim().is_empty() {
+            bail!("research program has an empty metric regex");
+        }
+
+        let regex = Regex::new(self.parse_regex.trim()).with_context(|| {
+            format!(
+                "research program has an invalid metric regex {:?}",
+                self.parse_regex
+            )
+        })?;
+        if regex.captures_len() < 2 {
+            bail!("research program metric regex must contain a capture group");
+        }
+        Ok(())
+    }
 }
 
 /// File that the agent is allowed to edit
@@ -96,6 +125,14 @@ pub struct ResearchProgram {
 }
 
 impl ResearchProgram {
+    /// Validate the program before it is used to execute or persist a session.
+    pub fn validate(&self) -> Result<()> {
+        if self.name.trim().is_empty() {
+            bail!("research program has an empty name");
+        }
+        self.metric_command.validate()
+    }
+
     /// Parse a research program from a markdown file
     ///
     /// The format follows karpathy/autoresearch's `program.md`:
@@ -242,10 +279,12 @@ impl ResearchProgram {
                                 if let Some(mem) = extract_float(lines[i]) {
                                     max_memory_gb = Some(mem);
                                 }
-                            } else if !lines[i].trim().starts_with('-')
-                                && !lines[i].trim().starts_with('*')
-                            {
-                                extra_constraints.push(lines[i].trim().to_string());
+                            } else {
+                                let declaration =
+                                    lines[i].trim().trim_start_matches(['-', '*']).trim();
+                                if !declaration.is_empty() {
+                                    extra_constraints.push(declaration.to_string());
+                                }
                             }
                             i += 1;
                         }
@@ -613,6 +652,17 @@ Modify train.py to improve val_bpb. Changes are kept if metric improves.
         assert!(!program.fixed_files.is_empty());
         assert_eq!(program.time_budget_seconds, 300);
         assert_eq!(program.max_memory_gb, Some(50.0));
+    }
+
+    #[test]
+    fn missing_regex_uses_the_valid_default() {
+        let program = ResearchProgram::from_markdown(
+            "# Default regex\n\n## Metric\n- Command: `printf 0.42`\n",
+        )
+        .unwrap();
+
+        assert_eq!(program.metric_command.parse_regex, r"([\d.]+)");
+        program.validate().unwrap();
     }
 
     #[test]

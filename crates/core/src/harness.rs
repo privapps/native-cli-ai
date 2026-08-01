@@ -130,16 +130,6 @@ pub fn build_system_prompt(
         }
     }
 
-    if let Some(section) = environment_section(snapshot) {
-        sections.push(section);
-    }
-    if let Some(section) = todos_section(snapshot) {
-        sections.push(section);
-    }
-    if let Some(section) = memory_section(snapshot) {
-        sections.push(section);
-    }
-
     if let Some(text) = read_if_exists(&workspace_root.join("AGENTS.md"))
         && !text.trim().is_empty()
     {
@@ -161,6 +151,18 @@ pub fn build_system_prompt(
     }
 
     if let Some(section) = skills_section(workspace_root, &config.harness.skill_directories) {
+        sections.push(section);
+    }
+
+    // Dynamic context follows the trusted instruction layers so it remains
+    // clearly contextual and cannot be mistaken for workspace policy.
+    if let Some(section) = environment_section(snapshot) {
+        sections.push(section);
+    }
+    if let Some(section) = todos_section(snapshot) {
+        sections.push(section);
+    }
+    if let Some(section) = memory_section(snapshot) {
         sections.push(section);
     }
 
@@ -466,13 +468,13 @@ mod tests {
             .expect("playbook");
 
         assert!(identity_idx < permission_idx);
-        assert!(permission_idx < env_idx);
-        assert!(env_idx < todos_idx);
-        assert!(todos_idx < memory_idx);
-        assert!(memory_idx < agents_idx);
+        assert!(permission_idx < agents_idx);
         assert!(agents_idx < project_idx);
         assert!(project_idx < local_idx);
         assert!(local_idx < skills_idx);
+        assert!(skills_idx < env_idx);
+        assert!(env_idx < todos_idx);
+        assert!(todos_idx < memory_idx);
         assert!(skills_idx < orchestration_idx);
         assert!(orchestration_idx < playbook_idx);
     }
@@ -519,5 +521,48 @@ mod tests {
         assert!(prompt.contains("AGENTS.md Instructions:\nagents override"));
         assert!(prompt.contains("Project Instructions:\nproject override"));
         assert!(prompt.contains("Local Instructions:\nlocal override"));
+    }
+
+    #[test]
+    fn absent_agents_file_does_not_add_an_instruction_layer() {
+        let config = NcaConfig::default();
+        let temp = tempdir().expect("tempdir");
+
+        let prompt = build_system_prompt(&config, &empty_snapshot(temp.path()), None);
+
+        assert!(!prompt.contains("AGENTS.md Instructions:"));
+    }
+
+    #[test]
+    fn agents_discovery_is_scoped_to_the_configured_workspace_root() {
+        let config = NcaConfig::default();
+        let parent = tempdir().expect("parent tempdir");
+        let workspace = parent.path().join("nested-workspace");
+        fs::create_dir_all(&workspace).expect("create nested workspace");
+        fs::write(parent.path().join("AGENTS.md"), "parent guidance")
+            .expect("write parent AGENTS.md");
+
+        let prompt = build_system_prompt(&config, &empty_snapshot(&workspace), None);
+
+        assert!(!prompt.contains("parent guidance"));
+        assert!(!prompt.contains("AGENTS.md Instructions:"));
+
+        fs::write(workspace.join("AGENTS.md"), "workspace guidance")
+            .expect("write workspace AGENTS.md");
+        let prompt = build_system_prompt(&config, &empty_snapshot(&workspace), None);
+        assert!(prompt.contains("AGENTS.md Instructions:\nworkspace guidance"));
+        assert!(!prompt.contains("parent guidance"));
+    }
+
+    #[test]
+    fn agents_instructions_are_not_duplicated_in_a_single_prompt() {
+        let config = NcaConfig::default();
+        let temp = tempdir().expect("tempdir");
+        fs::write(temp.path().join("AGENTS.md"), "workspace guidance").expect("write AGENTS.md");
+
+        let prompt = build_system_prompt(&config, &empty_snapshot(temp.path()), None);
+
+        assert_eq!(prompt.matches("workspace guidance").count(), 1);
+        assert_eq!(prompt.matches("AGENTS.md Instructions:").count(), 1);
     }
 }
