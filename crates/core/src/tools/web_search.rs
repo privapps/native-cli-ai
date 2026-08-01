@@ -128,23 +128,103 @@ trait SearchProvider: Send + Sync {
 pub struct SearchLimiter {
     in_flight: Arc<Semaphore>,
     state: Mutex<GateState>,
+    clock: Arc<dyn SearchClock>,
     min_interval: Duration,
     cooldown: Duration,
     max_cooldown: Duration,
 }
 
 struct GateState {
-    last_started: Option<Instant>,
-    cooldown_until: Option<Instant>,
+    last_started: Option<Duration>,
+    cooldown_until: Option<Duration>,
     blocked_count: u32,
+}
+
+#[async_trait]
+pub trait SearchClock: Send + Sync {
+    fn now(&self) -> Duration;
+
+    async fn sleep_until(&self, deadline: Duration);
+}
+
+struct TokioSearchClock {
+    origin: Instant,
+}
+
+#[async_trait]
+impl SearchClock for TokioSearchClock {
+    fn now(&self) -> Duration {
+        self.origin.elapsed()
+    }
+
+    async fn sleep_until(&self, deadline: Duration) {
+        tokio::time::sleep(deadline.saturating_sub(self.now())).await;
+    }
+}
+
+/// A monotonic clock for deterministic limiter tests.
+#[doc(hidden)]
+pub struct ManualSearchClock {
+    now: std::sync::Mutex<Duration>,
+    advanced: tokio::sync::Notify,
+    sleep_started: tokio::sync::Notify,
+}
+
+impl ManualSearchClock {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            now: std::sync::Mutex::new(Duration::ZERO),
+            advanced: tokio::sync::Notify::new(),
+            sleep_started: tokio::sync::Notify::new(),
+        })
+    }
+
+    pub fn advance(&self, duration: Duration) {
+        let mut now = self.now.lock().expect("manual clock mutex poisoned");
+        *now = now.saturating_add(duration);
+        drop(now);
+        self.advanced.notify_waiters();
+    }
+
+    pub async fn wait_for_sleep(&self) {
+        self.sleep_started.notified().await;
+    }
+}
+
+#[async_trait]
+impl SearchClock for ManualSearchClock {
+    fn now(&self) -> Duration {
+        *self.now.lock().expect("manual clock mutex poisoned")
+    }
+
+    async fn sleep_until(&self, deadline: Duration) {
+        self.sleep_started.notify_one();
+        loop {
+            let notified = self.advanced.notified();
+            if self.now() >= deadline {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 impl SearchLimiter {
     pub fn new(config: &WebConfig) -> Arc<Self> {
-        Arc::new(Self::from_config(config))
+        Arc::new(Self::from_config(
+            config,
+            Arc::new(TokioSearchClock {
+                origin: Instant::now(),
+            }),
+        ))
     }
 
-    fn from_config(config: &WebConfig) -> Self {
+    #[doc(hidden)]
+    pub fn new_with_clock(config: &WebConfig, clock: Arc<dyn SearchClock>) -> Arc<Self> {
+        Arc::new(Self::from_config(config, clock))
+    }
+
+    fn from_config(config: &WebConfig, clock: Arc<dyn SearchClock>) -> Self {
         Self {
             in_flight: Arc::new(Semaphore::new(1)),
             state: Mutex::new(GateState {
@@ -152,6 +232,7 @@ impl SearchLimiter {
                 cooldown_until: None,
                 blocked_count: 0,
             }),
+            clock,
             min_interval: Duration::from_millis(config.search_min_interval_ms),
             cooldown: Duration::from_millis(config.search_cooldown_ms),
             max_cooldown: Duration::from_millis(config.search_max_cooldown_ms)
@@ -169,30 +250,40 @@ impl SearchLimiter {
 
     async fn wait_for_start(&self) {
         loop {
-            let wait = {
+            let wait_until = {
                 let mut state = self.state.lock().await;
-                let now = Instant::now();
-                let interval_wait = state
+                let now = self.clock.now();
+                let interval_until = state
                     .last_started
-                    .and_then(|last| self.min_interval.checked_sub(last.elapsed()));
-                let cooldown_wait = state
-                    .cooldown_until
-                    .and_then(|until| until.checked_duration_since(now));
-                match (interval_wait, cooldown_wait) {
+                    .map(|last| last.saturating_add(self.min_interval));
+                let cooldown_until = state.cooldown_until;
+                let until = match (interval_until, cooldown_until) {
                     (Some(interval), Some(cooldown)) => Some(interval.max(cooldown)),
-                    (Some(wait), None) | (None, Some(wait)) => Some(wait),
-                    (None, None) => {
-                        state.last_started = Some(now);
-                        None
-                    }
+                    (Some(interval), None) => Some(interval),
+                    (None, Some(cooldown)) => Some(cooldown),
+                    (None, None) => None,
+                };
+                if until.is_none_or(|deadline| deadline <= now) {
+                    state.last_started = Some(now);
+                    None
+                } else {
+                    until
                 }
             };
-            if let Some(wait) = wait {
-                tokio::time::sleep(wait).await;
+            if let Some(deadline) = wait_until {
+                self.clock.sleep_until(deadline).await;
             } else {
                 return;
             }
         }
+    }
+
+    async fn sleep_for_retry(&self, retry_index: u32) {
+        let deadline = self
+            .clock
+            .now()
+            .saturating_add(self.retry_delay(retry_index));
+        self.clock.sleep_until(deadline).await;
     }
 
     fn retry_delay(&self, retry_index: u32) -> Duration {
@@ -210,7 +301,11 @@ impl SearchLimiter {
     async fn record_challenge(&self) {
         let mut state = self.state.lock().await;
         state.blocked_count = state.blocked_count.saturating_add(1).min(16);
-        state.cooldown_until = Some(Instant::now() + self.retry_delay(state.blocked_count - 1));
+        state.cooldown_until = Some(
+            self.clock
+                .now()
+                .saturating_add(self.retry_delay(state.blocked_count - 1)),
+        );
     }
 
     async fn record_failure(&self, error: &ProviderError) {
@@ -219,16 +314,15 @@ impl SearchLimiter {
         }
         let mut state = self.state.lock().await;
         state.blocked_count = state.blocked_count.saturating_add(1).min(16);
-        state.cooldown_until = Some(Instant::now() + self.retry_delay(state.blocked_count - 1));
+        state.cooldown_until = Some(
+            self.clock
+                .now()
+                .saturating_add(self.retry_delay(state.blocked_count - 1)),
+        );
     }
 }
 
 type ProviderGate = SearchLimiter;
-
-fn shared_bing_gate(config: &WebConfig) -> Arc<ProviderGate> {
-    static GATE: OnceLock<Arc<ProviderGate>> = OnceLock::new();
-    GATE.get_or_init(|| SearchLimiter::new(config)).clone()
-}
 
 fn shared_duckduckgo_gate(config: &WebConfig) -> Arc<ProviderGate> {
     static GATE: OnceLock<Arc<ProviderGate>> = OnceLock::new();
@@ -239,26 +333,23 @@ struct BingSearchProvider {
     client: reqwest::Client,
     endpoint: String,
     config: WebConfig,
-    gate: Arc<ProviderGate>,
 }
 
 impl BingSearchProvider {
-    fn new(config: WebConfig, gate: Arc<ProviderGate>) -> Self {
+    fn new(config: WebConfig) -> Self {
         let client = build_search_client(&config);
-        Self::with_client(config, client, BING_SEARCH_URL, gate)
+        Self::with_client(config, client, BING_SEARCH_URL)
     }
 
     fn with_client(
         config: WebConfig,
         client: reqwest::Client,
         endpoint: impl Into<String>,
-        gate: Arc<ProviderGate>,
     ) -> Self {
         Self {
             client,
             endpoint: endpoint.into(),
             config,
-            gate,
         }
     }
 
@@ -302,21 +393,17 @@ impl BingSearchProvider {
 #[async_trait]
 impl SearchProvider for BingSearchProvider {
     async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>, ProviderError> {
-        let _permit = self.gate.acquire().await;
         let retries = self
             .config
             .search_retry_attempts
             .min(MAX_SEARCH_RETRY_ATTEMPTS);
         for retry_index in 0..=retries {
-            self.gate.wait_for_start().await;
             match self.attempt(query, limit).await {
                 Ok(rows) if !rows.is_empty() => {
-                    self.gate.record_success().await;
                     return Ok(rows);
                 }
                 Ok(_) => {
                     let error = ProviderError::empty("bing");
-                    self.gate.record_failure(&error).await;
                     return Err(error);
                 }
                 Err(error) if error.retryable() && retry_index < retries => {
@@ -327,10 +414,9 @@ impl SearchProvider for BingSearchProvider {
                         error = %error,
                         "retrying transient search provider failure"
                     );
-                    tokio::time::sleep(self.gate.retry_delay(retry_index)).await;
+                    tokio::time::sleep(configured_retry_delay(&self.config, retry_index)).await;
                 }
                 Err(error) => {
-                    self.gate.record_failure(&error).await;
                     return Err(error);
                 }
             }
@@ -460,7 +546,7 @@ impl SearchProvider for DuckDuckGoSearchProvider {
                         error = %error,
                         "retrying DuckDuckGo search provider failure"
                     );
-                    tokio::time::sleep(self.gate.retry_delay(transient_retry_index - 1)).await;
+                    self.gate.sleep_for_retry(transient_retry_index - 1).await;
                 }
                 Err(error) => {
                     drop(permit);
@@ -477,6 +563,14 @@ fn build_search_client(config: &WebConfig) -> reqwest::Client {
         .user_agent(config.user_agent.clone())
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+fn configured_retry_delay(config: &WebConfig, retry_index: u32) -> Duration {
+    let cooldown = Duration::from_millis(config.search_cooldown_ms);
+    let max_cooldown = Duration::from_millis(config.search_max_cooldown_ms).max(cooldown);
+    cooldown
+        .saturating_mul(1_u32 << retry_index.min(16))
+        .min(max_cooldown)
 }
 
 pub struct WebSearchTool {
@@ -499,7 +593,7 @@ pub(crate) fn is_non_retryable_search_failure(error: Option<&str>) -> bool {
 
 impl WebSearchTool {
     pub fn new(config: WebConfig, context: Arc<ResearchContext>) -> Self {
-        let bing = BingSearchProvider::new(config.clone(), shared_bing_gate(&config));
+        let bing = BingSearchProvider::new(config.clone());
         let duckduckgo =
             DuckDuckGoSearchProvider::new(config.clone(), shared_duckduckgo_gate(&config));
         Self {
@@ -518,12 +612,7 @@ impl WebSearchTool {
         duckduckgo_client: reqwest::Client,
         duckduckgo_endpoint: impl Into<String>,
     ) -> Self {
-        let bing = BingSearchProvider::with_client(
-            config.clone(),
-            bing_client,
-            bing_endpoint,
-            SearchLimiter::new(&config),
-        );
+        let bing = BingSearchProvider::with_client(config.clone(), bing_client, bing_endpoint);
         let duckduckgo = DuckDuckGoSearchProvider::with_client(
             config.clone(),
             duckduckgo_client,
@@ -548,12 +637,7 @@ impl WebSearchTool {
         duckduckgo_endpoint: impl Into<String>,
         duckduckgo_limiter: Arc<SearchLimiter>,
     ) -> Self {
-        let bing = BingSearchProvider::with_client(
-            config.clone(),
-            bing_client,
-            bing_endpoint,
-            SearchLimiter::new(&config),
-        );
+        let bing = BingSearchProvider::with_client(config.clone(), bing_client, bing_endpoint);
         let duckduckgo = DuckDuckGoSearchProvider::with_client(
             config.clone(),
             duckduckgo_client,
@@ -577,12 +661,7 @@ impl WebSearchTool {
         duckduckgo_client: reqwest::Client,
         duckduckgo_endpoint: impl Into<String>,
     ) -> Self {
-        let bing = BingSearchProvider::with_client(
-            config.clone(),
-            bing_client,
-            bing_endpoint,
-            shared_bing_gate(&config),
-        );
+        let bing = BingSearchProvider::with_client(config.clone(), bing_client, bing_endpoint);
         let duckduckgo = DuckDuckGoSearchProvider::with_client(
             config.clone(),
             duckduckgo_client,
