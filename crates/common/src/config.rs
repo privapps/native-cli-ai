@@ -2169,6 +2169,8 @@ pub struct WebConfig {
     pub search_max_cooldown_ms: u64,
     /// Number of retries after the initial recognized HTTP 202 challenge.
     pub search_challenge_retries: u32,
+    /// Number of retries for transient search-provider failures.
+    pub search_retry_attempts: u32,
     pub user_agent: String,
 }
 
@@ -2182,6 +2184,7 @@ impl Default for WebConfig {
             search_cooldown_ms: 5_000,
             search_max_cooldown_ms: 60_000,
             search_challenge_retries: 3,
+            search_retry_attempts: 1,
             user_agent: "nca/0.5 (+https://github.com/user/native-cli-ai)".into(),
         }
     }
@@ -2209,6 +2212,11 @@ impl WebConfig {
         }
         if let Some(search_challenge_retries) = partial.search_challenge_retries {
             self.search_challenge_retries = search_challenge_retries;
+        }
+        if let Some(search_retry_attempts) = partial.search_retry_attempts {
+            self.search_retry_attempts = search_retry_attempts;
+        } else if let Some(search_challenge_retries) = partial.search_challenge_retries {
+            self.search_retry_attempts = search_challenge_retries;
         }
         if let Some(user_agent) = partial.user_agent {
             self.user_agent = user_agent;
@@ -2526,6 +2534,7 @@ struct PartialWebConfig {
     search_cooldown_ms: Option<u64>,
     search_max_cooldown_ms: Option<u64>,
     search_challenge_retries: Option<u32>,
+    search_retry_attempts: Option<u32>,
     user_agent: Option<String>,
 }
 
@@ -2590,6 +2599,7 @@ mod tests {
         assert_eq!(defaults.search_cooldown_ms, 5_000);
         assert_eq!(defaults.search_max_cooldown_ms, 60_000);
         assert_eq!(defaults.search_challenge_retries, 3);
+        assert_eq!(defaults.search_retry_attempts, 1);
 
         let workspace = tempfile::tempdir().expect("workspace");
         let path = workspace_config_path(workspace.path());
@@ -2606,6 +2616,7 @@ mod tests {
         assert_eq!(configured.web.search_cooldown_ms, 750);
         assert_eq!(configured.web.search_max_cooldown_ms, 5_000);
         assert_eq!(configured.web.search_challenge_retries, 2);
+        assert_eq!(configured.web.search_retry_attempts, 2);
         assert_eq!(configured.web.default_search_limit, 5);
     }
 

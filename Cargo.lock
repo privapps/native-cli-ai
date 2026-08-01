@@ -2055,6 +2055,7 @@ dependencies = [
  "genai",
  "nca-autoresearch",
  "nca-common",
+ "quick-xml",
  "regex",
  "reqwest 0.12.28",
  "serde",
@@ -2675,6 +2676,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
 dependencies = [
  "memchr",
+ "serde",
 ]
 
 [[package]]
