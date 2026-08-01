@@ -30,7 +30,7 @@ pub fn parse_tui_question_answer(
     }
     if q.allow_custom && !t.is_empty() {
         return Some(QuestionSelection::Custom {
-            text: t.to_string(),
+            text: raw.to_string(),
         });
     }
     None
@@ -106,6 +106,25 @@ mod tests {
         assert_eq!(
             parse_tui_question_answer("0", &q),
             Some(QuestionSelection::Suggested)
+        );
+    }
+
+    #[test]
+    fn preserves_newlines_in_custom_answers() {
+        let q = InteractiveQuestionPayload {
+            question_id: "q".into(),
+            call_id: "c".into(),
+            prompt: "p".into(),
+            options: vec![],
+            allow_custom: true,
+            suggested_answer: "x".into(),
+        };
+
+        assert_eq!(
+            parse_tui_question_answer(" first\n\nsecond\n", &q),
+            Some(QuestionSelection::Custom {
+                text: " first\n\nsecond\n".into(),
+            })
         );
     }
 }

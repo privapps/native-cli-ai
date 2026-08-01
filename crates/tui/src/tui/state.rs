@@ -205,6 +205,19 @@ pub struct ModelPickerEntry {
     pub is_header: bool,
 }
 
+/// Lightweight skill projection used by the TUI picker. It deliberately
+/// excludes the instruction body so opening `/skills` does not retain full
+/// skill documents in overlay state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillPickerEntry {
+    pub command: String,
+    pub display_name: String,
+    pub description: String,
+    pub source: String,
+    pub directory: String,
+    pub manual_only: bool,
+}
+
 impl TuiSessionState {
     pub fn new(
         session_id: String,
@@ -315,6 +328,10 @@ impl TuiSessionState {
 
     pub fn session_picker_open(&self) -> bool {
         matches!(self.overlay, UiOverlay::SessionPicker { .. })
+    }
+
+    pub fn skill_picker_open(&self) -> bool {
+        matches!(self.overlay, UiOverlay::SkillPicker { .. })
     }
 
     pub fn provider_picker_open(&self) -> bool {
@@ -516,6 +533,34 @@ impl TuiSessionState {
     pub fn session_picker_scroll(&self) -> usize {
         match &self.overlay {
             UiOverlay::SessionPicker { scroll, .. } => *scroll,
+            _ => 0,
+        }
+    }
+
+    pub fn skill_picker_query(&self) -> &str {
+        match &self.overlay {
+            UiOverlay::SkillPicker { query, .. } => query.as_str(),
+            _ => "",
+        }
+    }
+
+    pub fn skill_picker_index(&self) -> usize {
+        match &self.overlay {
+            UiOverlay::SkillPicker { index, .. } => *index,
+            _ => 0,
+        }
+    }
+
+    pub fn skill_picker_entries(&self) -> &[SkillPickerEntry] {
+        match &self.overlay {
+            UiOverlay::SkillPicker { entries, .. } => entries.as_slice(),
+            _ => &[],
+        }
+    }
+
+    pub fn skill_picker_scroll(&self) -> usize {
+        match &self.overlay {
+            UiOverlay::SkillPicker { scroll, .. } => *scroll,
             _ => 0,
         }
     }
@@ -886,6 +931,27 @@ impl TuiSessionState {
         }
     }
 
+    pub fn skill_picker_query_mut(&mut self) -> Option<&mut String> {
+        match &mut self.overlay {
+            UiOverlay::SkillPicker { query, .. } => Some(query),
+            _ => None,
+        }
+    }
+
+    pub fn skill_picker_index_mut(&mut self) -> Option<&mut usize> {
+        match &mut self.overlay {
+            UiOverlay::SkillPicker { index, .. } => Some(index),
+            _ => None,
+        }
+    }
+
+    pub fn skill_picker_scroll_mut(&mut self) -> Option<&mut usize> {
+        match &mut self.overlay {
+            UiOverlay::SkillPicker { scroll, .. } => Some(scroll),
+            _ => None,
+        }
+    }
+
     pub fn provider_picker_index_mut(&mut self) -> Option<&mut usize> {
         match &mut self.overlay {
             UiOverlay::ProviderPicker { index, .. } => Some(index),
@@ -1123,6 +1189,21 @@ impl TuiSessionState {
 
     pub fn close_session_picker(&mut self) {
         if self.session_picker_open() {
+            self.close_overlay();
+        }
+    }
+
+    pub fn open_skill_picker(&mut self, entries: Vec<SkillPickerEntry>, query: &str) {
+        self.set_overlay(UiOverlay::SkillPicker {
+            query: query.trim().to_string(),
+            index: 0,
+            entries,
+            scroll: 0,
+        });
+    }
+
+    pub fn close_skill_picker(&mut self) {
+        if self.skill_picker_open() {
             self.close_overlay();
         }
     }

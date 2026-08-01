@@ -6,7 +6,7 @@
 use nca_common::config::ProviderKind;
 use std::fmt;
 
-use super::state::{CustomProviderSetupStep, ModelPickerEntry};
+use super::state::{CustomProviderSetupStep, ModelPickerEntry, SkillPickerEntry};
 
 /// Active modal overlay and its variant-specific payload.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -60,6 +60,12 @@ pub enum UiOverlay {
         entries: Vec<String>,
         scroll: usize,
     },
+    SkillPicker {
+        query: String,
+        index: usize,
+        entries: Vec<SkillPickerEntry>,
+        scroll: usize,
+    },
     ProviderPicker {
         index: usize,
         scroll: usize,
@@ -100,6 +106,7 @@ impl UiOverlay {
             Self::AgentPicker { .. } => UiOverlayKind::AgentPicker,
             Self::QuestionModal { .. } => UiOverlayKind::QuestionModal,
             Self::SessionPicker { .. } => UiOverlayKind::SessionPicker,
+            Self::SkillPicker { .. } => UiOverlayKind::SkillPicker,
             Self::ProviderPicker { .. } => UiOverlayKind::ProviderPicker,
             Self::CustomProviderSetup { .. } => UiOverlayKind::CustomProviderSetup,
         }
@@ -145,6 +152,7 @@ pub enum UiOverlayKind {
     AgentPicker,
     QuestionModal,
     SessionPicker,
+    SkillPicker,
     ProviderPicker,
     CustomProviderSetup,
 }

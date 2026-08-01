@@ -21,7 +21,7 @@ pub use runner::{
     dispatch_tool_approval,
 };
 pub use tui::{
-    DisplayBlock, ModelPickerAction, ModelPickerEntry, TuiCmd, TuiSessionState, git_create_branch,
-    git_current_branch, git_list_branches, git_switch_branch, replay_event_log_into_state,
-    run_blocking, spawn_tui_bridge,
+    DisplayBlock, ModelPickerAction, ModelPickerEntry, SkillPickerEntry, TuiCmd, TuiSessionState,
+    git_create_branch, git_current_branch, git_list_branches, git_switch_branch,
+    replay_event_log_into_state, run_blocking, spawn_tui_bridge,
 };

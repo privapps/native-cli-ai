@@ -4,17 +4,20 @@ use crate::file_mentions;
 use crate::tui::composer::{
     PaletteRow, SLASH_PANEL_MAX_ROWS, apply_at_completion, apply_selected_at_completion,
     at_completion_active, at_completion_matches, branch_picker_enter_command,
-    composer_chrome_height, composer_line, delete_completed_at_mention, filter_palette_rows,
-    filter_slash_entries, filtered_branch_indices, load_slash_entries, palette_command_for_label,
-    palette_selectable_indices, slash_panel_visible,
+    composer_chrome_height, composer_input_height, composer_render_model,
+    delete_completed_at_mention, filter_palette_rows, filter_slash_entries,
+    filtered_branch_indices, insert_text_at_cursor, load_slash_entries, move_cursor_end,
+    move_cursor_home, move_cursor_vertical, normalize_paste, palette_command_for_label,
+    palette_selectable_indices, sanitize_single_line_paste, slash_panel_visible,
 };
 use crate::tui::connect_modal::{
     ConnectRow, build_connect_rows, clamp_selection, row_index_for_selection,
 };
 use crate::tui::input::{
-    ApprovalAnswer, ConnectModalKeyResult, CustomProviderSetupKeyResult, handle_approval_key,
-    handle_connect_modal_key, handle_custom_provider_setup_key, parse_tui_question_answer,
-    render_branch_picker, render_command_palette,
+    ApprovalAnswer, ConnectModalKeyResult, CustomProviderSetupKeyResult, SKILL_PICKER_MAX_ROWS,
+    empty_skill_picker_message, filtered_skill_indices, handle_approval_key,
+    handle_connect_modal_key, handle_custom_provider_setup_key, handle_skill_picker_key,
+    parse_tui_question_answer, render_branch_picker, render_command_palette,
 };
 use crate::tui::layout::{
     centered_rect, layout_chunks, layout_with_sidebar, rect_contains, sidebar_fit,
@@ -22,7 +25,7 @@ use crate::tui::layout::{
 use crate::tui::state::{
     CustomProviderSetupStep, DisplayBlock, ModelPickerAction, ModelPickerEntry, TuiSessionState,
 };
-use crate::tui::terminal::{restore_terminal, setup_terminal};
+use crate::tui::terminal::{TerminalRestoreGuard, restore_terminal, setup_terminal};
 use crate::tui::theme;
 use crate::tui::transcript::{
     ensure_transcript_cache, live_activity_lines, parse_approval_verdict, transcript_lines,
@@ -121,6 +124,10 @@ pub enum TuiCmd {
 }
 
 const MOUSE_SCROLL_LINES: usize = 3;
+
+fn modified_enter_inserts_newline(modifiers: KeyModifiers) -> bool {
+    modifiers.contains(KeyModifiers::SHIFT) || modifiers.contains(KeyModifiers::ALT)
+}
 
 /// Matches `PermissionMode` as stored via `format!("{:?}", mode)` (e.g. `BypassPermissions`).
 fn toolbar_permission_is_bypass(mode: &str) -> bool {
@@ -263,6 +270,93 @@ fn dispatch_custom_provider_key(
     false
 }
 
+/// Route a crossterm atomic paste to the active input context. Full-screen
+/// chat and inline custom answers preserve newlines; every single-line field
+/// receives the same payload with line endings replaced by spaces.
+fn dispatch_paste(state: &mut TuiSessionState, text: &str) -> bool {
+    let multiline = normalize_paste(text);
+    let single_line = sanitize_single_line_paste(text);
+
+    if state.question_modal_open()
+        || state.info_modal_open()
+        || state.provider_picker_open()
+        || state.permission_picker_open()
+        || state.agent_picker_open()
+    {
+        return true;
+    }
+    if state.command_palette_open() {
+        if let Some(query) = state.command_palette_query_mut() {
+            query.push_str(&single_line);
+            *state.palette_index_mut().unwrap() = 0;
+        }
+        return true;
+    }
+    if state.model_picker_open() {
+        if let Some(query) = state.model_picker_search_mut() {
+            query.push_str(&single_line);
+            *state.model_picker_index_mut().unwrap() = 0;
+            *state.model_picker_scroll_mut().unwrap() = 0;
+        }
+        return true;
+    }
+    if state.connect_modal_open() {
+        if let Some(query) = state.connect_search_mut() {
+            query.push_str(&single_line);
+            *state.connect_menu_index_mut().unwrap() = 0;
+            *state.connect_modal_scroll_mut().unwrap() = 0;
+        }
+        return true;
+    }
+    if state.branch_picker_open() {
+        if let Some(query) = state.branch_picker_query_mut() {
+            query.push_str(&single_line);
+            *state.branch_picker_index_mut().unwrap() = 0;
+        }
+        return true;
+    }
+    if state.session_picker_open() {
+        if let Some(query) = state.session_picker_search_mut() {
+            query.push_str(&single_line);
+            *state.session_picker_index_mut().unwrap() = 0;
+            *state.session_picker_scroll_mut().unwrap() = 0;
+        }
+        return true;
+    }
+    if state.skill_picker_open() {
+        state
+            .skill_picker_query_mut()
+            .unwrap()
+            .push_str(&single_line);
+        *state.skill_picker_index_mut().unwrap() = 0;
+        *state.skill_picker_scroll_mut().unwrap() = 0;
+        return true;
+    }
+    if state.api_key_modal_open() {
+        state.api_key_input_mut().unwrap().push_str(&single_line);
+        return true;
+    }
+    if state.custom_provider_setup_open() {
+        state
+            .custom_setup_input_mut()
+            .unwrap()
+            .push_str(&single_line);
+        return true;
+    }
+    if state.active_approval.is_some() {
+        state.input_buffer.push_str(&single_line);
+        state.cursor_char_idx = state.input_buffer.chars().count();
+        return true;
+    }
+
+    let (buffer, cursor) =
+        insert_text_at_cursor(&state.input_buffer, state.cursor_char_idx, &multiline);
+    state.input_buffer = buffer;
+    state.cursor_char_idx = cursor;
+    state.slash_menu_index = 0;
+    true
+}
+
 /// `question_answer_tx`: when `Some`, answers are sent there so they unblock `ask_question` while
 /// the async loop is stuck in `run_turn` (that task does not poll `cmd_rx` until the turn ends).
 #[allow(clippy::too_many_arguments)]
@@ -275,17 +369,18 @@ pub fn run_blocking(
     approval_answer_tx: Option<Sender<ApprovalAnswer>>,
     show_run_banner: bool,
     cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    skill_directories: Vec<PathBuf>,
 ) -> anyhow::Result<()> {
     let _ = version_rx.borrow_and_update();
     let mut terminal = setup_terminal()?;
+    let mut terminal_restore_guard = TerminalRestoreGuard::new();
 
     // Load slash entries once: hardcoded commands + discovered skills
-    let skill_dirs = vec![PathBuf::from(".nca/skills")];
     let workspace_root = {
         let g = state.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         g.workspace_root.clone()
     };
-    let slash_entries = load_slash_entries(&workspace_root, &skill_dirs);
+    let slash_entries = load_slash_entries(&workspace_root, &skill_directories);
     let (workspace_files_tx, workspace_files_rx) = std::sync::mpsc::channel();
     let discovery_root = workspace_root.clone();
     std::thread::spawn(move || {
@@ -359,11 +454,14 @@ pub fn run_blocking(
                     &g.input_buffer,
                     g.cursor_char_idx,
                 );
+                let auxiliary_rows = usize::from(!g.staged_image_attachments.is_empty()) + 1;
+                let input_h = composer_input_height(&g.input_buffer, auxiliary_rows);
 
                 terminal.draw(|frame| {
                 let area = frame.area();
                 let (main_area, sidebar_opt) = layout_with_sidebar(area);
-                let (tr, st_r, slash_opt, inp_r) = layout_chunks(main_area, chrome_h);
+                let (tr, st_r, slash_opt, inp_r) =
+                    layout_chunks(main_area, chrome_h, input_h);
 
                 let transcript_h = tr.height.saturating_sub(2) as usize;
                 let inner_w = tr.width.saturating_sub(2);
@@ -871,7 +969,13 @@ pub fn run_blocking(
                     }
                 }
 
-                let input_line = composer_line(&g.input_buffer, g.cursor_char_idx);
+                let render_model = composer_render_model(
+                    &g.input_buffer,
+                    g.cursor_char_idx,
+                    inp_r.height
+                        .saturating_sub(2 + auxiliary_rows as u16)
+                        .max(1) as usize,
+                );
 
                 let hint = if g.active_approval.is_some() {
                     Line::from(Span::styled(
@@ -892,7 +996,7 @@ pub fn run_blocking(
                     Line::from(Span::styled(hint_msg, Style::default().fg(theme::MUTED)))
                 } else if g.input_buffer.is_empty() {
                     Line::from(Span::styled(
-                        "Enter send · Tab agent · Ctrl+V image · Ctrl+P palette · Ctrl+X Q exit · Ctrl+L clear",
+                        "Enter send · Shift+Enter/Alt+Enter newline · Tab agent · Ctrl+V image · Ctrl+P palette · Ctrl+X Q exit · Ctrl+L clear",
                         Style::default().fg(theme::MUTED),
                     ))
                 } else {
@@ -918,7 +1022,7 @@ pub fn run_blocking(
                 } else {
                     Span::styled(" message ", Style::default().fg(theme::MUTED))
                 };
-                let mut input_lines = vec![input_line];
+                let mut input_lines = render_model.rows;
                 if !g.staged_image_attachments.is_empty() {
                     input_lines.push(Line::from(Span::styled(
                         format!(
@@ -1589,6 +1693,96 @@ pub fn run_blocking(
                     frame.render_widget(popup, popup_area);
                 }
 
+                if g.skill_picker_open() {
+                    let filtered = filtered_skill_indices(&g);
+                    let pick = g
+                        .skill_picker_index()
+                        .min(filtered.len().saturating_sub(1));
+                    let viewport = filtered.len().min(SKILL_PICKER_MAX_ROWS);
+                    let max_scroll = filtered.len().saturating_sub(viewport);
+                    *g.skill_picker_scroll_mut().unwrap() = g
+                        .skill_picker_scroll()
+                        .min(max_scroll)
+                        .min(pick);
+                    let start = g.skill_picker_scroll();
+                    let end = (start + viewport).min(filtered.len());
+                    let popup_h = (viewport as u16).saturating_add(7).max(9);
+                    let popup_area = centered_rect(area, 92, popup_h);
+                    let query = if g.skill_picker_query().is_empty() {
+                        "type to filter".to_string()
+                    } else {
+                        g.skill_picker_query().to_string()
+                    };
+                    let mut lines = vec![
+                        Line::from(vec![
+                            Span::styled(
+                                " Search ",
+                                Style::default()
+                                    .fg(theme::MUTED)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(query, Style::default().fg(theme::TEXT)),
+                        ]),
+                        Line::default(),
+                    ];
+                    if filtered.is_empty() {
+                        let message = empty_skill_picker_message(&g).unwrap();
+                        lines.push(Line::from(Span::styled(
+                            message,
+                            Style::default().fg(theme::MUTED),
+                        )));
+                    } else {
+                        for (visible, entry_index) in filtered[start..end].iter().enumerate() {
+                            let entry = &g.skill_picker_entries()[*entry_index];
+                            let selected = start + visible == pick;
+                            let style = if selected {
+                                Style::default()
+                                    .fg(Color::Black)
+                                    .bg(theme::USER)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().fg(theme::TEXT)
+                            };
+                            let manual = if entry.manual_only {
+                                " · manual-only"
+                            } else {
+                                ""
+                            };
+                            lines.push(Line::from(Span::styled(
+                                format!(
+                                    " /{} — {}: {} · {} [{}]{}",
+                                    entry.command,
+                                    entry.display_name,
+                                    entry.description,
+                                    entry.directory,
+                                    entry.source,
+                                    manual
+                                ),
+                                style,
+                            )));
+                        }
+                    }
+                    lines.push(Line::default());
+                    lines.push(Line::from(Span::styled(
+                        " ↑↓/jk select · Enter insert · Esc/q close ",
+                        Style::default().fg(theme::MUTED),
+                    )));
+                    frame.render_widget(ClearWidget, popup_area);
+                    let popup = Paragraph::new(Text::from(lines))
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .border_style(Style::default().fg(theme::BORDER))
+                                .title(Span::styled(
+                                    " skills ",
+                                    Style::default().fg(theme::MUTED),
+                                )),
+                        )
+                        .style(Style::default().bg(theme::SURFACE))
+                        .wrap(Wrap { trim: false });
+                    frame.render_widget(popup, popup_area);
+                }
+
                 // Model picker popup.
                 if g.model_picker_open() {
                     let filter = g.model_picker_search().to_ascii_lowercase();
@@ -1875,7 +2069,11 @@ pub fn run_blocking(
                 Event::Mouse(_) if g.permission_picker_open() => continue,
                 Event::Mouse(_) if g.agent_picker_open() => continue,
                 Event::Mouse(_) if g.session_picker_open() => continue,
+                Event::Mouse(_) if g.skill_picker_open() => continue,
                 Event::Mouse(_) if g.question_modal_open() => continue,
+                Event::Paste(text) => {
+                    dispatch_paste(&mut g, &text);
+                }
                 Event::Mouse(m) => {
                     let sz = terminal.size()?;
                     let area = Rect::new(0, 0, sz.width, sz.height);
@@ -1889,7 +2087,11 @@ pub fn run_blocking(
                         &g.input_buffer,
                         g.cursor_char_idx,
                     );
-                    let (tr, _, slash_r, _) = layout_chunks(main_area, sh);
+                    let input_h = composer_input_height(
+                        &g.input_buffer,
+                        usize::from(!g.staged_image_attachments.is_empty()) + 1,
+                    );
+                    let (tr, _, slash_r, _) = layout_chunks(main_area, sh, input_h);
 
                     if rect_contains(tr, m.column, m.row) {
                         let inner_w = tr.width.saturating_sub(2);
@@ -2082,6 +2284,13 @@ pub fn run_blocking(
                             }
                             _ => {}
                         }
+                        continue;
+                    }
+
+                    // Enter in the skill picker only edits the draft. The
+                    // resulting command is submitted later through Chat.
+                    if g.skill_picker_open() {
+                        handle_skill_picker_key(&mut g, key);
                         continue;
                     }
 
@@ -2718,6 +2927,13 @@ pub fn run_blocking(
                                 continue;
                             }
                         }
+                        (KeyCode::Enter, mods) if modified_enter_inserts_newline(mods) => {
+                            let (buffer, cursor) =
+                                insert_text_at_cursor(&g.input_buffer, g.cursor_char_idx, "\n");
+                            g.input_buffer = buffer;
+                            g.cursor_char_idx = cursor;
+                            g.slash_menu_index = 0;
+                        }
                         (KeyCode::Enter, _) => {
                             if !workspace_files_indexing
                                 && let Some((buf, cidx)) = apply_selected_at_completion(
@@ -2829,15 +3045,22 @@ pub fn run_blocking(
                             drop(g);
                             let _ = cmd_tx.try_send(TuiCmd::Submit(line));
                         }
-                        (KeyCode::Char('a'), KeyModifiers::CONTROL) | (KeyCode::Home, _) => {
+                        (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
                             g.cursor_char_idx = 0;
                         }
                         (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
                             g.cursor_char_idx = g.input_buffer.chars().count();
                         }
+                        (KeyCode::Home, _) => {
+                            if !g.input_buffer.is_empty() {
+                                g.cursor_char_idx =
+                                    move_cursor_home(&g.input_buffer, g.cursor_char_idx);
+                            }
+                        }
                         (KeyCode::End, _) => {
                             if !g.input_buffer.is_empty() {
-                                g.cursor_char_idx = g.input_buffer.chars().count();
+                                g.cursor_char_idx =
+                                    move_cursor_end(&g.input_buffer, g.cursor_char_idx);
                             } else {
                                 let sz = terminal.size().ok();
                                 if let Some(sz) = sz {
@@ -2849,7 +3072,11 @@ pub fn run_blocking(
                                         &g.input_buffer,
                                         g.cursor_char_idx,
                                     );
-                                    let (tr, _, _, _) = layout_chunks(main_area, sh);
+                                    let input_h = composer_input_height(
+                                        &g.input_buffer,
+                                        usize::from(!g.staged_image_attachments.is_empty()) + 1,
+                                    );
+                                    let (tr, _, _, _) = layout_chunks(main_area, sh, input_h);
                                     let total =
                                         transcript_lines(&g, tr.width.saturating_sub(2)).len();
                                     let th = tr.height.saturating_sub(2) as usize;
@@ -2883,6 +3110,12 @@ pub fn run_blocking(
                                     && slash_panel_visible(&g.input_buffer)
                                 {
                                     g.slash_menu_index = g.slash_menu_index.saturating_sub(1);
+                                } else if !g.input_buffer.is_empty() {
+                                    g.cursor_char_idx = move_cursor_vertical(
+                                        &g.input_buffer,
+                                        g.cursor_char_idx,
+                                        false,
+                                    );
                                 } else {
                                     g.transcript_follow_tail = false;
                                     g.scroll_lines = g.scroll_lines.saturating_sub(1);
@@ -2908,6 +3141,12 @@ pub fn run_blocking(
                                 {
                                     let n = slash_filtered.len();
                                     g.slash_menu_index = (g.slash_menu_index + 1) % n;
+                                } else if !g.input_buffer.is_empty() {
+                                    g.cursor_char_idx = move_cursor_vertical(
+                                        &g.input_buffer,
+                                        g.cursor_char_idx,
+                                        true,
+                                    );
                                 } else {
                                     let sz = terminal.size().ok();
                                     if let Some(sz) = sz {
@@ -2919,7 +3158,11 @@ pub fn run_blocking(
                                             &g.input_buffer,
                                             g.cursor_char_idx,
                                         );
-                                        let (tr, _, _, _) = layout_chunks(main_area, sh);
+                                        let input_h = composer_input_height(
+                                            &g.input_buffer,
+                                            usize::from(!g.staged_image_attachments.is_empty()) + 1,
+                                        );
+                                        let (tr, _, _, _) = layout_chunks(main_area, sh, input_h);
                                         let lines =
                                             transcript_lines(&g, tr.width.saturating_sub(2));
                                         let total = lines.len();
@@ -2981,6 +3224,7 @@ pub fn run_blocking(
     }
 
     restore_terminal();
+    terminal_restore_guard.disarm();
     let _ = execute!(stdout(), MoveToColumn(0));
     Ok(())
 }
@@ -2989,11 +3233,12 @@ pub fn run_blocking(
 mod approval_parse_tests {
     use super::{
         ApprovalShortcutAction, PrimaryInputMode, TuiCmd, apply_selected_at_completion,
-        approval_shortcut_action, branch_picker_enter_command, composer_line,
-        delete_completed_at_mention, dispatch_custom_provider_key, escape_cancels_active_turn,
-        filter_slash_entries, filtered_branch_indices, load_slash_entries, primary_input_mode,
+        approval_shortcut_action, branch_picker_enter_command, delete_completed_at_mention,
+        dispatch_custom_provider_key, dispatch_paste, escape_cancels_active_turn,
+        filter_slash_entries, filtered_branch_indices, load_slash_entries,
+        modified_enter_inserts_newline, primary_input_mode,
     };
-    use crate::tui::composer::completed_at_mention_range_before_cursor;
+    use crate::tui::composer::{completed_at_mention_range_before_cursor, composer_line};
     use crate::tui::state::{CustomProviderSetupStep, TuiSessionState};
     use crate::tui::transcript::parse_approval_verdict;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -3333,6 +3578,71 @@ mod approval_parse_tests {
             .expect("mention span should exist");
 
         assert_eq!(mention_span.style.bg, Some(super::theme::MENTION_BG));
+    }
+
+    #[test]
+    fn atomic_paste_preserves_chat_newlines_and_cursor_position() {
+        let mut state = state();
+        state.input_buffer = "αβγ".into();
+        state.cursor_char_idx = 2;
+
+        dispatch_paste(&mut state, "one\r\ntwo");
+
+        assert_eq!(state.input_buffer, "αβone\ntwoγ");
+        assert_eq!(state.cursor_char_idx, "αβone\ntwo".chars().count());
+    }
+
+    #[test]
+    fn modified_enter_is_newline_insertion_without_submission() {
+        assert!(modified_enter_inserts_newline(KeyModifiers::SHIFT));
+        assert!(modified_enter_inserts_newline(KeyModifiers::ALT));
+        assert!(!modified_enter_inserts_newline(KeyModifiers::NONE));
+
+        let mut state = state();
+        state.input_buffer = "draft".into();
+        state.cursor_char_idx = state.input_buffer.chars().count();
+        let (buffer, cursor) = crate::tui::composer::insert_text_at_cursor(
+            &state.input_buffer,
+            state.cursor_char_idx,
+            "\n",
+        );
+        state.input_buffer = buffer;
+        state.cursor_char_idx = cursor;
+
+        assert_eq!(state.input_buffer, "draft\n");
+        assert_eq!(state.cursor_char_idx, "draft\n".chars().count());
+    }
+
+    #[test]
+    fn atomic_paste_is_insert_only_and_does_not_submit_chat_input() {
+        let mut state = state();
+        dispatch_paste(&mut state, "first\nsecond");
+
+        assert_eq!(state.input_buffer, "first\nsecond");
+        assert!(!state.should_exit);
+    }
+
+    #[test]
+    fn multiline_at_completion_remains_available_after_a_newline() {
+        let workspace_files = vec!["src/main.rs".into(), "src/lib.rs".into()];
+        let buffer = "first line\nopen @src/ma";
+        let cursor = buffer.chars().count();
+
+        assert_eq!(
+            crate::tui::composer::at_completion_matches(&workspace_files, buffer, cursor),
+            vec!["src/main.rs"]
+        );
+    }
+
+    #[test]
+    fn atomic_paste_sanitizes_single_line_api_key_input_without_submit() {
+        let mut state = state();
+        state.open_api_key_modal(nca_common::config::ProviderKind::OpenAi, false, false);
+
+        dispatch_paste(&mut state, "secret\r\ncontinued");
+
+        assert_eq!(state.api_key_input(), "secret continued");
+        assert!(state.api_key_modal_open());
     }
 
     #[test]

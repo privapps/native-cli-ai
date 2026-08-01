@@ -2539,6 +2539,7 @@ fn default_skill_directories() -> Vec<PathBuf> {
         PathBuf::from("skills"),
         PathBuf::from(".nca/skills"),
         PathBuf::from(".claude/skills"),
+        PathBuf::from(".agents/skills"),
     ];
     if let Some(product) = nca_product_home() {
         dirs.push(product.join("skills"));
@@ -2553,6 +2554,16 @@ fn default_skill_directories() -> Vec<PathBuf> {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_harness_includes_compatible_agents_skill_directory() {
+        assert!(
+            NcaConfig::default()
+                .harness
+                .skill_directories
+                .contains(&PathBuf::from(".agents/skills"))
+        );
+    }
 
     #[test]
     fn custom_setup_normalizes_versioned_path_urls() {

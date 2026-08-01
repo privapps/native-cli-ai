@@ -88,6 +88,9 @@ pub struct SupervisorConfig {
     pub approval_handler: Option<Arc<dyn ApprovalHandler>>,
     pub orchestration_context: Option<OrchestrationContext>,
     pub execution: ExecutionContext,
+    /// Skill commands explicitly requested by a parent session. These may
+    /// load even when a skill is marked manual-only for model discovery.
+    pub explicitly_requested_skills: Vec<String>,
 }
 
 /// A handle returned to callers for interacting with a running supervisor.
@@ -226,12 +229,15 @@ impl Supervisor {
             event_tx.clone(),
             todos.clone(),
         )));
-        tools.register(Box::new(InvokeSkillTool::new_with_financial_capability(
-            workspace_root.clone(),
-            config.harness.skill_directories.clone(),
-            recent_skills,
-            tools.financial_research_capability(),
-        )));
+        tools.register(Box::new(
+            InvokeSkillTool::new_with_financial_capability_and_explicit_skills(
+                workspace_root.clone(),
+                config.harness.skill_directories.clone(),
+                recent_skills,
+                tools.financial_research_capability(),
+                cfg.explicitly_requested_skills.clone(),
+            ),
+        ));
         let session_id = cfg.session_id.unwrap_or_else(generate_session_id);
         let session_store = SessionStore::new(resolve_sessions_dir(&config, &workspace_root));
 
@@ -373,6 +379,7 @@ impl Supervisor {
                 approval_handler,
                 orchestration_context: None,
                 execution,
+                explicitly_requested_skills: Vec::new(),
             },
             Some(loaded),
         )
@@ -1688,6 +1695,7 @@ pub async fn spawn_child_session(
         approval_handler: Some(Arc::new(AutoDenyHandler) as Arc<dyn ApprovalHandler>),
         orchestration_context: None,
         execution: cfg.execution,
+        explicitly_requested_skills: cfg.skills.clone(),
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -2018,6 +2026,7 @@ mod tests {
             approval_handler: None,
             orchestration_context: None,
             execution: ExecutionContext::normal(),
+            explicitly_requested_skills: Vec::new(),
         })
         .await
         .expect("create supervisor");
@@ -2065,6 +2074,7 @@ mod tests {
             approval_handler: None,
             orchestration_context: None,
             execution: ExecutionContext::normal(),
+            explicitly_requested_skills: Vec::new(),
         })
         .await
         .expect("create supervisor");
@@ -2379,6 +2389,72 @@ mod tests {
         assert!(response.output.contains("review"));
 
         handle.abort();
+    }
+
+    #[test]
+    fn child_skill_resolution_keeps_explicit_manual_only_requests() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let skill_dir = temp.path().join(".agents/skills/manual");
+        std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: Manual\ncommand: manual\ndisable-model-invocation: true\n---\nManual body.\n",
+        )
+        .expect("write skill");
+
+        let config = NcaConfig::default();
+        let resolved = SkillCatalog::resolve_requested_commands(
+            temp.path(),
+            &config.harness.skill_directories,
+            &["manual".into()],
+        )
+        .expect("explicit child skill");
+
+        assert_eq!(resolved, vec!["manual"]);
+    }
+
+    #[tokio::test]
+    async fn spawned_child_receives_explicit_manual_only_skill_context() {
+        let (base_url, body_rx) = spawn_openai_turn_server();
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut config = NcaConfig::default();
+        config.provider.default = ProviderKind::Custom;
+        config.provider.custom.base_url = base_url;
+        config.provider.custom.api_key = Some("test-key".into());
+        config.provider.custom.model = "test-model".into();
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAi;
+        config.model.default_model = "test-model".into();
+        config.session.history_dir = workspace.path().join("sessions");
+        config.session.last_session_file = workspace.path().join("last-session");
+        config.memory.file_path = workspace.path().join("memory.json");
+        config.memory.context.auto_detect_context_window = false;
+        config.memory.context.query_provider_models_api = false;
+
+        let result = spawn_child_session(
+            ChildSessionConfig {
+                parent_session_id: "parent-1".into(),
+                task: "Use the requested workflow".into(),
+                workspace_root: workspace.path().to_path_buf(),
+                config,
+                parent_summary: "Parent selected the workflow explicitly.".into(),
+                use_worktree: false,
+                focus_files: vec![],
+                skills: vec!["manual".into()],
+                execution: ExecutionContext::normal(),
+                safe_mode: true,
+            },
+            None,
+        )
+        .await
+        .expect("spawn child session");
+
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.output, "ok");
+        let request_body = body_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("child provider request");
+        assert!(request_body.contains("## Recommended Skills"));
+        assert!(request_body.contains("- manual"));
     }
 
     #[test]

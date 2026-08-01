@@ -12,7 +12,6 @@ use nca_core::tools::web_search::WebSearchTool;
 use nca_core::tools::{RecentSkillHints, ToolExecutor, ToolRegistry};
 use reqwest::Client;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tiny_http::{Header, Response, Server, StatusCode};
 
@@ -180,7 +179,16 @@ async fn fallback_and_unverified_results_remain_structured_and_explicit() {
 
 #[tokio::test]
 async fn financial_skill_discovery_is_explicit_and_enables_financial_tools() {
-    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let workspace = tempfile::tempdir().expect("create skill fixture workspace");
+    let skill_directory = workspace.path().join(".agents/skills/financial-research");
+    std::fs::create_dir_all(&skill_directory).expect("create financial skill directory");
+    std::fs::write(
+        skill_directory.join("SKILL.md"),
+        "---\nname: Financial Research\ncommand: financial-research\n---\nUse one immutable UTC calendar date for the research turn.\n",
+    )
+    .expect("write financial skill fixture");
+
+    let workspace_root = workspace.path().to_path_buf();
     let config = NcaConfig::default();
     let registry =
         ToolRegistry::with_default_readonly_tools(workspace_root.clone(), config.web.clone());

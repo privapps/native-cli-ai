@@ -8,7 +8,7 @@ use crate::slash_commands::{help_lines as registry_help_lines, visible_commands}
 use crate::tui::custom_provider_flow::{CustomProviderProbeOutcome, CustomProviderSetupTransition};
 use crate::tui::{
     ApprovalAnswer, CustomProviderProbeAction, CustomProviderSetupSubmission, DisplayBlock,
-    ModelPickerAction, ModelPickerEntry, SharedTuiState, TuiCmd, TuiSessionState,
+    ModelPickerAction, ModelPickerEntry, SharedTuiState, SkillPickerEntry, TuiCmd, TuiSessionState,
     git_create_branch, git_current_branch, git_list_branches, git_switch_branch,
     replay_event_log_into_state, run_blocking, spawn_tui_bridge,
 };
@@ -18,10 +18,11 @@ use nca_common::config::{
     normalize_custom_provider_base_url, validate_custom_api_key_env_name,
 };
 use nca_common::event::{EndReason, QuestionSelection};
-use nca_core::skills::SkillCatalog;
+use nca_core::skills::{Skill, SkillCatalog};
 use nca_runtime::memory_store::MemoryStore;
 use reedline::{Completer, Emacs, FileBackedHistory, Reedline, Signal, Suggestion, Vi};
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use tokio::process::Command;
@@ -58,6 +59,41 @@ fn parse_custom_provider_command(
         api_key: tokens.next().map(str::to_string),
         model: tokens.next().map(str::to_string),
     }))
+}
+
+fn open_skill_picker_for_query(
+    state: &Arc<Mutex<TuiSessionState>>,
+    workspace_root: &Path,
+    skill_directories: &[PathBuf],
+    query: &str,
+) -> Result<(), String> {
+    let skills = SkillCatalog::discover(workspace_root, skill_directories)?;
+    let entries = skills
+        .into_iter()
+        .map(|skill| SkillPickerEntry {
+            display_name: skill.display_label().to_string(),
+            description: skill.presentation_description().to_string(),
+            source: skill.source_label().to_string(),
+            directory: skill.directory.display().to_string(),
+            manual_only: skill.is_manual_only(),
+            command: skill.command,
+        })
+        .collect();
+    state
+        .lock()
+        .map_err(|_| "TUI state lock poisoned".to_string())?
+        .open_skill_picker(entries, query);
+    Ok(())
+}
+
+fn resolve_explicit_skill(
+    workspace_root: &Path,
+    skill_directories: &[PathBuf],
+    command: &str,
+) -> Result<Option<Skill>, String> {
+    Ok(SkillCatalog::discover(workspace_root, skill_directories)?
+        .into_iter()
+        .find(|skill| skill.command == command))
 }
 
 impl ReplOutput<'_> {
@@ -1250,29 +1286,26 @@ impl Repl {
                 out.println(&format!("permission mode set to {target:?}"));
             }
             "/skills" => {
-                let skills = SkillCatalog::discover(
-                    self.runtime.workspace_root(),
-                    &self.runtime.config().harness.skill_directories,
-                )
-                .map_err(anyhow::Error::msg)?;
-                if skills.is_empty() {
-                    let lines = vec!["No skills discovered.".into()];
-                    if let ReplOutput::Tui(st) = &out {
-                        if let Ok(mut g) = st.lock() {
-                            g.open_info_modal("skills", lines);
-                        }
-                    } else {
-                        out.println("no skills discovered");
-                    }
+                if let ReplOutput::Tui(st) = &out {
+                    open_skill_picker_for_query(
+                        st,
+                        self.runtime.workspace_root(),
+                        &self.runtime.config().harness.skill_directories,
+                        rest,
+                    )
+                    .map_err(anyhow::Error::msg)?;
                 } else {
-                    let lines: Vec<String> = skills.iter().map(|s| s.summary_line()).collect();
-                    if let ReplOutput::Tui(st) = &out {
-                        if let Ok(mut g) = st.lock() {
-                            g.open_info_modal("skills", lines);
-                        }
+                    let skills = SkillCatalog::discover(
+                        self.runtime.workspace_root(),
+                        &self.runtime.config().harness.skill_directories,
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                    if skills.is_empty() {
+                        out.println("no skills discovered");
                     } else {
-                        for l in &lines {
-                            out.println(l);
+                        for skill in &skills {
+                            let summary = skill.summary_line();
+                            out.println(&summary);
                         }
                     }
                 }
@@ -2054,12 +2087,13 @@ impl Repl {
         task: &str,
         out: &ReplOutput<'_>,
     ) -> anyhow::Result<bool> {
-        let skills = SkillCatalog::discover(
+        let Some(skill) = resolve_explicit_skill(
             self.runtime.workspace_root(),
             &self.runtime.config().harness.skill_directories,
+            skill_name,
         )
-        .map_err(anyhow::Error::msg)?;
-        let Some(skill) = skills.into_iter().find(|skill| skill.command == skill_name) else {
+        .map_err(anyhow::Error::msg)?
+        else {
             return Ok(false);
         };
 
@@ -2226,6 +2260,7 @@ impl Repl {
         let version_tx = shared_state.version_tx();
         let banner = self.run_mode;
         let cancel_flag = self.runtime.cancel_handle();
+        let skill_directories = self.runtime.config().harness.skill_directories.clone();
         let ui = tokio::task::spawn_blocking(move || {
             run_blocking(
                 st,
@@ -2236,6 +2271,7 @@ impl Repl {
                 Some(approval_for_tui),
                 banner,
                 Some(cancel_flag),
+                skill_directories,
             )
         });
 
@@ -2741,7 +2777,9 @@ impl Repl {
                     }
                 }
                 TuiCmd::Submit(line) => {
-                    let line = line.trim().to_string();
+                    // Keep the submitted draft intact for ordinary messages;
+                    // only command/empty-input checks use trimmed text.
+                    let trimmed_line = line.trim().to_string();
                     let api_key_modal_state = tui_state.lock().ok().and_then(|g| {
                         g.api_key_modal_open().then_some((
                             g.api_key_target_provider(),
@@ -2750,13 +2788,13 @@ impl Repl {
                         ))
                     });
                     if let Some((Some(p), key_input, connect_after_save)) = api_key_modal_state {
-                        let typed = if line.starts_with('/') {
+                        let typed = if trimmed_line.starts_with('/') {
                             ""
                         } else {
                             key_input.trim()
                         };
                         let had_existing = self.runtime.config().provider.api_key_present_for(p);
-                        if line.starts_with('/') {
+                        if trimmed_line.starts_with('/') {
                             if let Ok(mut g) = tui_state.lock() {
                                 g.close_api_key_modal();
                             }
@@ -2794,7 +2832,7 @@ impl Repl {
                             continue;
                         }
                     }
-                    if line.is_empty() {
+                    if trimmed_line.is_empty() {
                         if let Ok(mut g) = tui_state.lock()
                             && g.pending_api_key_provider.take().is_some()
                         {
@@ -2810,9 +2848,9 @@ impl Repl {
                         .ok()
                         .and_then(|g| g.pending_api_key_provider)
                     {
-                        if !line.starts_with('/') {
+                        if !trimmed_line.starts_with('/') {
                             let mut cfg = self.runtime.config().clone();
-                            cfg.set_provider_api_key(p, &line);
+                            cfg.set_provider_api_key(p, &trimmed_line);
                             match self.runtime.apply_nca_config(cfg) {
                                 Ok(()) => {
                                     if let Err(e) = self
@@ -2847,14 +2885,18 @@ impl Repl {
                             g.mark_dirty();
                         }
                     }
-                    if line.starts_with('!') {
-                        let shell_cmd = line.trim_start_matches('!').trim();
+                    if crate::tui::composer::is_single_line_command(&line)
+                        && trimmed_line.starts_with('!')
+                    {
+                        let shell_cmd = trimmed_line.trim_start_matches('!').trim();
                         self.run_bash_tui(shell_cmd, &tui_state).await;
                         continue;
                     }
-                    if line.starts_with('/') {
+                    if crate::tui::composer::is_single_line_command(&line)
+                        && trimmed_line.starts_with('/')
+                    {
                         if !self
-                            .handle_command(&line, ReplOutput::Tui(&tui_state))
+                            .handle_command(&trimmed_line, ReplOutput::Tui(&tui_state))
                             .await?
                         {
                             if let Ok(mut g) = tui_state.lock() {
@@ -3527,5 +3569,77 @@ mod tests {
                 && line.contains("OpenAI-compatible only")
                 && line.contains("inactive for active provider")
         }));
+    }
+
+    #[tokio::test]
+    async fn skills_command_opens_picker_with_query_and_enter_only_inserts_draft() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let state = Arc::new(Mutex::new(TuiSessionState::new(
+            "session".into(),
+            "model".into(),
+            "@build".into(),
+            "default".into(),
+            workspace.path().to_path_buf(),
+        )));
+        let skill_dir = workspace
+            .path()
+            .join(".agents/skills/nca-acceptance-picker");
+        std::fs::create_dir_all(&skill_dir).expect("skill directory");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: Picker Review\ncommand: nca-acceptance-picker\ndescription: Review from picker\n---\nReview.\n",
+        )
+        .expect("skill file");
+
+        open_skill_picker_for_query(
+            &state,
+            workspace.path(),
+            &[PathBuf::from(".agents/skills")],
+            "nca-acceptance-picker",
+        )
+        .expect("open skills picker");
+        {
+            let state = state.lock().expect("state lock");
+            assert!(state.skill_picker_open());
+            assert_eq!(state.skill_picker_query(), "nca-acceptance-picker");
+            assert!(
+                state
+                    .skill_picker_entries()
+                    .iter()
+                    .any(|entry| entry.command == "nca-acceptance-picker")
+            );
+            assert!(state.blocks.is_empty());
+        }
+
+        crate::tui::input::handle_skill_picker_key(
+            &mut state.lock().expect("state lock"),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        let state = state.lock().expect("state lock");
+        assert!(!state.skill_picker_open());
+        assert_eq!(state.input_buffer, "/nca-acceptance-picker ");
+        assert!(state.blocks.is_empty());
+    }
+
+    #[test]
+    fn explicit_user_skill_resolution_keeps_manual_only_skill() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let skill_dir = workspace.path().join(".agents/skills/manual-user");
+        std::fs::create_dir_all(&skill_dir).expect("skill directory");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: Manual User\ncommand: manual-user\ndisable-model-invocation: true\n---\nManual user skill.\n",
+        )
+        .expect("skill file");
+
+        let skill = resolve_explicit_skill(
+            workspace.path(),
+            &[PathBuf::from(".agents/skills")],
+            "manual-user",
+        )
+        .expect("resolve explicit skill")
+        .expect("manual skill");
+        assert!(skill.is_manual_only());
     }
 }

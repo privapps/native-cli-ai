@@ -9,7 +9,15 @@ pub const SIDEBAR_MIN_TOTAL_WIDTH: u16 = 110;
 pub const COMMAND_PALETTE_WIDTH: u16 = 48;
 pub const COMMAND_PALETTE_MAX_ROWS: usize = 10;
 
-pub fn layout_chunks(area: Rect, slash_h: u16) -> (Rect, Rect, Option<Rect>, Rect) {
+pub fn layout_chunks(
+    area: Rect,
+    slash_h: u16,
+    requested_input_h: u16,
+) -> (Rect, Rect, Option<Rect>, Rect) {
+    // Keep at least four transcript rows available, while allowing very small
+    // terminals to reduce the composer to its minimum bordered height.
+    let input_h =
+        requested_input_h.min(area.height.saturating_sub(slash_h.saturating_add(6)).max(3));
     if slash_h > 0 {
         let c = Layout::default()
             .direction(Direction::Vertical)
@@ -17,7 +25,7 @@ pub fn layout_chunks(area: Rect, slash_h: u16) -> (Rect, Rect, Option<Rect>, Rec
                 Constraint::Min(4),
                 Constraint::Length(2),
                 Constraint::Length(slash_h),
-                Constraint::Length(3),
+                Constraint::Length(input_h),
             ])
             .split(area);
         (c[0], c[1], Some(c[2]), c[3])
@@ -27,7 +35,7 @@ pub fn layout_chunks(area: Rect, slash_h: u16) -> (Rect, Rect, Option<Rect>, Rec
             .constraints([
                 Constraint::Min(4),
                 Constraint::Length(2),
-                Constraint::Length(3),
+                Constraint::Length(input_h),
             ])
             .split(area);
         (c[0], c[1], None, c[2])

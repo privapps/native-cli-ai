@@ -683,9 +683,36 @@ async fn run_onboarding_inner(
         })?;
 
         // Poll events (short timeout so spinner animates smoothly)
-        if event::poll(Duration::from_millis(if is_validating { 30 } else { 50 }))?
-            && let Event::Key(key) = event::read()?
-        {
+        if event::poll(Duration::from_millis(if is_validating { 30 } else { 50 }))? {
+            let key = match event::read()? {
+                Event::Key(key) => key,
+                Event::Paste(text) => {
+                    let text = crate::tui::composer::sanitize_single_line_paste(&text);
+                    if let Some(flow) = custom_flow.as_ref() {
+                        if matches!(
+                            flow.screen(),
+                            OnboardingScreen::Custom(
+                                CustomOnboardingStep::Endpoint
+                                    | CustomOnboardingStep::Credentials
+                                    | CustomOnboardingStep::Model
+                            )
+                        ) {
+                            custom_input.push_str(&text);
+                            custom_error = None;
+                        }
+                    } else if api_key_open {
+                        api_key_input.push_str(&text);
+                        if let Ok(mut state) = validation_state.lock() {
+                            *state = None;
+                        }
+                    } else if connect_open {
+                        connect_search.push_str(&text);
+                        connect_index = 0;
+                    }
+                    continue;
+                }
+                _ => continue,
+            };
             // Global quit
             if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                 anyhow::bail!("onboarding cancelled by user");

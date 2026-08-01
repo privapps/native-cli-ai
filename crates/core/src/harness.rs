@@ -286,7 +286,7 @@ fn skills_section(
     workspace_root: &Path,
     skill_directories: &[std::path::PathBuf],
 ) -> Option<String> {
-    let skills = SkillCatalog::discover(workspace_root, skill_directories).ok()?;
+    let skills = SkillCatalog::discover_for_model(workspace_root, skill_directories).ok()?;
     if skills.is_empty() {
         return None;
     }
@@ -475,6 +475,30 @@ mod tests {
         assert!(local_idx < skills_idx);
         assert!(skills_idx < orchestration_idx);
         assert!(orchestration_idx < playbook_idx);
+    }
+
+    #[test]
+    fn model_manifest_excludes_manual_only_skills_but_keeps_normal_skills() {
+        let config = NcaConfig::default();
+        let temp = tempdir().expect("tempdir");
+        fs::create_dir_all(temp.path().join(".agents/skills/normal")).expect("normal dir");
+        fs::create_dir_all(temp.path().join(".agents/skills/manual")).expect("manual dir");
+        fs::write(
+            temp.path().join(".agents/skills/normal/SKILL.md"),
+            "---\nname: Normal\ncommand: normal\ndescription: Normal workflow\n---\nNormal body.\n",
+        )
+        .expect("normal skill");
+        fs::write(
+            temp.path().join(".agents/skills/manual/SKILL.md"),
+            "---\nname: Manual\ncommand: manual\ndisable-model-invocation: true\n---\nManual body.\n",
+        )
+        .expect("manual skill");
+
+        let prompt = build_system_prompt(&config, &empty_snapshot(temp.path()), None);
+
+        assert!(prompt.contains("/normal:"));
+        assert!(!prompt.contains("/manual:"));
+        assert!(!prompt.contains("Manual body."));
     }
 
     #[test]

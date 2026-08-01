@@ -12,6 +12,7 @@ pub struct InvokeSkillTool {
     workspace_root: PathBuf,
     skill_directories: Vec<PathBuf>,
     recent_skills: RecentSkillHints,
+    explicitly_requested_skills: Vec<String>,
     financial_research_capability: Option<Arc<AtomicBool>>,
 }
 
@@ -25,6 +26,7 @@ impl InvokeSkillTool {
             workspace_root,
             skill_directories,
             recent_skills,
+            explicitly_requested_skills: Vec::new(),
             financial_research_capability: None,
         }
     }
@@ -37,6 +39,23 @@ impl InvokeSkillTool {
     ) -> Self {
         let mut tool = Self::new(workspace_root, skill_directories, recent_skills);
         tool.financial_research_capability = Some(capability);
+        tool
+    }
+
+    pub fn new_with_financial_capability_and_explicit_skills(
+        workspace_root: PathBuf,
+        skill_directories: Vec<PathBuf>,
+        recent_skills: RecentSkillHints,
+        capability: Arc<AtomicBool>,
+        explicitly_requested_skills: Vec<String>,
+    ) -> Self {
+        let mut tool = Self::new_with_financial_capability(
+            workspace_root,
+            skill_directories,
+            recent_skills,
+            capability,
+        );
+        tool.explicitly_requested_skills = explicitly_requested_skills;
         tool
     }
 }
@@ -91,7 +110,14 @@ impl ToolExecutor for InvokeSkillTool {
             }
         };
 
-        if let Some(skill) = skills.iter().find(|s| s.command == skill_name) {
+        if let Some(skill) = skills.iter().find(|s| {
+            s.command == skill_name
+                && (s.allow_implicit_invocation
+                    || self
+                        .explicitly_requested_skills
+                        .iter()
+                        .any(|requested| requested == &s.command))
+        }) {
             let body = skill.expanded_body();
             self.recent_skills.record(&skill.command);
             if skill.command == "financial-research"
@@ -211,6 +237,32 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.error.unwrap().contains("skill_name is required"));
+    }
+
+    #[tokio::test]
+    async fn manual_only_skill_requires_explicit_child_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".nca/skills/manual");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: Manual\ncommand: manual\ndisable-model-invocation: true\n---\nManual body.\n",
+        )
+        .unwrap();
+
+        let denied = make_tool(dir.path()).execute(&make_call("manual")).await;
+        assert!(!denied.success);
+
+        let allowed = InvokeSkillTool::new_with_financial_capability_and_explicit_skills(
+            dir.path().to_path_buf(),
+            vec![std::path::PathBuf::from(".nca/skills")],
+            RecentSkillHints::default(),
+            Arc::new(AtomicBool::new(false)),
+            vec!["manual".into()],
+        );
+        let loaded = allowed.execute(&make_call("manual")).await;
+        assert!(loaded.success);
+        assert!(loaded.output.contains("Manual body."));
     }
 
     #[tokio::test]

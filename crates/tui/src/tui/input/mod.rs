@@ -9,6 +9,7 @@ mod command_palette;
 mod connect_modal;
 mod custom_provider;
 mod question;
+mod skill_picker;
 mod slash_panel;
 
 pub use api_key_modal::{ApiKeyModalKeyResult, handle_api_key_modal_key};
@@ -24,6 +25,10 @@ pub use custom_provider::{
     handle_custom_provider_setup_key, provider_activation_outcome,
 };
 pub use question::{QuestionModalKeyResult, handle_question_modal_key};
+pub use skill_picker::{
+    SKILL_PICKER_MAX_ROWS, empty_skill_picker_message, filtered_skill_indices,
+    handle_skill_picker_key,
+};
 pub use slash_panel::{handle_slash_panel_key, render_slash_panel};
 
 use crate::tui::composer::slash_panel_visible;
@@ -38,6 +43,7 @@ pub enum InputContext {
     CustomProviderSetup,
     BranchPicker,
     QuestionModal,
+    SkillPicker,
     Approval,
     SlashPanel,
     AtPanel,
@@ -60,6 +66,7 @@ pub fn resolve_input_context(state: &TuiSessionState, at_active: bool) -> InputC
         }
         crate::tui::overlay::UiOverlayKind::BranchPicker => InputContext::BranchPicker,
         crate::tui::overlay::UiOverlayKind::QuestionModal => InputContext::QuestionModal,
+        crate::tui::overlay::UiOverlayKind::SkillPicker => InputContext::SkillPicker,
         _ if slash_panel_visible(&state.input_buffer) => InputContext::SlashPanel,
         _ if at_active => InputContext::AtPanel,
         _ => InputContext::Chat,

@@ -1467,13 +1467,16 @@ fn list_skills(config: &NcaConfig, workspace_root: &Path, json: bool) -> anyhow:
                 let source = skill.source_label().to_string();
                 SkillOutput {
                     name: skill.name,
+                    display_name: skill.display_name,
                     command: skill.command,
                     description: skill.description,
+                    short_description: skill.short_description,
                     model: skill.model,
                     permission_mode: skill.permission_mode.map(|mode| format!("{mode:?}")),
                     context: format!("{:?}", skill.context),
                     source,
                     directory: skill.directory,
+                    allow_implicit_invocation: skill.allow_implicit_invocation,
                 }
             })
             .collect();
@@ -1953,13 +1956,16 @@ struct CancelCommandOutput {
 #[derive(serde::Serialize)]
 struct SkillOutput {
     name: String,
+    display_name: Option<String>,
     command: String,
     description: Option<String>,
+    short_description: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
     context: String,
     source: String,
     directory: PathBuf,
+    allow_implicit_invocation: bool,
 }
 
 #[derive(serde::Serialize)]

@@ -56,9 +56,18 @@ Can you review @src/main.rs and @src/lib.rs?
 
 In the TUI, pressing `@` opens a file picker with fuzzy search. Use `Tab` to navigate matches and `Enter` to select.
 
-### Multiline Input (`\`)
+### Multiline Input (TUI)
 
-End a line with `\` to continue input on the next line:
+In the full-screen TUI, **Enter** sends the current draft. Use **Shift+Enter**
+or **Alt+Enter** to insert a newline. Bracketed terminal paste inserts the
+whole payload atomically, preserving paragraph breaks while normalizing CRLF
+and CR to LF; a trailing newline remains in the draft and never submits it.
+The composer grows to eight visible rows and follows the cursor for longer
+drafts. Up/Down navigate a non-empty draft, while an empty draft keeps their
+transcript-scrolling behavior. Use **Ctrl+X E** for the external editor when
+the composition is very long.
+
+The line-oriented REPL retains its backslash continuation behavior:
 
 ```
 Write a function that \
@@ -147,7 +156,7 @@ provider setup wizard.
 
 | Command | Description |
 |---------|-------------|
-| `/skills` | List discovered skills |
+| `/skills [query]` | Open the searchable skill picker; Enter inserts a skill command without running it |
 | `/memory [text]` | Show memory notes, or add a note |
 | `/mcp` | List MCP servers |
 | `/permissions [mode]` | Show or set permission mode |
@@ -185,7 +194,8 @@ provider setup wizard.
 
 | Shortcut | Action |
 |----------|--------|
-| `Enter` | Send message |
+| `Enter` | Send the current TUI draft |
+| `Shift+Enter` / `Alt+Enter` | Insert a newline in the TUI draft |
 | `Esc` | Cancel current agent turn / close modal |
 | `Ctrl+C` | Cancel request |
 | `Ctrl+L` | Clear screen |

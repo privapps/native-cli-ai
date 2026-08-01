@@ -101,6 +101,7 @@ async fn run_service_session_with_startup(
                 approval_handler: None,
                 orchestration_context: request.orchestration_context.clone(),
                 execution: request.execution,
+                explicitly_requested_skills: Vec::new(),
             })
             .await
         }

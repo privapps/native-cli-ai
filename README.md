@@ -189,7 +189,7 @@ Slash commands, the Ctrl+P command palette, autocomplete, and `/help` all come f
 | `/help` | Show help (generated from the registry). |
 | `/agent` | Choose agent profile (`build`, `plan`, `review`, `fix`, `test`). |
 | `/plan` `/review` `/fix` `/test` | Run a preset turn for that profile. |
-| `/skills` | Browse discovered skills; `/{skill}` runs one. |
+| `/skills [query]` | Open the searchable skill picker; Enter inserts `/{skill}` without running it. |
 | `/memory` | Show or append memory notes. |
 | `/compact` | Compact session context. |
 | `/copy` | Copy the latest assistant response (TUI; also `Ctrl+Shift+C`). |
@@ -216,6 +216,8 @@ Slash commands, the Ctrl+P command palette, autocomplete, and `/help` all come f
 | `Ctrl+X` then `m` / `e` / `l` / `n` / `c` / `s` / `a` / `h` / `q` | Leader shortcuts: model, editor, sessions, new, compact, status, agent, help, exit. |
 | `Ctrl+Y` / `Ctrl+N` / `Ctrl+U` | Approve / deny / always-allow a pending tool (wins over an open question modal). |
 | `Tab` | Complete `@` path or `/` command; otherwise cycle agent profile. |
+| `Enter` | Send the current full-screen TUI draft. |
+| `Shift+Enter` / `Alt+Enter` | Insert a newline in the full-screen TUI draft. |
 | `F2` / `Shift+F2` | Cycle recent models. |
 | `Ctrl+V` | Paste clipboard image (off the UI thread). |
 | `Ctrl+L` | Clear the transcript (same idea as `/clear`). |
@@ -257,8 +259,10 @@ See [Orchestration Contract](docs/orchestration.md) for the subprocess-facing su
 | `~/.local/share/ncacli/workspaces/<id>/last_session` | Auto-resume pointer. |
 | `<workspace>/AGENTS.md` | Repo-local instruction layer; each `## Heading` is also a discoverable skill. |
 | `<workspace>/.nca/skills/` | Default workspace skill directory. |
+| `<workspace>/.agents/skills/` | Workspace-compatible agent skill directory. |
 | `~/.local/share/ncacli/skills/` | User-level skill directory (legacy `~/.nca/skills/` still discovered). |
 | `~/.claude/skills/` | Imported Claude-style skill directory, if present. |
+| `~/.agents/skills/` | Global compatible agent skill directory, if present. |
 | `<repo>/.nca/worktrees/<session-id>` | Worktree path for isolated child sessions. |
 | `$XDG_RUNTIME_DIR/nca/<session_id>.sock` | Unix IPC socket when `XDG_RUNTIME_DIR` is set. |
 | `/tmp/nca/<session_id>.sock` | Unix IPC socket fallback when `XDG_RUNTIME_DIR` is not set. |
@@ -272,10 +276,17 @@ See [Orchestration Contract](docs/orchestration.md) for the subprocess-facing su
 `nca` discovers skills from multiple sources with visible provenance:
 
 1. **`AGENTS.md`** — Each root-level `## Heading` becomes a slash-invokable skill. Optional directive bullets can set `model=...`, `permission_mode=...`, and `context=...`.
-2. **Filesystem directories** — Skills from `.nca/skills/`, `~/.nca/skills/`, and `~/.claude/skills/`.
+2. **Filesystem directories** — Skills from configured directories plus `.agents/skills/`, `~/.nca/skills/`, `~/.claude/skills/`, and `~/.agents/skills/`.
 3. **Built-in skills** — Core skills baked into the binary.
 
 Use `nca skills --json` to see all discovered skills with their sources.
+
+In the full-screen TUI, `/skills` opens a searchable picker. Search matches a
+skill command, display name, or description; Enter inserts the selected
+`/<skill> ` into the draft without executing it. Compatible packs may add
+`agents/openai.yaml` for presentation metadata and a manual-only policy. A
+manual-only skill is hidden from model discovery but remains available to
+explicit users and child-session skill requests.
 
 ## Context Management
 

@@ -5,7 +5,11 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub struct Skill {
     pub name: String,
+    /// Optional presentation label supplied by compatible skill metadata.
+    pub display_name: Option<String>,
     pub description: Option<String>,
+    /// Optional short presentation description supplied by compatible metadata.
+    pub short_description: Option<String>,
     pub command: String,
     pub model: Option<String>,
     pub permission_mode: Option<PermissionMode>,
@@ -13,6 +17,8 @@ pub struct Skill {
     pub directory: PathBuf,
     pub body: String,
     pub source: SkillSource,
+    /// Whether the model may discover and invoke this skill implicitly.
+    pub allow_implicit_invocation: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,22 +40,12 @@ impl SkillCatalog {
         workspace_root: &Path,
         skill_directories: &[PathBuf],
     ) -> Result<Vec<Skill>, String> {
-        let mut roots = Vec::new();
-        if let Some(product) = nca_product_home() {
-            roots.push(product.join("skills"));
-        }
-        if let Some(home) = user_home_dir() {
-            roots.push(home.join(".nca/skills"));
-            roots.push(home.join(".claude/skills"));
-        }
-
-        for dir in skill_directories {
-            if dir.is_absolute() {
-                roots.push(dir.clone());
-            } else {
-                roots.push(workspace_root.join(dir));
-            }
-        }
+        let roots = discovery_roots(
+            workspace_root,
+            skill_directories,
+            nca_product_home().as_deref(),
+            user_home_dir().as_deref(),
+        );
 
         let mut skills = Vec::new();
 
@@ -130,6 +126,44 @@ impl SkillCatalog {
             available.join(", ")
         ))
     }
+
+    /// Return the skills advertised to the model. Explicit user and child
+    /// session resolution intentionally uses [`Self::discover`] directly so
+    /// manual-only skills remain available there.
+    pub fn discover_for_model(
+        workspace_root: &Path,
+        skill_directories: &[PathBuf],
+    ) -> Result<Vec<Skill>, String> {
+        Ok(Self::discover(workspace_root, skill_directories)?
+            .into_iter()
+            .filter(|skill| skill.allow_implicit_invocation)
+            .collect())
+    }
+}
+
+fn discovery_roots(
+    workspace_root: &Path,
+    skill_directories: &[PathBuf],
+    product_home: Option<&Path>,
+    user_home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(product) = product_home {
+        roots.push(product.join("skills"));
+    }
+    if let Some(home) = user_home {
+        roots.push(home.join(".nca/skills"));
+        roots.push(home.join(".claude/skills"));
+        roots.push(home.join(".agents/skills"));
+    }
+    roots.extend(skill_directories.iter().map(|directory| {
+        if directory.is_absolute() {
+            directory.clone()
+        } else {
+            workspace_root.join(directory)
+        }
+    }));
+    roots
 }
 
 impl Skill {
@@ -138,9 +172,60 @@ impl Skill {
             SkillSource::AgentsMd => " [AGENTS.md]",
             SkillSource::FileSystem => "",
         };
-        match &self.description {
-            Some(description) => format!("/{:<14} {}{}", self.command, description, source_tag),
-            None => format!("/{:<14} {}{}", self.command, self.name, source_tag),
+        let description = self.presentation_description();
+        let manual_tag = if self.allow_implicit_invocation {
+            ""
+        } else {
+            " [manual-only]"
+        };
+        format!(
+            "/{:<14} {}{}{}",
+            self.command, description, source_tag, manual_tag
+        )
+    }
+
+    pub fn display_label(&self) -> &str {
+        self.display_name.as_deref().unwrap_or(&self.name)
+    }
+
+    pub fn presentation_description(&self) -> &str {
+        self.short_description
+            .as_deref()
+            .or(self.description.as_deref())
+            .unwrap_or(self.display_label())
+    }
+
+    pub fn is_manual_only(&self) -> bool {
+        !self.allow_implicit_invocation
+    }
+
+    fn metadata_path(skill_file: &Path) -> Option<PathBuf> {
+        skill_file
+            .parent()
+            .map(|directory| directory.join("agents").join("openai.yaml"))
+    }
+
+    fn apply_metadata(&mut self, skill_file: &Path) {
+        let Some(path) = Self::metadata_path(skill_file) else {
+            return;
+        };
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let Ok(metadata) = serde_yaml::from_str::<SkillMetadata>(&raw) else {
+            return;
+        };
+        if let Some(interface) = metadata.interface {
+            self.display_name = non_empty(interface.display_name).or(self.display_name.take());
+            self.short_description =
+                non_empty(interface.short_description).or(self.short_description.take());
+        }
+        if metadata
+            .policy
+            .and_then(|policy| policy.allow_implicit_invocation)
+            == Some(false)
+        {
+            self.allow_implicit_invocation = false;
         }
     }
 
@@ -250,9 +335,11 @@ fn parse_skill_file(path: &Path) -> Result<Skill, String> {
                 .unwrap_or_else(|| file_stem.clone()),
         )
     });
-    Ok(Skill {
+    let mut skill = Skill {
         name: frontmatter.name.unwrap_or(file_stem),
+        display_name: None,
         description: frontmatter.description,
+        short_description: None,
         command,
         model: frontmatter.model,
         permission_mode: frontmatter.permission_mode,
@@ -260,7 +347,10 @@ fn parse_skill_file(path: &Path) -> Result<Skill, String> {
         directory,
         body: body.trim().to_string(),
         source: SkillSource::FileSystem,
-    })
+        allow_implicit_invocation: !frontmatter.disable_model_invocation.unwrap_or(false),
+    };
+    skill.apply_metadata(path);
+    Ok(skill)
 }
 
 fn split_frontmatter(raw: &str) -> Result<(SkillFrontmatter, String), String> {
@@ -299,6 +389,29 @@ struct SkillFrontmatter {
     model: Option<String>,
     permission_mode: Option<PermissionMode>,
     context: Option<SkillContextMode>,
+    #[serde(rename = "disable-model-invocation")]
+    disable_model_invocation: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SkillMetadata {
+    interface: Option<SkillInterfaceMetadata>,
+    policy: Option<SkillPolicyMetadata>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SkillInterfaceMetadata {
+    display_name: Option<String>,
+    short_description: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SkillPolicyMetadata {
+    allow_implicit_invocation: Option<bool>,
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
 }
 
 impl<'de> Deserialize<'de> for SkillContextMode {
@@ -443,7 +556,9 @@ fn build_skill_from_section(
 
     Some(Skill {
         name: heading.to_string(),
+        display_name: None,
         description: Some(section_description(heading, body)),
+        short_description: None,
         command,
         model,
         permission_mode,
@@ -451,6 +566,7 @@ fn build_skill_from_section(
         directory: workspace_root.to_path_buf(),
         body: body.to_string(),
         source: SkillSource::AgentsMd,
+        allow_implicit_invocation: true,
     })
 }
 
@@ -631,6 +747,118 @@ mod tests {
         assert_eq!(skill.context, SkillContextMode::Fork);
         assert_eq!(skill.permission_mode, Some(PermissionMode::Plan));
         assert!(skill.body.contains("Inspect diffs"));
+    }
+
+    #[test]
+    fn parses_agents_metadata_for_presentation_and_model_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".agents/skills/review");
+        std::fs::create_dir_all(skill_dir.join("agents")).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: Review\ndescription: Inspect code\n---\nReview carefully.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            skill_dir.join("agents/openai.yaml"),
+            "interface:\n  display_name: Review Changes\n  short_description: Inspect a diff\npolicy:\n  allow_implicit_invocation: false\n",
+        )
+        .unwrap();
+
+        let skill = parse_skill_file(&skill_dir.join("SKILL.md")).unwrap();
+        assert_eq!(skill.display_label(), "Review Changes");
+        assert_eq!(skill.presentation_description(), "Inspect a diff");
+        assert!(skill.is_manual_only());
+    }
+
+    #[test]
+    fn discovery_roots_include_global_agents_catalog() {
+        let workspace = Path::new("/workspace");
+        let product = Path::new("/product");
+        let home = Path::new("/home/user");
+        let roots = discovery_roots(workspace, &[], Some(product), Some(home));
+        assert_eq!(roots[0], PathBuf::from("/product/skills"));
+        assert!(roots.contains(&PathBuf::from("/home/user/.agents/skills")));
+    }
+
+    #[test]
+    fn malformed_optional_agents_metadata_falls_back_to_skill_definition() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("review");
+        std::fs::create_dir_all(skill_dir.join("agents")).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: Review\ndescription: Inspect code\ndisable-model-invocation: true\n---\nReview carefully.\n",
+        )
+        .unwrap();
+        std::fs::write(skill_dir.join("agents/openai.yaml"), "not: [valid").unwrap();
+
+        let skill = parse_skill_file(&skill_dir.join("SKILL.md")).unwrap();
+        assert_eq!(skill.display_label(), "Review");
+        assert_eq!(skill.presentation_description(), "Inspect code");
+        assert!(skill.is_manual_only());
+    }
+
+    #[test]
+    fn discovers_workspace_agents_skills_and_preserves_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join(".agents/skills/review");
+        let configured = dir.path().join("configured/review");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::create_dir_all(&configured).unwrap();
+        std::fs::write(
+            agents.join("SKILL.md"),
+            "---\nname: Agents Review\ncommand: review\n---\nAgents body.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            configured.join("SKILL.md"),
+            "---\nname: Configured Review\ncommand: review\n---\nConfigured body.\n",
+        )
+        .unwrap();
+
+        let skills =
+            SkillCatalog::discover(dir.path(), &[PathBuf::from(".agents/skills")]).unwrap();
+        let review = skills
+            .iter()
+            .find(|skill| skill.command == "review")
+            .unwrap();
+        assert_eq!(review.name, "Agents Review");
+
+        let configured_only =
+            SkillCatalog::discover(dir.path(), &[PathBuf::from("configured")]).unwrap();
+        assert_eq!(
+            configured_only
+                .iter()
+                .find(|skill| skill.command == "review")
+                .unwrap()
+                .name,
+            "Configured Review"
+        );
+    }
+
+    #[test]
+    fn model_discovery_excludes_manual_only_but_explicit_resolution_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("skills/manual");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: Manual\ncommand: manual\ndisable-model-invocation: true\n---\nManual body.\n",
+        )
+        .unwrap();
+        let dirs = [PathBuf::from("skills")];
+        assert!(
+            !SkillCatalog::discover_for_model(dir.path(), &dirs)
+                .unwrap()
+                .iter()
+                .any(|skill| skill.command == "manual")
+        );
+        assert_eq!(
+            SkillCatalog::resolve_requested_commands(dir.path(), &dirs, &["manual".to_string()])
+                .unwrap(),
+            vec!["manual"]
+        );
     }
 
     #[test]
@@ -836,7 +1064,9 @@ Component management and styling...
 
         let skill = Skill {
             name: "test".into(),
+            display_name: None,
             description: None,
+            short_description: None,
             command: "test".into(),
             model: None,
             permission_mode: None,
@@ -844,6 +1074,7 @@ Component management and styling...
             directory: skill_dir,
             body: "Main body.\n\nSee ./helper.md for details.".into(),
             source: SkillSource::FileSystem,
+            allow_implicit_invocation: true,
         };
 
         let expanded = skill.expanded_body();
@@ -860,7 +1091,9 @@ Component management and styling...
 
         let skill = Skill {
             name: "test".into(),
+            display_name: None,
             description: None,
+            short_description: None,
             command: "test".into(),
             model: None,
             permission_mode: None,
@@ -868,6 +1101,7 @@ Component management and styling...
             directory: skill_dir,
             body: "Main body.\n\nSee ./nonexistent.md for details.".into(),
             source: SkillSource::FileSystem,
+            allow_implicit_invocation: true,
         };
 
         let expanded = skill.expanded_body();
@@ -887,7 +1121,9 @@ Component management and styling...
 
         let skill = Skill {
             name: "test".into(),
+            display_name: None,
             description: None,
+            short_description: None,
             command: "test".into(),
             model: None,
             permission_mode: None,
@@ -895,6 +1131,7 @@ Component management and styling...
             directory: skill_dir,
             body: "Main body.\n\nRead @testing-anti-patterns.md to avoid pitfalls.".into(),
             source: SkillSource::FileSystem,
+            allow_implicit_invocation: true,
         };
 
         let expanded = skill.expanded_body();
@@ -914,7 +1151,9 @@ Component management and styling...
 
         let skill = Skill {
             name: "test".into(),
+            display_name: None,
             description: None,
+            short_description: None,
             command: "test".into(),
             model: None,
             permission_mode: None,
@@ -922,6 +1161,7 @@ Component management and styling...
             directory: skill_dir,
             body: "See `template.md` for the template.".into(),
             source: SkillSource::FileSystem,
+            allow_implicit_invocation: true,
         };
 
         let expanded = skill.expanded_body();
@@ -938,7 +1178,9 @@ Component management and styling...
 
         let skill = Skill {
             name: "test".into(),
+            display_name: None,
             description: None,
+            short_description: None,
             command: "test".into(),
             model: None,
             permission_mode: None,
@@ -946,6 +1188,7 @@ Component management and styling...
             directory: skill_dir,
             body: "See ./helper.md and `helper.md` again.".into(),
             source: SkillSource::FileSystem,
+            allow_implicit_invocation: true,
         };
 
         let expanded = skill.expanded_body();

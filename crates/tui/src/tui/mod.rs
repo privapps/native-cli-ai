@@ -25,4 +25,6 @@ pub use input::{ApprovalAnswer, CustomProviderProbeAction, CustomProviderSetupSu
 pub use overlay::{UiOverlay, UiOverlayKind};
 pub use replay::replay_event_log_into_state;
 pub use shared::SharedTuiState;
-pub use state::{DisplayBlock, ModelPickerAction, ModelPickerEntry, TuiSessionState};
+pub use state::{
+    DisplayBlock, ModelPickerAction, ModelPickerEntry, SkillPickerEntry, TuiSessionState,
+};

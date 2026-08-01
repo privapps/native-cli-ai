@@ -15,6 +15,104 @@ use ratatui::text::{Line, Span};
 use std::path::{Path, PathBuf};
 
 pub const SLASH_PANEL_MAX_ROWS: usize = 8;
+pub const COMPOSER_MAX_DRAFT_ROWS: usize = 8;
+
+/// The display and insertion contract for a paste payload.
+pub fn normalize_paste(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+pub fn sanitize_single_line_paste(text: &str) -> String {
+    normalize_paste(text).replace('\n', " ")
+}
+
+/// Insert text at a character-index cursor, returning the new buffer and
+/// character-index cursor. Newline normalization is intentionally centralized
+/// here so paste and any future programmatic insertion share the same rules.
+pub fn insert_text_at_cursor(buffer: &str, cursor_char_idx: usize, text: &str) -> (String, usize) {
+    let cursor_char_idx = cursor_char_idx.min(buffer.chars().count());
+    let cursor_byte = cursor_byte_index(buffer, cursor_char_idx);
+    let inserted = normalize_paste(text);
+    let mut result = String::with_capacity(buffer.len() + inserted.len());
+    result.push_str(&buffer[..cursor_byte]);
+    result.push_str(&inserted);
+    result.push_str(&buffer[cursor_byte..]);
+    (result, cursor_char_idx + inserted.chars().count())
+}
+
+/// Return the character-index line and column for a cursor in a newline-
+/// delimited draft.
+pub fn cursor_line_column(buffer: &str, cursor_char_idx: usize) -> (usize, usize) {
+    let cursor_char_idx = cursor_char_idx.min(buffer.chars().count());
+    let mut line = 0;
+    let mut column = 0;
+    for ch in buffer.chars().take(cursor_char_idx) {
+        if ch == '\n' {
+            line += 1;
+            column = 0;
+        } else {
+            column += 1;
+        }
+    }
+    (line, column)
+}
+
+/// Move vertically while preserving the current column as far as the target
+/// line allows. The cursor stays at the nearest edge at the first/last line.
+pub fn move_cursor_vertical(buffer: &str, cursor_char_idx: usize, down: bool) -> usize {
+    let (line, column) = cursor_line_column(buffer, cursor_char_idx);
+    let lines: Vec<&str> = buffer.split('\n').collect();
+    let target_line = if down {
+        (line + 1).min(lines.len().saturating_sub(1))
+    } else {
+        line.saturating_sub(1)
+    };
+    let target_column = column.min(lines[target_line].chars().count());
+    lines
+        .iter()
+        .take(target_line)
+        .map(|line| line.chars().count() + 1)
+        .sum::<usize>()
+        + target_column
+}
+
+pub fn move_cursor_home(buffer: &str, cursor_char_idx: usize) -> usize {
+    let (_, column) = cursor_line_column(buffer, cursor_char_idx);
+    cursor_char_idx
+        .min(buffer.chars().count())
+        .saturating_sub(column)
+}
+
+pub fn move_cursor_end(buffer: &str, cursor_char_idx: usize) -> usize {
+    let (line, column) = cursor_line_column(buffer, cursor_char_idx);
+    let line_length = buffer
+        .split('\n')
+        .nth(line)
+        .unwrap_or_default()
+        .chars()
+        .count();
+    cursor_char_idx.min(buffer.chars().count()) + line_length.saturating_sub(column)
+}
+
+/// Slash and shell prefixes are commands only for a single-line draft.
+pub fn is_single_line_command(buffer: &str) -> bool {
+    if buffer.contains('\n') {
+        return false;
+    }
+    let trimmed = buffer.trim_start();
+    trimmed.starts_with('/') || trimmed.starts_with('!')
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposerRenderModel {
+    pub rows: Vec<Line<'static>>,
+    pub draft_height: usize,
+    pub total_rows: usize,
+    pub first_row: usize,
+    pub cursor_row: usize,
+    pub cursor_col: usize,
+    pub cursor_visible: bool,
+}
 
 /// Text used for `/command` detection (ignores leading spaces in the composer).
 pub fn slash_command_buffer(buffer: &str) -> &str {
@@ -22,8 +120,11 @@ pub fn slash_command_buffer(buffer: &str) -> &str {
 }
 
 pub fn slash_panel_visible(buffer: &str) -> bool {
+    if buffer.contains('\n') {
+        return false;
+    }
     let s = slash_command_buffer(buffer);
-    s.starts_with('/') && !s.contains(' ')
+    s.starts_with('/') && !s.chars().any(char::is_whitespace)
 }
 
 pub fn cursor_byte_index(line: &str, cursor_char_idx: usize) -> usize {
@@ -186,21 +287,36 @@ fn push_styled_run(
 }
 
 pub fn composer_line(buffer: &str, cursor_char_idx: usize) -> Line<'static> {
+    composer_line_at(buffer, buffer, 0, cursor_char_idx, true)
+}
+
+fn composer_line_at(
+    full_buffer: &str,
+    line: &str,
+    line_start_char_idx: usize,
+    cursor_char_idx: usize,
+    first_line: bool,
+) -> Line<'static> {
     let prompt = Span::styled("❯ ", Style::default().fg(theme::USER).bold());
-    let chars: Vec<char> = buffer.chars().collect();
-    let mention_ranges = at_mention_char_ranges(buffer);
-    let cursor_char_idx = cursor_char_idx.min(chars.len());
-    let mut spans = vec![prompt];
+    let chars: Vec<char> = line.chars().collect();
+    let mention_ranges = at_mention_char_ranges(full_buffer);
+    let cursor_char_idx = cursor_char_idx.min(line_start_char_idx + chars.len());
+    let mut spans = if first_line {
+        vec![prompt]
+    } else {
+        vec![Span::raw("  ")]
+    };
     let mut run = String::new();
     let mut run_style: Option<Style> = None;
 
     for idx in 0..=chars.len() {
-        if idx == cursor_char_idx {
+        let global_idx = line_start_char_idx + idx;
+        if global_idx == cursor_char_idx {
             let cursor_char = chars.get(idx).copied().unwrap_or(' ');
             let in_mention = idx < chars.len()
                 && mention_ranges
                     .iter()
-                    .any(|(start, end)| *start <= idx && idx < *end);
+                    .any(|(start, end)| *start <= global_idx && global_idx < *end);
             let cursor_style = if in_mention {
                 Style::default()
                     .bg(theme::USER)
@@ -230,7 +346,7 @@ pub fn composer_line(buffer: &str, cursor_char_idx: usize) -> Line<'static> {
         };
         let in_mention = mention_ranges
             .iter()
-            .any(|(start, end)| *start <= idx && idx < *end);
+            .any(|(start, end)| *start <= global_idx && global_idx < *end);
         let style = if in_mention {
             Style::default()
                 .fg(theme::TEXT)
@@ -249,6 +365,61 @@ pub fn composer_line(buffer: &str, cursor_char_idx: usize) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Build the visible draft rows and cursor viewport for the full-screen TUI.
+pub fn composer_render_model(
+    buffer: &str,
+    cursor_char_idx: usize,
+    max_visible_rows: usize,
+) -> ComposerRenderModel {
+    let lines: Vec<&str> = buffer.split('\n').collect();
+    let total_rows = lines.len().max(1);
+    let (cursor_row, cursor_col) = cursor_line_column(buffer, cursor_char_idx);
+    let cursor_row = cursor_row.min(total_rows.saturating_sub(1));
+    let draft_height = total_rows.min(max_visible_rows.max(1));
+    let first_row = cursor_row
+        .saturating_sub(draft_height.saturating_sub(1))
+        .min(total_rows.saturating_sub(draft_height));
+    let initial_line_start = lines
+        .iter()
+        .take(first_row)
+        .map(|line| line.chars().count() + 1)
+        .sum::<usize>();
+    let rows = lines
+        .iter()
+        .enumerate()
+        .skip(first_row)
+        .take(draft_height)
+        .scan(initial_line_start, |line_start, (row, line)| {
+            let current_start = *line_start;
+            *line_start += line.chars().count() + usize::from(row + 1 < total_rows);
+            Some(composer_line_at(
+                buffer,
+                line,
+                current_start,
+                cursor_char_idx.min(buffer.chars().count()),
+                row == first_row,
+            ))
+        })
+        .collect();
+
+    ComposerRenderModel {
+        rows,
+        draft_height,
+        total_rows,
+        first_row,
+        cursor_row,
+        cursor_col,
+        cursor_visible: cursor_row >= first_row && cursor_row < first_row + draft_height,
+    }
+}
+
+/// Height of the bordered composer, including its hint and optional auxiliary
+/// rows such as staged-image status.
+pub fn composer_input_height(buffer: &str, auxiliary_rows: usize) -> u16 {
+    let draft_rows = buffer.matches('\n').count().saturating_add(1);
+    (draft_rows.min(COMPOSER_MAX_DRAFT_ROWS) + auxiliary_rows + 3) as u16
+}
+
 // ---------------------------------------------------------------------------
 // Slash-command entries
 // ---------------------------------------------------------------------------
@@ -259,8 +430,11 @@ pub enum SlashEntry {
     Command(&'static str),
     Skill {
         command: String,
-        description: Option<String>,
+        display_name: String,
+        description: String,
         source: SkillSource,
+        directory: PathBuf,
+        manual_only: bool,
     },
 }
 
@@ -277,17 +451,22 @@ impl SlashEntry {
             SlashEntry::Command(s) => s.to_string(),
             SlashEntry::Skill {
                 command,
+                display_name,
                 description,
                 source,
+                directory,
+                manual_only,
             } => {
                 let tag = match source {
                     SkillSource::AgentsMd => " (AGENTS.md)",
                     SkillSource::FileSystem => " (skill dir)",
                 };
-                match description {
-                    Some(desc) => format!("/{command:<20} — {desc}{tag}"),
-                    None => format!("/{command}{tag}"),
-                }
+                let manual = if *manual_only { " · manual-only" } else { "" };
+                format!(
+                    "/{command:<20} — {display_name}: {description}{tag} · {}{}",
+                    directory.display(),
+                    manual
+                )
             }
         }
     }
@@ -298,10 +477,18 @@ fn collect_skill_entries(workspace_root: &Path, skill_dirs: &[PathBuf]) -> Vec<S
     match SkillCatalog::discover(workspace_root, skill_dirs) {
         Ok(skills) => skills
             .into_iter()
-            .map(|s| SlashEntry::Skill {
-                command: s.command,
-                description: s.description,
-                source: s.source,
+            .map(|s| {
+                let display_name = s.display_label().to_string();
+                let description = s.presentation_description().to_string();
+                let manual_only = s.is_manual_only();
+                SlashEntry::Skill {
+                    command: s.command,
+                    display_name,
+                    description,
+                    source: s.source,
+                    directory: s.directory,
+                    manual_only,
+                }
             })
             .collect(),
         Err(_) => Vec::new(),
@@ -518,5 +705,96 @@ mod tests {
             })
             .count();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn paste_normalizes_line_endings_without_collapsing_paragraphs() {
+        assert_eq!(
+            normalize_paste("one\r\ntwo\rthree\n\nfour\n"),
+            "one\ntwo\nthree\n\nfour\n"
+        );
+    }
+
+    #[test]
+    fn paste_inserts_at_unicode_cursor_and_advances_by_chars() {
+        let (buffer, cursor) = insert_text_at_cursor("αβγ", 2, "\r\n你好");
+
+        assert_eq!(buffer, "αβ\n你好γ");
+        assert_eq!(cursor, 5);
+    }
+
+    #[test]
+    fn vertical_cursor_movement_clamps_to_destination_line() {
+        assert_eq!(move_cursor_vertical("first\n二\nthird", 4, true), 7);
+        assert_eq!(move_cursor_vertical("first\n二\nthird", 7, true), 9);
+    }
+
+    #[test]
+    fn home_and_end_move_within_the_current_line() {
+        let buffer = "first\nsecond\nthird";
+        assert_eq!(move_cursor_home(buffer, 9), 6);
+        assert_eq!(move_cursor_end(buffer, 8), 12);
+    }
+
+    #[test]
+    fn multiline_command_prefix_is_not_classified_as_a_command() {
+        assert!(is_single_line_command(" /help"));
+        assert!(is_single_line_command("!echo hi"));
+        assert!(!is_single_line_command("/help\nmore"));
+        assert!(!is_single_line_command("!echo\nmore"));
+        assert!(!slash_panel_visible("\n/help"));
+        assert!(!is_single_line_command("\n/help"));
+    }
+
+    #[test]
+    fn multiline_at_completion_uses_the_token_before_the_cursor() {
+        let files = vec!["src/main.rs".into(), "src/lib.rs".into()];
+        let buffer = "intro\nsee @src/ma";
+        let cursor = buffer.chars().count();
+
+        assert!(at_completion_active(buffer, cursor));
+        assert_eq!(
+            at_completion_matches(&files, buffer, cursor),
+            vec!["src/main.rs"]
+        );
+        assert!(!slash_panel_visible("/help\n@src/ma"));
+    }
+
+    #[test]
+    fn render_model_caps_rows_and_keeps_cursor_visible() {
+        let model = composer_render_model("one\ntwo\nthree\nfour", 14, 2);
+
+        assert_eq!(model.total_rows, 4);
+        assert_eq!(model.draft_height, 2);
+        assert_eq!(model.first_row, 2);
+        assert_eq!(model.cursor_row, 3);
+        assert!(model.cursor_visible);
+        assert_eq!(model.rows.len(), 2);
+        assert!(model.rows[0].spans[0].content.contains('❯'));
+    }
+
+    #[test]
+    fn configured_agents_skill_is_in_inline_completion_and_builtins_stay_distinct() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".agents/skills/review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: Review Changes\ncommand: agents-review\ndescription: Inspect a diff\n---\nReview.\n",
+        )
+        .unwrap();
+
+        let entries = load_slash_entries(dir.path(), &[PathBuf::from(".agents/skills")]);
+        let skill = entries
+            .iter()
+            .find(|entry| entry.command_str() == "/agents-review")
+            .unwrap();
+        assert!(skill.display_text().contains("Inspect a diff"));
+        assert!(skill.display_text().contains(".agents/skills/review"));
+        assert!(
+            entries
+                .iter()
+                .any(|entry| { matches!(entry, SlashEntry::Command("/help")) })
+        );
     }
 }

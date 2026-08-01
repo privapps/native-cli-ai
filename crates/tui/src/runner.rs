@@ -269,6 +269,7 @@ pub async fn build_session_runtime(
         approval_handler,
         orchestration_context,
         execution: ExecutionContext { yolo },
+        explicitly_requested_skills: Vec::new(),
     })
     .await?;
 

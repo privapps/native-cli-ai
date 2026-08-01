@@ -20,6 +20,12 @@ fn write_local_config_contents(workspace: &Path, contents: &str) {
     fs::write(config_dir.join("config.local.toml"), contents).expect("write local config");
 }
 
+fn write_skill(workspace: &Path, command: &str, contents: &str) {
+    let directory = workspace.join(".agents/skills").join(command);
+    fs::create_dir_all(&directory).expect("create skill directory");
+    fs::write(directory.join("SKILL.md"), contents).expect("write skill");
+}
+
 fn write_session(
     workspace: &Path,
     id: &str,
@@ -110,6 +116,65 @@ fn run_without_config_exits_nonzero() {
         .failure()
         .code(10)
         .stderr(predicates::str::contains("missing MiniMax API key"));
+}
+
+#[test]
+fn skills_lists_workspace_agents_directory_human_readably() {
+    let temp = tempdir().expect("tempdir");
+    write_skill(
+        temp.path(),
+        "cli-visible",
+        "---\nname: CLI Visible\ncommand: cli-visible\ndescription: Check CLI discovery\n---\nUse this skill.\n",
+    );
+
+    Command::cargo_bin("nca")
+        .expect("binary")
+        .current_dir(temp.path())
+        .env("HOME", temp.path())
+        .env("NCA_HOME", temp.path().join("nca-home"))
+        .arg("skills")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("/cli-visible"))
+        .stdout(predicates::str::contains("Check CLI discovery"));
+}
+
+#[test]
+fn skills_json_lists_workspace_agents_directory_with_metadata() {
+    let temp = tempdir().expect("tempdir");
+    write_skill(
+        temp.path(),
+        "cli-json",
+        "---\nname: CLI JSON\ncommand: cli-json\ndescription: Machine-readable discovery\n---\nUse this skill.\n",
+    );
+
+    let output = Command::cargo_bin("nca")
+        .expect("binary")
+        .current_dir(temp.path())
+        .env("HOME", temp.path())
+        .env("NCA_HOME", temp.path().join("nca-home"))
+        .args(["skills", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let skills: Value = serde_json::from_slice(&output).expect("skills JSON");
+    let skill = skills
+        .as_array()
+        .expect("skill array")
+        .iter()
+        .find(|skill| skill["command"] == "cli-json")
+        .expect("workspace skill");
+    assert_eq!(skill["source"], "filesystem");
+    assert!(
+        skill["directory"]
+            .as_str()
+            .unwrap()
+            .ends_with(".agents/skills/cli-json")
+    );
+    assert_eq!(skill["description"], "Machine-readable discovery");
 }
 
 #[test]

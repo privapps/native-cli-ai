@@ -12,12 +12,16 @@ nca looks for skills in configured directories:
 
 ```toml
 [harness]
-skill_directories = [".nca/skills", ".claude/skills"]
+skill_directories = ["skills", ".nca/skills", ".claude/skills", ".agents/skills"]
 ```
 
 Default search paths (relative to workspace):
 1. `.nca/skills/` — nca-specific skills
 2. `.claude/skills/` — compatible with Claude Code skills
+3. `.agents/skills/` — compatible agent skill packs
+
+The global `~/.agents/skills/` directory is also searched, alongside the
+existing nca and Claude-compatible global directories.
 
 ### Skill Structure
 
@@ -97,8 +101,15 @@ When delegating work to a child session with `spawn_subagent`, the parent can al
 ### Slash Command
 
 ```
-/skills                    # List available skills
+/skills                    # Open the searchable TUI picker
+/skills rust               # Open it with an initial search query
 ```
+
+In the full-screen TUI, search matches commands, display names, and
+descriptions. Use Up/Down (or `j`/`k`) to select a row. Enter inserts
+`/<skill> ` into the composer without executing it; add a task and submit the
+draft normally. Escape or `q` closes the picker without changing the draft.
+Rows include the source directory and mark manual-only skills.
 
 ## Writing Skills
 
@@ -177,3 +188,23 @@ nca discovers skills from `.claude/skills/` by default, making it compatible wit
 ## System Prompt Integration
 
 When skills are available, nca adds a skills section to the system prompt listing all discovered skills by name. The agent can then use the `invoke_skill` tool to load any skill's full instructions on demand.
+
+## Compatible metadata and manual-only skills
+
+`SKILL.md` remains the required contract. Compatible packs may optionally add
+`agents/openai.yaml` next to it:
+
+```yaml
+interface:
+  display_name: Review Changes
+  short_description: Inspect a diff
+policy:
+  allow_implicit_invocation: false
+```
+
+Presentation fields only change labels and descriptions. Missing or malformed
+optional metadata falls back to `SKILL.md`. Setting
+`allow_implicit_invocation: false`, or adding
+`disable-model-invocation: true` to `SKILL.md` frontmatter, hides a skill from
+model-facing discovery while keeping explicit `/skill` commands, picker
+selection, and child-session skill requests available.
