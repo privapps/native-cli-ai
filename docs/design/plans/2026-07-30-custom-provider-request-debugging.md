@@ -12,7 +12,7 @@ Add request-only diagnostics for custom OpenAI-compatible Chat Completions and O
 
 ## Implementation
 
-1. Add an internal request-debug formatter that can inspect the final custom request without changing the public `Provider` trait. It will include a UTC timestamp, protocol, method, URL, redacted headers, and pretty JSON body, redact credentials, and append to `./debug.log`.
+1. Add an internal request-debug formatter that can inspect the final custom request without changing the public `Provider` trait. It will include a UTC timestamp, protocol, method, URL, redacted headers, and pretty JSON body, redact credentials, emit the record to stderr, and append it to `./debug.log`.
 2. Add the formatter at the custom provider request seam immediately before `.send()` for both protocol adapters.
 3. Keep the response untouched: no response body, stream, parsed event, provider error body, or completion output may be logged.
 4. Keep custom Anthropic requests silent and make log-write failures warnings rather than provider failures.

@@ -13,7 +13,7 @@ The repository already has an `NCA_DEBUG_REQUEST` convention, but its current be
 
 ## Solution
 
-When `NCA_DEBUG_REQUEST=1` is set, nca appends the complete outgoing custom-provider request to `./debug.log` for both:
+When `NCA_DEBUG_REQUEST=1` is set, nca emits the complete outgoing custom-provider request to stderr and appends the same record to `./debug.log` for both:
 
 - OpenAI-compatible Chat Completions requests.
 - OpenAI Responses requests.
@@ -52,7 +52,7 @@ No response data is logged. This includes successful responses, non-success resp
 - Log immediately before sending the request, after the adapter has constructed the final method, URL, headers, and JSON body.
 - Include the HTTP method, URL, headers, and serialized request body in the diagnostic record.
 - Redact `Authorization`, `x-api-key`, and configured API-key values before writing diagnostics.
-- Append diagnostics to `./debug.log` so stdout, stderr, NDJSON, and CLI rendering contracts remain unaffected; use stderr only for log-write warnings.
+- Emit the redacted request record to stderr and append it to `./debug.log`; never write diagnostics to stdout so JSON, NDJSON, and CLI output streams remain usable. File-write failures add a warning on stderr and do not block the request.
 - Do not log any response body, response stream bytes, parsed response events, provider error body, or completion result.
 - Reuse the existing custom protocol adapters, request-body builders, request execution, and stream parsers. Any shared helper or optional diagnostics seam remains internal and does not change the public provider abstraction.
 - Preserve existing request behavior for both `/chat/completions` and `/responses`, including path prefixes, authentication, streaming flags, tools, reasoning settings, and model overrides.
@@ -65,7 +65,7 @@ No response data is logged. This includes successful responses, non-success resp
 - Cover both custom OpenAI-compatible modes:
   - Chat Completions at the custom `/chat/completions` endpoint.
   - OpenAI Responses at the custom `/responses` endpoint.
-- Assert request logging behavior externally: method, URL, relevant headers, request JSON, append behavior, log-write fallback, and absence of credential values.
+- Assert request logging behavior externally: method, URL, relevant headers, request JSON, matching stderr and file records, append behavior, log-write fallback, and absence of credential values.
 - Cover enabled and disabled environment values, including unset, empty, `0`, and other non-`1` values.
 - Cover redaction of bearer credentials, protocol-specific API-key headers where applicable, and configured key text appearing in serialized data.
 - Verify that successful streamed text, tool calls, usage, and completion events remain unchanged for both protocols.
