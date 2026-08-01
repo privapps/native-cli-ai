@@ -132,7 +132,19 @@ Search the public web and return titles, URLs, snippets, and provenance metadata
 - `issuer` (string, optional) — Issuer name to bind inferred report metadata to the requested company
 - `as_of` is supplied by the runtime turn context and is not a caller-controlled field
 
-**Behavior:** HTTP GET to DuckDuckGo HTML search. Results are returned as JSON with the query, date-only UTC turn `as_of`, retrieval timestamp, URL, source authority, available publication metadata, and an `eligible_as_of` flag. Unknown metadata remains `null`; the upstream search response is not assumed to support an exact date filter.
+**Behavior:** HTTP GET to DuckDuckGo HTML search through a process-wide
+provider limiter. Requests have at most one in flight and are separated by the
+configured minimum start interval. Recognized HTTP 202 anti-bot challenges
+enter bounded cooldown/backoff and retry up to `search_challenge_retries`
+(three by default); retries also pass through the limiter. A successful
+response clears temporary challenge state. Exhaustion remains an explicit
+failed tool result rather than an empty success. Results are returned as JSON
+with the query, date-only UTC turn `as_of`, retrieval timestamp, URL, source
+authority, available publication metadata, and an `eligible_as_of` flag.
+Unknown metadata remains `null`; the upstream search response is not assumed
+to support an exact date filter. The limiter applies only to DuckDuckGo search
+requests and does not change the global tool-call budget or unrelated-tool
+concurrency.
 
 ---
 

@@ -234,8 +234,24 @@ blocking = false    # If true, waits for completion
 timeout_secs = 15
 max_fetch_chars = 25000
 default_search_limit = 5
+search_min_interval_ms = 1000       # Minimum time between DuckDuckGo request starts
+search_cooldown_ms = 5000           # Initial cooldown after an HTTP 202 challenge
+search_max_cooldown_ms = 60000       # Maximum exponential challenge cooldown
+search_challenge_retries = 3         # Retries after the initial recognized HTTP 202
 user_agent = "nca/0.5 (+https://github.com/user/native-cli-ai)"
 ```
+
+`web_search` uses a process-wide DuckDuckGo limiter shared by runtime sessions:
+requests are serialized and paced by `search_min_interval_ms`. A recognized
+HTTP 202 anti-bot challenge starts cooldown at `search_cooldown_ms`; repeated
+challenges use bounded exponential backoff up to `search_max_cooldown_ms`.
+`search_challenge_retries` defaults to three retries (four attempts total) and
+is capped at ten. Each retry passes through the same limiter. A successful
+response clears the temporary challenge backoff; exhausted challenges remain
+explicit failed tool results. These settings affect only DuckDuckGo
+`web_search`, not `fetch_url` or unrelated tools. Separately launched nca
+processes have independent limiters, and the policy does not spoof a browser
+user agent or bypass DuckDuckGo's challenge.
 
 ### `[ui]` — Interface Settings
 

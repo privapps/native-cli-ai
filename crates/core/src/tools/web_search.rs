@@ -7,8 +7,10 @@ use nca_common::config::WebConfig;
 use nca_common::tool::{ToolCall, ToolDefinition, ToolResult};
 use reqwest::StatusCode;
 use serde_json::json;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::time::Instant;
 
 use super::ToolExecutor;
 use super::fetch_url::{
@@ -16,11 +18,110 @@ use super::fetch_url::{
     html_attribute, html_elements_with_class_any_tag, html_fragment_text,
 };
 
+const MAX_SEARCH_CHALLENGE_RETRIES: u32 = 10;
+
+/// Process-local policy and state for DuckDuckGo requests.
+///
+/// Runtime-created search tools receive the process-wide instance. Fixture
+/// constructors may create an isolated instance so tests do not share state.
+pub struct SearchLimiter {
+    in_flight: Arc<Semaphore>,
+    state: Mutex<SearchLimiterState>,
+    min_interval: Duration,
+    initial_cooldown: Duration,
+    max_cooldown: Duration,
+}
+
+struct SearchLimiterState {
+    last_started: Option<Instant>,
+    cooldown_until: Option<Instant>,
+    challenge_count: u32,
+}
+
+impl SearchLimiter {
+    /// Create an isolated limiter, intended for deterministic fixture tests.
+    pub fn new(config: &WebConfig) -> Arc<Self> {
+        Arc::new(Self {
+            in_flight: Arc::new(Semaphore::new(1)),
+            state: Mutex::new(SearchLimiterState {
+                last_started: None,
+                cooldown_until: None,
+                challenge_count: 0,
+            }),
+            min_interval: Duration::from_millis(config.search_min_interval_ms),
+            initial_cooldown: Duration::from_millis(config.search_cooldown_ms),
+            max_cooldown: Duration::from_millis(config.search_max_cooldown_ms)
+                .max(Duration::from_millis(config.search_cooldown_ms)),
+        })
+    }
+
+    async fn acquire(&self) -> OwnedSemaphorePermit {
+        self.in_flight
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("DuckDuckGo limiter semaphore should never close")
+    }
+
+    async fn wait_until_allowed(&self) {
+        loop {
+            let wait = {
+                let mut state = self.state.lock().await;
+                let now = Instant::now();
+                let interval_wait = state
+                    .last_started
+                    .and_then(|last| self.min_interval.checked_sub(last.elapsed()));
+                let cooldown_wait = state
+                    .cooldown_until
+                    .and_then(|until| until.checked_duration_since(now));
+
+                match (interval_wait, cooldown_wait) {
+                    (Some(interval), Some(cooldown)) => Some(interval.max(cooldown)),
+                    (Some(wait), None) | (None, Some(wait)) => Some(wait),
+                    (None, None) => {
+                        state.last_started = Some(now);
+                        None
+                    }
+                }
+            };
+
+            match wait {
+                Some(wait) => tokio::time::sleep(wait).await,
+                None => return,
+            }
+        }
+    }
+
+    async fn record_challenge(&self) {
+        let mut state = self.state.lock().await;
+        state.challenge_count = state.challenge_count.saturating_add(1).min(16);
+        let exponent = state.challenge_count.saturating_sub(1).min(16);
+        let multiplier = 1_u32 << exponent;
+        let cooldown = self
+            .initial_cooldown
+            .saturating_mul(multiplier)
+            .min(self.max_cooldown);
+        state.cooldown_until = Some(Instant::now() + cooldown);
+    }
+
+    async fn record_success(&self) {
+        let mut state = self.state.lock().await;
+        state.challenge_count = 0;
+        state.cooldown_until = None;
+    }
+}
+
+fn process_wide_search_limiter(config: &WebConfig) -> Arc<SearchLimiter> {
+    static LIMITER: OnceLock<Arc<SearchLimiter>> = OnceLock::new();
+    LIMITER.get_or_init(|| SearchLimiter::new(config)).clone()
+}
+
 pub struct WebSearchTool {
     client: reqwest::Client,
     config: WebConfig,
     context: Arc<ResearchContext>,
     search_url: String,
+    limiter: Arc<SearchLimiter>,
 }
 
 /// Returns whether a search error is a definitive provider outcome rather than
@@ -39,7 +140,13 @@ impl WebSearchTool {
             .user_agent(config.user_agent.clone())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self::with_client_and_endpoint(config, context, client, "https://html.duckduckgo.com/html/")
+        Self::with_client_and_endpoint_and_limiter(
+            config.clone(),
+            context,
+            client,
+            "https://html.duckduckgo.com/html/",
+            process_wide_search_limiter(&config),
+        )
     }
 
     /// Construct a search tool with an injected HTTP client and endpoint.
@@ -52,11 +159,29 @@ impl WebSearchTool {
         client: reqwest::Client,
         search_url: impl Into<String>,
     ) -> Self {
+        Self::with_client_and_endpoint_and_limiter(
+            config.clone(),
+            context,
+            client,
+            search_url,
+            SearchLimiter::new(&config),
+        )
+    }
+
+    /// Construct a search tool with an explicitly shared limiter.
+    pub fn with_client_and_endpoint_and_limiter(
+        config: WebConfig,
+        context: Arc<ResearchContext>,
+        client: reqwest::Client,
+        search_url: impl Into<String>,
+        limiter: Arc<SearchLimiter>,
+    ) -> Self {
         Self {
             client,
             config,
             context,
             search_url: search_url.into(),
+            limiter,
         }
     }
 }
@@ -105,48 +230,72 @@ impl ToolExecutor for WebSearchTool {
         }
 
         let query = add_domain_hints(query, &call.input["domains"]);
-        let response = self
-            .client
-            .get(&self.search_url)
-            .query(&[("q", query.as_str())])
-            .send()
-            .await;
+        let retries = self
+            .config
+            .search_challenge_retries
+            .min(MAX_SEARCH_CHALLENGE_RETRIES);
+        let mut retry_index = 0;
+        let rows = loop {
+            let _permit = self.limiter.acquire().await;
+            self.limiter.wait_until_allowed().await;
+            let response = self
+                .client
+                .get(&self.search_url)
+                .query(&[("q", query.as_str())])
+                .send()
+                .await;
 
-        let (status, body) = match response {
-            Ok(response) => {
-                let status = response.status();
-                match response.text().await {
-                    Ok(body) => (status, body),
-                    Err(err) => {
-                        return ToolResult {
-                            call_id: call.id.clone(),
-                            success: false,
-                            output: String::new(),
-                            error: Some(format!("failed to read search response: {err}")),
-                        };
+            let (status, body) = match response {
+                Ok(response) => {
+                    let status = response.status();
+                    match response.text().await {
+                        Ok(body) => (status, body),
+                        Err(err) => {
+                            return ToolResult {
+                                call_id: call.id.clone(),
+                                success: false,
+                                output: String::new(),
+                                error: Some(format!("failed to read search response: {err}")),
+                            };
+                        }
                     }
                 }
+                Err(err) => {
+                    return ToolResult {
+                        call_id: call.id.clone(),
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("search request failed: {err}")),
+                    };
+                }
+            };
+
+            let rows = parse_search_results(&body, limit);
+            if is_retryable_duckduckgo_challenge(status, &body) {
+                self.limiter.record_challenge().await;
+                if retry_index < retries {
+                    retry_index += 1;
+                    tracing::debug!(
+                        retry = retry_index,
+                        max_retries = retries,
+                        "DuckDuckGo anti-bot challenge; waiting for limiter cooldown before retry"
+                    );
+                    continue;
+                }
             }
-            Err(err) => {
+
+            if let Some(error) = classify_search_failure(status, &body, rows.is_empty()) {
                 return ToolResult {
                     call_id: call.id.clone(),
                     success: false,
                     output: String::new(),
-                    error: Some(format!("search request failed: {err}")),
+                    error: Some(error),
                 };
             }
+
+            self.limiter.record_success().await;
+            break rows;
         };
-
-        let rows = parse_search_results(&body, limit);
-
-        if let Some(error) = classify_search_failure(status, &body, rows.is_empty()) {
-            return ToolResult {
-                call_id: call.id.clone(),
-                success: false,
-                output: String::new(),
-                error: Some(error),
-            };
-        }
 
         let retrieved_at = Utc::now();
         let as_of = self.context.as_of();
@@ -279,16 +428,14 @@ fn classify_search_failure(
         return None;
     }
 
-    let body_lower = body.to_ascii_lowercase();
-    if body_lower.contains("anomaly-modal")
-        || body_lower.contains("challenge-form")
-        || body_lower.contains("unfortunately, bots use duckduckgo too")
-    {
+    if is_duckduckgo_challenge_body(body) {
         return Some(format!(
             "search provider blocked the request (HTTP {}): DuckDuckGo returned an anti-bot challenge",
             status.as_u16()
         ));
     }
+
+    let body_lower = body.to_ascii_lowercase();
 
     if !status.is_success() {
         return Some(format!(
@@ -305,6 +452,17 @@ fn classify_search_failure(
         "search response contained no recognized structured results (HTTP {})",
         status.as_u16()
     ))
+}
+
+fn is_duckduckgo_challenge_body(body: &str) -> bool {
+    let body_lower = body.to_ascii_lowercase();
+    body_lower.contains("anomaly-modal")
+        || body_lower.contains("challenge-form")
+        || body_lower.contains("unfortunately, bots use duckduckgo too")
+}
+
+fn is_retryable_duckduckgo_challenge(status: StatusCode, body: &str) -> bool {
+    status == StatusCode::ACCEPTED && is_duckduckgo_challenge_body(body)
 }
 
 #[cfg(test)]
