@@ -1437,7 +1437,7 @@ mod tests {
     use super::*;
     use crate::provider::test_support::{collect_chunks, spawn_sse_server};
     use serde_json::json;
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::sync::mpsc;
     use tiny_http::{Header, Request, Response, Server, StatusCode};
 
@@ -1760,6 +1760,43 @@ mod tests {
         base_url
     }
 
+    fn spawn_failing_sse_server(body: Vec<u8>) -> String {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("start failing SSE server");
+        let address = listener.local_addr().expect("failing SSE server address");
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("receive failing SSE request");
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let length = stream.read(&mut buffer).expect("read failing SSE request");
+                if length == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..length]);
+            }
+
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:X}\r\n",
+                body.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .expect("write failing SSE headers");
+            stream.write_all(&body).expect("write failing SSE body");
+            stream
+                .write_all(b"\r\n")
+                .expect("write failing SSE chunk terminator");
+            stream.flush().expect("flush failing SSE response");
+            stream
+                .shutdown(std::net::Shutdown::Write)
+                .expect("close failing SSE response");
+        });
+
+        format!("http://{address}")
+    }
+
     struct ChunkedBodyReader {
         chunks: Vec<Vec<u8>>,
         index: usize,
@@ -1981,6 +2018,41 @@ mod tests {
         assert!(debug_output.contains("\"model\": \"responses-model\""));
         assert!(debug_output.contains("authorization: [REDACTED]"));
         assert!(!debug_output.contains("event: "));
+    }
+
+    #[tokio::test]
+    async fn custom_openai_responses_turns_stream_transport_failure_into_provider_error() {
+        let body = br#"event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"partial"}
+
+"#;
+        let base_url = spawn_failing_sse_server(body.to_vec());
+
+        let mut config = NcaConfig::default();
+        config.provider.custom.api_key = Some("custom-test-key".into());
+        config.provider.custom.base_url = base_url;
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
+
+        let provider = CustomProvider::from_config(&config).expect("provider");
+        let stream = provider
+            .chat(&[Message::user("hello")], &[], "", Path::new("."))
+            .await
+            .expect("chat stream");
+        let chunks = collect_chunks(stream).await;
+
+        assert!(
+            matches!(
+                chunks.last(),
+                Some(StreamChunk::Error(message))
+                    if message.contains("Responses stream error")
+            ),
+            "unexpected Responses chunks: {chunks:?}"
+        );
+        assert!(
+            !chunks
+                .iter()
+                .any(|chunk| matches!(chunk, StreamChunk::Done))
+        );
     }
 
     #[tokio::test]
