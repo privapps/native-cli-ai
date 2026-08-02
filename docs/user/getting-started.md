@@ -127,6 +127,13 @@ You can guide the agent's behavior with instruction files, loaded in this order:
 2. **`AGENTS.md`** — project-level instructions (compatible with other AI tools)
 3. **`.ncarc`** — project-level nca-specific instructions
 4. **`.nca/instructions.md`** — personal local instructions (gitignored)
+5. **Skills** — discovered summaries available for explicit invocation
+6. **Orchestration context** — optional `NCA_ORCH_*` metadata for supervised runs
+
+The full non-empty `AGENTS.md` at the configured workspace root is additive: it
+does not replace built-in safety guidance, and nca does not implicitly search
+parent or nested directories for more instruction files. Root-level `##`
+sections may also appear as explicitly invocable skills; see [Skills](./skills.md).
 
 Example `.ncarc`:
 

@@ -401,13 +401,22 @@ Personal instructions (add to `.gitignore`):
 
 ## Auto-Research
 
-nca includes an auto-research feature for automated investigation:
+nca includes a bounded autoresearch workflow for metric-driven experiments.
+The complete Markdown program format, durable session lifecycle, approval
+boundary, failure states, recovery behavior, and result review are documented
+in [Autoresearch](./autoresearch.md):
 
 ```bash
+nca autoresearch start --program my-research.md
+nca autoresearch status
+nca autoresearch results
+nca autoresearch stop
 nca autoresearch once <program> [--workspace <path>]
 ```
 
-This runs a single automated research pass on a program or topic, generating structured output in the workspace.
+`once` is the single bounded probe; use the session commands when results must
+survive interruption or a process restart. Execution remains explicit and is
+subject to the normal approval policy.
 
 ---
 

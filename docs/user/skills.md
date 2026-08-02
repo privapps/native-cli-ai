@@ -8,20 +8,32 @@ Skills are **not code plugins** — they are structured instruction documents th
 
 ## Skill Discovery
 
-nca looks for skills in configured directories:
+nca combines compatible skill sources in a stable precedence order. Configure
+additional workspace-relative or absolute directories with:
 
 ```toml
 [harness]
 skill_directories = ["skills", ".nca/skills", ".claude/skills", ".agents/skills"]
 ```
 
-Default search paths (relative to workspace):
-1. `.nca/skills/` — nca-specific skills
-2. `.claude/skills/` — compatible with Claude Code skills
-3. `.agents/skills/` — compatible agent skill packs
+The built-in roots are:
 
-The global `~/.agents/skills/` directory is also searched, alongside the
-existing nca and Claude-compatible global directories.
+| Source | Location | Purpose |
+|--------|----------|---------|
+| Product-home skills | `$NCA_HOME/skills/`, `$XDG_DATA_HOME/ncacli/skills/`, or `~/.local/share/ncacli/skills/` | Skills installed for the nca product home |
+| User nca skills | `~/.nca/skills/` | nca-compatible global skills |
+| User Claude skills | `~/.claude/skills/` | Claude-compatible global skills |
+| User agent skills | `~/.agents/skills/` | Agent-compatible global skills |
+| Configured roots | `harness.skill_directories` | Explicit workspace or absolute directories |
+| Workspace agent skills | `<workspace>/.agents/skills/` | Always-discovered workspace-compatible skills |
+| Workspace manifest | `<workspace>/AGENTS.md` | Root instructions plus `##` skill projections |
+
+`AGENTS.md` is parsed before filesystem skills, so its command wins over a
+duplicate filesystem command. Filesystem roots keep their configured order;
+the workspace `.agents/skills` fallback is still checked when a custom list
+replaces the defaults. `nca skills` and `nca skills --json` expose the same
+catalog used by model manifests, explicit commands, completion, child-session
+requests, and the TUI picker.
 
 ### Skill Structure
 
@@ -199,6 +211,11 @@ skills; that catalog view does not replace or duplicate the full instruction
 block. A child session rebuilds the same applicable block for its own workspace
 root, while explicitly requested child skills remain resolvable even when they
 are manual-only for model discovery.
+
+The full instruction block and the skill projection have different purposes:
+the former guides every ordinary turn, while the latter is loaded only when a
+skill is explicitly selected or invoked. Parent and nested `AGENTS.md` files
+are not searched implicitly.
 
 ## Compatible metadata and manual-only skills
 

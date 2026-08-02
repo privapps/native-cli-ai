@@ -95,13 +95,20 @@ from `common::config::NcaConfig`. The CLI resolves configuration from defaults, 
 The system prompt is layered by `core::harness::build_system_prompt` from a runtime-built `HarnessSnapshot`:
 
 1. built-in identity + permission mode
-2. `AGENTS.md` / project (`.ncarc`) / local instructions
-3. skills catalog
-4. **Available Context** (cwd, git branch, model, permission mode, agent profile; contextual only)
-5. **Todos** (capped session todo list; contextual only)
-6. **Memory** (newest notes from the home workspace cache; contextual only)
-7. optional orchestration metadata from `NCA_ORCH_*`
-8. built-in tool and execution guidance; nca development instructions add the edit order (`replace_match` → `edit_file` → `apply_patch` → `write_file`)
+2. the complete non-empty workspace-root `AGENTS.md` instruction block
+3. project instructions (`.ncarc`)
+4. local instructions (`.nca/instructions.md`)
+5. skill summaries from the shared catalog
+6. **Available Context** (cwd, git branch, model, permission mode, agent profile; contextual only)
+7. **Todos** (capped session todo list; contextual only)
+8. **Memory** (newest notes from the home workspace cache; contextual only)
+9. optional orchestration metadata from `NCA_ORCH_*`
+10. built-in tool and execution guidance; nca development instructions add the edit order (`replace_match` → `edit_file` → `apply_patch` → `write_file`)
+
+The runtime reads `AGENTS.md` only at the configured workspace root. Its full
+text is additive and is kept separate from the root-level `##` sections that
+are projected into the skill catalog; refreshing the prompt does not duplicate
+conversation history.
 
 ```mermaid
 sequenceDiagram

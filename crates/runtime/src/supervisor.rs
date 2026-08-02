@@ -1930,6 +1930,37 @@ mod tests {
     use std::sync::mpsc as std_mpsc;
     use tiny_http::{Header, Response, Server};
 
+    struct NcaHomeGuard {
+        previous: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl NcaHomeGuard {
+        fn set(path: &std::path::Path) -> Self {
+            static NCA_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let lock = NCA_HOME_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let previous = std::env::var_os("NCA_HOME");
+            unsafe { std::env::set_var("NCA_HOME", path) };
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for NcaHomeGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.as_ref() {
+                    Some(value) => std::env::set_var("NCA_HOME", value),
+                    None => std::env::remove_var("NCA_HOME"),
+                }
+            }
+        }
+    }
+
     fn write_session_for_test(
         workspace: &std::path::Path,
         id: &str,
@@ -2043,10 +2074,11 @@ mod tests {
                 .expect("provider response");
         });
 
-        let home = tempfile::tempdir().expect("product home");
-        unsafe { std::env::set_var("NCA_HOME", home.path()) };
         let workspace = tempfile::tempdir().expect("workspace");
         let mut config = nca_common::config::NcaConfig::default();
+        config.session.history_dir = workspace.path().join("sessions");
+        config.session.last_session_file = workspace.path().join("last-session");
+        config.memory.file_path = workspace.path().join("memory.json");
         config.provider.default = ProviderKind::Custom;
         config.provider.custom.base_url = format!("http://{address}");
         config.provider.custom.api_key = Some("test-key".into());
@@ -2085,7 +2117,6 @@ mod tests {
         assert!(request_body.contains("as_of: 2026-07-29"));
 
         supervisor.finish(EndReason::Completed).await;
-        unsafe { std::env::remove_var("NCA_HOME") };
     }
 
     #[tokio::test]
@@ -2335,7 +2366,7 @@ mod tests {
     #[tokio::test]
     async fn get_last_session_id_falls_back_to_most_recent() {
         let home = tempfile::tempdir().expect("home");
-        unsafe { std::env::set_var("NCA_HOME", home.path()) };
+        let _home_guard = NcaHomeGuard::set(home.path());
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace = temp.path();
         let _ = std::fs::create_dir_all(workspace);
@@ -2382,7 +2413,6 @@ mod tests {
         );
         let content = std::fs::read_to_string(&last_session_path).unwrap();
         assert_eq!(content.trim(), "session-newest");
-        unsafe { std::env::remove_var("NCA_HOME") };
     }
 
     #[tokio::test]

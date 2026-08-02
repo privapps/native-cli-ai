@@ -95,3 +95,19 @@ headless approval modes can require an interactive approval or fail clearly.
 Sessions live below `.nca/autoresearch/sessions/` in the selected workspace.
 Stopping or cancelling does not delete state, results, or audit records;
 `results` can be used after a process restart to choose the next experiment.
+
+## Reviewing progress safely
+
+Result review is read-only: it does not rerun a program, change experiment
+status, modify the Git checkout, or rewrite the results log. The persisted
+records and progress views retain the experiment order, keep/discard/crash
+counts, best metric so far, candidate metric, and description. Rich agent
+records also retain termination state, stdout/stderr, changed files, the
+isolated workspace, and any secondary-constraint violations.
+
+The autoresearch engine supports bounded parallel scheduling with one isolated
+workspace per experiment and deterministic result ordering. Its analysis view
+can identify the best accepted result, primary-metric regressions, a stalled
+run, and diminishing returns from an immutable result sequence. These views are
+observational only, so they are safe to use when deciding whether to request
+another explicitly approved continuation.

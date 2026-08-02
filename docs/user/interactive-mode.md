@@ -69,6 +69,13 @@ drafts. Up/Down navigate a non-empty draft, while an empty draft keeps their
 transcript-scrolling behavior. Use **Ctrl+X E** for the external editor when
 the composition is very long.
 
+Rendering is display-cell aware: long unbroken lines wrap to the terminal
+width, and wide or combining Unicode keeps the cursor aligned with the logical
+draft. Across the fullscreen TUI and line-oriented REPL, a submitted multiline
+draft remains one request. The line-oriented REPL records it as one
+prompt-history entry, while canonical session messages, event logs, replay, and
+`/export` preserve its exact line breaks and whitespace.
+
 The line-oriented REPL retains its backslash continuation behavior:
 
 ```

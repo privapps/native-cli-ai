@@ -154,7 +154,7 @@ and must be greater than zero.
 built_in_enabled = true                           # Include nca's built-in system prompt
 project_instructions_path = ".ncarc"              # Project instructions file
 local_instructions_path = ".nca/instructions.md"  # Local (personal) instructions
-skill_directories = [".nca/skills", ".claude/skills"]  # Skill discovery paths
+skill_directories = ["skills", ".nca/skills", ".claude/skills", ".agents/skills"]  # Skill discovery paths
 ```
 
 The harness rebuilds a **dynamic** system prompt each turn from a `HarnessSnapshot`

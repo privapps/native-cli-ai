@@ -134,6 +134,25 @@ Search the public web and return titles, URLs, snippets, and provenance metadata
 
 **Behavior:** Searches Bing RSS first, then falls back to DuckDuckGo HTML when Bing is empty, blocked, malformed, or unavailable. Provider retries and per-provider request serialization happen inside the tool. Results are returned as JSON with the query, date-only UTC turn `as_of`, retrieval timestamp, URL, source authority, available publication metadata, and an `eligible_as_of` flag. Unknown metadata remains `null`; the upstream search response is not assumed to support an exact date filter. If both providers fail, the tool returns one provider-aware failure and the agent does not repeat the exhausted search operation automatically.
 
+#### Search failure classification and recovery
+
+Search failures retain the reason from each provider so an agent can recover
+without treating every failed response as malformed markup:
+
+| Failure | Meaning | Handling |
+|---------|---------|----------|
+| `no usable results` | The provider returned a legitimate empty-results page | Falls back to the other provider; it is not reported as a parser failure |
+| Parser failure (for example, `response contained no recognized structured results`) | The response was non-empty but did not match the provider parser | Falls back immediately; inspect the other provider or use `fetch_url` |
+| `provider returned an anti-bot challenge (HTTP <status>)` | The provider blocked the request or presented a challenge | HTTP 202 DuckDuckGo challenges use the configured challenge retry budget; other blocking is surfaced as non-retryable |
+| Transport or retryable HTTP failure | The request could not complete or the provider returned 408, 425, 429, or 5xx | Retries according to the search retry budget and cooldown settings |
+
+If both providers fail, `web_search` returns one error containing both provider
+reasons and the agent stops that search operation after the failed call. The
+agent reports recovery guidance to try a different provider or adjust the
+query; it does not issue three equivalent `web_search` calls automatically.
+See [Configuration](./configuration.md#web-web-request-settings) for retry,
+cooldown, and request-spacing settings.
+
 ---
 
 ### `fetch_url`
