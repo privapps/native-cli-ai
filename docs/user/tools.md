@@ -15,7 +15,7 @@ These tools are always available, including in [safe mode](./permissions.md).
 | `list_directory` | List files and directories at a path |
 | `git_status` | Show `git status` for the workspace |
 | `git_diff` | Show `git diff` (staged or unstaged) |
-| `web_search` | Search the web via DuckDuckGo, retaining URL, authority, retrieval, and available publication metadata |
+| `web_search` | Search the web via Bing with DuckDuckGo fallback, retaining URL, authority, retrieval, and available publication metadata |
 | `fetch_url` | Fetch and extract text content from a URL, retaining source and publication metadata |
 | `resolve_latest_financial_report` | Resolve the newest eligible observed result for an issuer and cadence, with explicit fallback status and limitations |
 | `validate_financial_report` | Validate a reported financial-period candidate against the current as-of boundary and observed official evidence |
@@ -132,7 +132,7 @@ Search the public web and return titles, URLs, snippets, and provenance metadata
 - `issuer` (string, optional) — Issuer name to bind inferred report metadata to the requested company
 - `as_of` is supplied by the runtime turn context and is not a caller-controlled field
 
-**Behavior:** HTTP GET to DuckDuckGo HTML search. Results are returned as JSON with the query, date-only UTC turn `as_of`, retrieval timestamp, URL, source authority, available publication metadata, and an `eligible_as_of` flag. Unknown metadata remains `null`; the upstream search response is not assumed to support an exact date filter.
+**Behavior:** Searches Bing RSS first, then falls back to DuckDuckGo HTML when Bing is empty, blocked, malformed, or unavailable. Provider retries and per-provider request serialization happen inside the tool. Results are returned as JSON with the query, date-only UTC turn `as_of`, retrieval timestamp, URL, source authority, available publication metadata, and an `eligible_as_of` flag. Unknown metadata remains `null`; the upstream search response is not assumed to support an exact date filter. If both providers fail, the tool returns one provider-aware failure and the agent does not repeat the exhausted search operation automatically.
 
 ---
 

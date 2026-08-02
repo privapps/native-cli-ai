@@ -18,7 +18,6 @@ use crate::hooks::{HookEventKind, HookRunner};
 use crate::provider::{Provider, ProviderError, StreamChunk};
 use crate::research::ResearchContext;
 use crate::tools::ToolRegistry;
-use crate::tools::web_search::is_non_retryable_search_failure;
 
 fn is_interactive_tool(name: &str) -> bool {
     matches!(name, "ask_question")
@@ -638,16 +637,15 @@ impl AgentLoop {
                 last_failed_tool.clear();
             }
 
-            let non_retryable_search_failure =
-                if tool_calls.len() == 1 && tool_calls[0].name == "web_search" {
-                    final_results.iter().find_map(|result| {
-                        is_non_retryable_search_failure(result.error.as_deref())
-                            .then(|| result.error.clone())
-                            .flatten()
-                    })
-                } else {
-                    None
-                };
+            let failed_search = tool_calls.len() == 1
+                && tool_calls[0].name == "web_search"
+                && final_results.iter().all(|result| !result.success);
+            let search_error = failed_search.then(|| {
+                final_results
+                    .iter()
+                    .find_map(|result| result.error.clone())
+                    .unwrap_or_else(|| "web search failed".into())
+            });
 
             for result in final_results {
                 self.messages.push(Message::tool(
@@ -661,7 +659,7 @@ impl AgentLoop {
                 .await;
             }
 
-            if let Some(error) = non_retryable_search_failure {
+            if let Some(error) = search_error {
                 let msg = format!(
                     "Search stopped: {error}. Recovery: try a different search provider or adjust the query."
                 );

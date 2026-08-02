@@ -331,9 +331,7 @@ mod tests {
         std::fs::create_dir(&endpoint).expect("endpoint collision fixture should be created");
 
         let result = bind_listener(&endpoint).await;
-        let error = result
-            .err()
-            .expect("binding an occupied endpoint should fail");
+        let error = result.unwrap_err();
         assert!(error.to_string().contains(&endpoint.display().to_string()));
     }
 
@@ -390,7 +388,7 @@ mod tests {
             ))
         });
 
-        let error = result.expect_err("permanent collisions should be actionable");
+        let error = result.unwrap_err();
         assert!(error.contains("after 8 attempts"));
         assert!(error.contains("simulated occupied endpoint"));
     }

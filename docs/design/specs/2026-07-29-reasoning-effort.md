@@ -50,7 +50,7 @@ The field is added to OpenAI-compatible Chat Completions requests for OpenAI, Op
 21. As an `nca` user, I want the setting visible in model and configuration status output, so that I can distinguish an explicit `nil` setting from a missing or accidentally ignored setting.
 22. As an `nca` user, I want status output to identify that the setting is OpenAI-compatible-only, so that seeing a configured value while using an Anthropic-compatible endpoint is not misleading.
 23. As an `nca` user, I want `reasoning_effort` to remain independent from `enable_thinking` and `thinking_budget`, so that existing thinking configuration is not silently reinterpreted.
-24. As an `nca` user, I want temperature behavior unchanged on Chat Completions and Anthropic-compatible paths, while Responses omits unsupported `temperature`, so that each protocol receives a valid request.
+24. As an `nca` user, I want temperature behavior unchanged on Chat Completions and Anthropic-compatible paths, while Responses omits model-dependent `temperature`, so that models rejecting the field remain usable.
 25. As an `nca` user, I want an unsupported value to produce the provider's normal error, so that invalid or incompatible configuration is visible instead of being silently downgraded.
 26. As an `nca` maintainer, I want protocol adapters to own this behavior, so that OpenAI, OpenRouter, Custom Chat Completions, and Custom Responses requests stay consistent.
 
@@ -65,7 +65,7 @@ The field is added to OpenAI-compatible Chat Completions requests for OpenAI, Op
 - Do not add the property to the Anthropic-compatible request-body contract, including Anthropic-compatible Custom endpoints and the MiniMax Anthropic-compatible path.
 - Always send a configured non-`nil` value for the selected Chat Completions or Responses provider in that protocol's request shape, without inspecting model names or attempting capability detection.
 - Do not retry a rejected request without the property. Provider errors remain visible to the user.
-- Keep `temperature` unchanged on Chat Completions and Anthropic-compatible paths. Custom Responses omits `temperature` because model support varies; this is a fixed protocol rule, not capability detection or retry behavior.
+- Keep `temperature` unchanged on Chat Completions and Anthropic-compatible paths. Omit it from Custom Responses because model support varies; do not add capability detection or retry behavior.
 - Keep `enable_thinking` and `thinking_budget` independent. This feature does not translate those settings into `reasoning_effort` and does not implement Anthropic `thinking` blocks.
 - Add a CLI `--reasoning-effort` option whose omission leaves the loaded configuration unchanged and whose explicit value, including `nil`, overrides it for the current invocation only.
 - Add the `/reasoning-effort` TUI command. With a value, it trims and persists the new setting to workspace configuration; without a value, it displays the current setting. The Custom-provider setup wizard remains focused on endpoint and credential configuration.

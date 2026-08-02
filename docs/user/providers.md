@@ -144,7 +144,7 @@ compatibility = "openai"   # or "openai-responses" or "anthropic"
 base_url = "https://sumopod.example"
 api_key_env = "CUSTOM_PROVIDER_API_KEY"
 model = "my-model"
-temperature = 0.7  # Responses mode retains this setting but omits the field
+temperature = 0.7  # Retained for other protocols; omitted from Responses
 ```
 
 `base_url` must be an HTTP(S) origin, optionally with a path ending in `/v1` (for example, `https://opencode.ai/zen/v1`). `nca` preserves that path prefix and appends the protocol-specific request path. Credentials, query strings, fragments, and final request paths such as `/v1/models` are rejected.
@@ -214,7 +214,7 @@ OpenAI Responses custom endpoints use:
 - `POST <base path>/responses` with Bearer authentication, `stream = true`, and `store = false` for agent turns.
 - Native Responses input items, function calls, function-call outputs, and SSE events. Existing nca function tools are supported; provider-hosted tools are not.
 - The complete canonical session history on every request; nca does not use `previous_response_id`.
-- The configured `temperature` value is not serialized. Responses model support for that field varies, and omitting it avoids `Unsupported parameter: 'temperature'` request failures.
+- The configured `temperature` setting is retained for compatibility but omitted from Responses requests because model support varies. No retry or fallback request is made for this field.
 
 The TUI performs the cheap protocol-specific probe before activation. Malformed URLs, invalid environment-variable names, and missing credentials are blocking errors. Network, authentication, protocol, and endpoint failures offer **Retry**, **Save anyway**, or **Cancel**. **Save anyway** activates the manually configured provider without requiring model discovery. Probe errors are sanitized before display.
 

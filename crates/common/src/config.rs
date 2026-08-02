@@ -2161,6 +2161,13 @@ pub struct WebConfig {
     pub timeout_secs: u64,
     pub max_fetch_chars: usize,
     pub default_search_limit: usize,
+    pub search_min_interval_ms: u64,
+    pub search_cooldown_ms: u64,
+    pub search_max_cooldown_ms: u64,
+    /// Number of retries for recognized DuckDuckGo HTTP 202 challenges.
+    pub search_challenge_retries: u32,
+    pub search_retry_attempts: u32,
+    pub search_user_agent: String,
     pub user_agent: String,
 }
 
@@ -2170,6 +2177,12 @@ impl Default for WebConfig {
             timeout_secs: 15,
             max_fetch_chars: 25_000,
             default_search_limit: 5,
+            search_min_interval_ms: 1_000,
+            search_cooldown_ms: 5_000,
+            search_max_cooldown_ms: 60_000,
+            search_challenge_retries: 3,
+            search_retry_attempts: 1,
+            search_user_agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36".into(),
             user_agent: "nca/0.5 (+https://github.com/user/native-cli-ai)".into(),
         }
     }
@@ -2185,6 +2198,28 @@ impl WebConfig {
         }
         if let Some(default_search_limit) = partial.default_search_limit {
             self.default_search_limit = default_search_limit;
+        }
+        if let Some(search_min_interval_ms) = partial.search_min_interval_ms {
+            self.search_min_interval_ms = search_min_interval_ms;
+        }
+        if let Some(search_cooldown_ms) = partial.search_cooldown_ms {
+            self.search_cooldown_ms = search_cooldown_ms;
+        }
+        if let Some(search_max_cooldown_ms) = partial.search_max_cooldown_ms {
+            self.search_max_cooldown_ms = search_max_cooldown_ms;
+        }
+        if let Some(search_challenge_retries) = partial.search_challenge_retries {
+            self.search_challenge_retries = search_challenge_retries;
+        }
+        if let Some(search_retry_attempts) = partial.search_retry_attempts {
+            self.search_retry_attempts = search_retry_attempts;
+        } else if let Some(search_challenge_retries) = partial.search_challenge_retries {
+            // Keep the historical challenge-retry key loadable as the
+            // transient retry alias when the new setting is absent.
+            self.search_retry_attempts = search_challenge_retries;
+        }
+        if let Some(search_user_agent) = partial.search_user_agent {
+            self.search_user_agent = search_user_agent;
         }
         if let Some(user_agent) = partial.user_agent {
             self.user_agent = user_agent;
@@ -2498,6 +2533,12 @@ struct PartialWebConfig {
     timeout_secs: Option<u64>,
     max_fetch_chars: Option<usize>,
     default_search_limit: Option<usize>,
+    search_min_interval_ms: Option<u64>,
+    search_cooldown_ms: Option<u64>,
+    search_max_cooldown_ms: Option<u64>,
+    search_retry_attempts: Option<u32>,
+    search_challenge_retries: Option<u32>,
+    search_user_agent: Option<String>,
     user_agent: Option<String>,
 }
 
@@ -2554,6 +2595,52 @@ fn default_skill_directories() -> Vec<PathBuf> {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_search_defaults_and_legacy_config_are_compatible() {
+        let defaults = NcaConfig::default().web;
+        assert_eq!(defaults.search_min_interval_ms, 1_000);
+        assert_eq!(defaults.search_cooldown_ms, 5_000);
+        assert_eq!(defaults.search_max_cooldown_ms, 60_000);
+        assert_eq!(defaults.search_challenge_retries, 3);
+        assert_eq!(defaults.search_retry_attempts, 1);
+        assert!(defaults.search_user_agent.starts_with("Mozilla/5.0"));
+
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let path = workspace_config_path(workspace.path());
+        std::fs::create_dir_all(path.parent().expect("config parent")).expect("config dir");
+        std::fs::write(
+            &path,
+            "[web]\ntimeout_secs = 20\nsearch_min_interval_ms = 250\nsearch_cooldown_ms = 750\nsearch_max_cooldown_ms = 5000\nsearch_challenge_retries = 1\n",
+        )
+        .expect("write config");
+
+        let configured = NcaConfig::load_workspace_file(workspace.path()).expect("load config");
+        assert_eq!(configured.web.timeout_secs, 20);
+        assert_eq!(configured.web.search_min_interval_ms, 250);
+        assert_eq!(configured.web.search_cooldown_ms, 750);
+        assert_eq!(configured.web.search_max_cooldown_ms, 5_000);
+        assert_eq!(configured.web.search_challenge_retries, 1);
+        assert_eq!(configured.web.search_retry_attempts, 1);
+        assert_eq!(configured.web.default_search_limit, 5);
+    }
+
+    #[test]
+    fn new_search_retry_setting_takes_precedence_over_legacy_alias() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let path = workspace_config_path(workspace.path());
+        std::fs::create_dir_all(path.parent().expect("config parent")).expect("config dir");
+        std::fs::write(
+            &path,
+            "[web]\nsearch_retry_attempts = 2\nsearch_challenge_retries = 9\nsearch_user_agent = 'test-agent'\n",
+        )
+        .expect("write config");
+
+        let configured = NcaConfig::load_workspace_file(workspace.path()).expect("load config");
+        assert_eq!(configured.web.search_retry_attempts, 2);
+        assert_eq!(configured.web.search_challenge_retries, 9);
+        assert_eq!(configured.web.search_user_agent, "test-agent");
+    }
 
     #[test]
     fn default_harness_includes_compatible_agents_skill_directory() {

@@ -125,8 +125,28 @@ pub enum TuiCmd {
 
 const MOUSE_SCROLL_LINES: usize = 3;
 
-fn modified_enter_inserts_newline(modifiers: KeyModifiers) -> bool {
-    modifiers.contains(KeyModifiers::SHIFT) || modifiers.contains(KeyModifiers::ALT)
+fn newline_key_inserts_newline(key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Enter => {
+            key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT)
+        }
+        // crossterm decodes raw Ctrl+J as `Char('j')`; CSI-u capable
+        // terminals may report the control character itself.
+        KeyCode::Char('j') | KeyCode::Char('\n') => key.modifiers.contains(KeyModifiers::CONTROL),
+        _ => false,
+    }
+}
+
+fn handle_newline_key(state: &mut TuiSessionState, key: KeyEvent) -> bool {
+    if !newline_key_inserts_newline(key) {
+        return false;
+    }
+
+    let (buffer, cursor) = insert_text_at_cursor(&state.input_buffer, state.cursor_char_idx, "\n");
+    state.input_buffer = buffer;
+    state.cursor_char_idx = cursor;
+    state.slash_menu_index = 0;
+    true
 }
 
 /// Matches `PermissionMode` as stored via `format!("{:?}", mode)` (e.g. `BypassPermissions`).
@@ -1003,7 +1023,7 @@ pub fn run_blocking(
                     Line::from(Span::styled(hint_msg, Style::default().fg(theme::MUTED)))
                 } else if g.input_buffer.is_empty() {
                     Line::from(Span::styled(
-                        "Enter send · Shift+Enter/Alt+Enter newline · Tab agent · Ctrl+V image · Ctrl+P palette · Ctrl+X Q exit · Ctrl+L clear",
+                        "Enter send · Shift+Enter/Alt+Enter/Ctrl+J newline · Tab agent · Ctrl+V image · Ctrl+P palette · Ctrl+X Q exit · Ctrl+L clear",
                         Style::default().fg(theme::MUTED),
                     ))
                 } else {
@@ -2800,6 +2820,10 @@ pub fn run_blocking(
                         continue;
                     }
 
+                    if handle_newline_key(&mut g, key) {
+                        continue;
+                    }
+
                     match (key.code, key.modifiers) {
                         (KeyCode::Esc, _) if escape_cancels_active_turn(&g) => {
                             if let Some(ref flag) = cancel_flag {
@@ -2934,13 +2958,6 @@ pub fn run_blocking(
                                 }
                                 continue;
                             }
-                        }
-                        (KeyCode::Enter, mods) if modified_enter_inserts_newline(mods) => {
-                            let (buffer, cursor) =
-                                insert_text_at_cursor(&g.input_buffer, g.cursor_char_idx, "\n");
-                            g.input_buffer = buffer;
-                            g.cursor_char_idx = cursor;
-                            g.slash_menu_index = 0;
                         }
                         (KeyCode::Enter, _) => {
                             if !workspace_files_indexing
@@ -3263,8 +3280,8 @@ mod approval_parse_tests {
         ApprovalShortcutAction, PrimaryInputMode, TuiCmd, apply_selected_at_completion,
         approval_shortcut_action, branch_picker_enter_command, delete_completed_at_mention,
         dispatch_custom_provider_key, dispatch_paste, escape_cancels_active_turn,
-        filter_slash_entries, filtered_branch_indices, load_slash_entries,
-        modified_enter_inserts_newline, primary_input_mode,
+        filter_slash_entries, filtered_branch_indices, handle_newline_key, load_slash_entries,
+        primary_input_mode,
     };
     use crate::tui::composer::{completed_at_mention_range_before_cursor, composer_line};
     use crate::tui::state::{CustomProviderSetupStep, TuiSessionState};
@@ -3621,24 +3638,35 @@ mod approval_parse_tests {
     }
 
     #[test]
-    fn modified_enter_is_newline_insertion_without_submission() {
-        assert!(modified_enter_inserts_newline(KeyModifiers::SHIFT));
-        assert!(modified_enter_inserts_newline(KeyModifiers::ALT));
-        assert!(!modified_enter_inserts_newline(KeyModifiers::NONE));
+    fn newline_shortcuts_insert_without_submitting() {
+        for key in [
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('\n'), KeyModifiers::CONTROL),
+        ] {
+            let mut state = state();
+            state.input_buffer = "αdraft".into();
+            state.cursor_char_idx = 1;
 
+            assert!(handle_newline_key(&mut state, key));
+            assert_eq!(state.input_buffer, "α\ndraft");
+            assert_eq!(state.cursor_char_idx, 2);
+        }
+    }
+
+    #[test]
+    fn ordinary_enter_remains_submission_key() {
         let mut state = state();
         state.input_buffer = "draft".into();
         state.cursor_char_idx = state.input_buffer.chars().count();
-        let (buffer, cursor) = crate::tui::composer::insert_text_at_cursor(
-            &state.input_buffer,
-            state.cursor_char_idx,
-            "\n",
-        );
-        state.input_buffer = buffer;
-        state.cursor_char_idx = cursor;
 
-        assert_eq!(state.input_buffer, "draft\n");
-        assert_eq!(state.cursor_char_idx, "draft\n".chars().count());
+        assert!(!handle_newline_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ));
+        assert_eq!(state.input_buffer, "draft");
+        assert_eq!(state.cursor_char_idx, 5);
     }
 
     #[test]

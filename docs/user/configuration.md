@@ -51,7 +51,7 @@ compatibility = "openai"   # "openai" | "openai-responses" | "anthropic"
 base_url = "https://gateway.example"
 api_key_env = "CUSTOM_PROVIDER_API_KEY"
 model = "gateway-model"
-temperature = 0.7           # Responses mode intentionally omits this field
+temperature = 0.7           # Omitted from Responses requests
 ```
 
 ### `[model]` — Model Settings
@@ -94,24 +94,25 @@ MiniMax, Anthropic, or a Custom provider using the Anthropic-compatible
 protocol.
 
 Custom providers using `compatibility = "openai-responses"` retain the shared
-`temperature` setting for configuration compatibility, but do not serialize it
-in Responses requests. Some Responses models reject that parameter; omitting it
-keeps the request valid while `max_tokens` is still sent as `max_output_tokens`.
+`temperature` setting for configuration compatibility, but omit it from
+Responses requests because model support varies. This keeps models that reject
+the parameter usable; `max_tokens` is sent as `max_output_tokens`.
 
 ### Custom provider request diagnostics
 
-Set `NCA_DEBUG_REQUEST=1` to append request-only diagnostics for custom providers
+Set `NCA_DEBUG_REQUEST=1` to emit request-only diagnostics for custom providers
 using `compatibility = "openai"` or `compatibility = "openai-responses"` to
-`./debug.log`. Each timestamped record contains the final HTTP method, URL,
-redacted headers, and pretty-printed JSON request body. The log is append-only
-across requests and runs.
+stderr and append the same record to `./debug.log`. Each timestamped record
+contains the final HTTP method, URL, redacted headers, and pretty-printed JSON
+request body. The log is append-only across requests and runs.
 
 Only the exact value `1` enables this behavior. Custom Anthropic requests are
 not logged. Responses, streamed events, provider errors, and completion output
-are never written to the file. Authorization and API-key values are redacted,
-but request bodies can still contain prompts, file contents, images, and tool
-schemas, so protect `debug.log` appropriately. If the file cannot be written,
-nca warns on stderr and continues the provider request.
+are never emitted to stderr or written to the file. Authorization and API-key
+values are redacted, but request bodies can still contain prompts, file
+contents, images, and tool schemas, so protect `debug.log` appropriately. If
+the file cannot be written, nca warns on stderr and continues the provider
+request.
 
 ### `[permissions]` — Permission System
 
@@ -234,8 +235,15 @@ blocking = false    # If true, waits for completion
 timeout_secs = 15
 max_fetch_chars = 25000
 default_search_limit = 5
+search_min_interval_ms = 1000
+search_cooldown_ms = 5000
+search_max_cooldown_ms = 60000
+search_challenge_retries = 3
+search_retry_attempts = 1
 user_agent = "nca/0.5 (+https://github.com/user/native-cli-ai)"
 ```
+
+`web_search` searches Bing RSS first and uses DuckDuckGo HTML as a fallback when Bing returns an empty, blocked, malformed, or failed response. The DuckDuckGo fallback has a process-wide serialized limiter shared by runtime sessions, with minimum request-start spacing and bounded anti-bot cooldown/backoff; Bing does not consume that DuckDuckGo limiter. Transport failures and HTTP 408, 425, 429, or 5xx responses use `search_retry_attempts`; recognized DuckDuckGo HTTP 202 anti-bot challenges use `search_challenge_retries` (three retries by default) through the same limiter and bounded cooldown. Empty results and parser failures immediately move to fallback. Both retry settings are capped at 10; when only the legacy `search_challenge_retries` key is present it remains a compatibility alias for transient retries as well. These settings do not limit unrelated tools. Separate nca processes have separate DuckDuckGo limiters. Search requests use the neutral `user_agent` identity; the legacy `search_user_agent` key remains loadable for configuration compatibility but is ignored, so nca does not spoof a browser.
 
 ### `[ui]` — Interface Settings
 

@@ -58,8 +58,10 @@ In the TUI, pressing `@` opens a file picker with fuzzy search. Use `Tab` to nav
 
 ### Multiline Input (TUI)
 
-In the full-screen TUI, **Enter** sends the current draft. Use **Shift+Enter**
-or **Alt+Enter** to insert a newline. Bracketed terminal paste inserts the
+In the full-screen TUI, **Enter** sends the current draft. Use **Shift+Enter**,
+**Alt+Enter**, or **Ctrl+J** to insert a newline. Ctrl+J is the reliable
+fallback when a terminal or multiplexer does not preserve the Shift modifier
+on Enter. Bracketed terminal paste inserts the
 whole payload atomically, preserving paragraph breaks while normalizing CRLF
 and CR to LF; a trailing newline remains in the draft and never submits it.
 The composer grows to eight visible rows and follows the cursor for longer
@@ -203,7 +205,7 @@ provider setup wizard.
 | Shortcut | Action |
 |----------|--------|
 | `Enter` | Send the current TUI draft |
-| `Shift+Enter` / `Alt+Enter` | Insert a newline in the TUI draft |
+| `Shift+Enter` / `Alt+Enter` / `Ctrl+J` | Insert a newline in the TUI draft |
 | `Esc` | Cancel current agent turn / close modal |
 | `Ctrl+C` | Cancel request |
 | `Ctrl+L` | Clear screen |

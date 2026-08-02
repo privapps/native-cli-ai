@@ -29,5 +29,5 @@ Add the global `model.reasoning_effort` setting to OpenAI-compatible Chat Comple
 - `nil` and empty values omit `reasoning_effort`.
 - Non-`nil` values are trimmed and passed through unchanged.
 - Anthropic-compatible requests never receive the OpenAI-only field.
-- Existing thinking settings remain independent. Chat Completions and Anthropic temperature behavior is unchanged; Custom Responses omits `temperature` because model support varies.
+- Existing thinking settings remain independent. Chat Completions and Anthropic temperature behavior is unchanged; Custom Responses omits `temperature` for model compatibility.
 - No model capability detection or fallback retry is introduced.

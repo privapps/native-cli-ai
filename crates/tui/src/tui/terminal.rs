@@ -4,7 +4,10 @@
 
 use crossterm::{
     cursor::{Hide, Show},
-    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
+    event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
     terminal::{
         Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
@@ -12,13 +15,28 @@ use crossterm::{
     },
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
-use std::io::{Stdout, stdout};
+use std::io::{self, Stdout, Write, stdout};
+
+fn request_keyboard_enhancement(out: &mut impl Write) -> io::Result<()> {
+    match execute!(
+        out,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    ) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => Ok(()),
+        Err(error) => Err(error),
+    }
+}
 
 pub fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode().map_err(|e| anyhow::anyhow!("enable_raw_mode: {e}"))?;
     let res: anyhow::Result<Terminal<CrosstermBackend<Stdout>>> = (|| {
         let mut out = stdout();
         execute!(out, EnterAlternateScreen)?;
+        // Ask supporting terminals and multiplexers to report modified keys
+        // using CSI-u. Without this, Shift+Enter is commonly indistinguishable
+        // from ordinary Enter at the byte stream level.
+        request_keyboard_enhancement(&mut out)?;
         execute!(out, EnableMouseCapture)?;
         execute!(out, EnableBracketedPaste)?;
         execute!(out, Hide)?;
@@ -81,6 +99,7 @@ impl<F: FnOnce()> Drop for TerminalRestoreGuard<F> {
 pub fn restore_terminal() {
     let mut out = stdout();
     let _ = execute!(out, DisableBracketedPaste);
+    let _ = execute!(out, PopKeyboardEnhancementFlags);
     let _ = execute!(out, Show);
     let _ = execute!(out, DisableMouseCapture);
     let _ = execute!(out, LeaveAlternateScreen);
@@ -89,8 +108,9 @@ pub fn restore_terminal() {
 
 #[cfg(test)]
 mod tests {
-    use super::TerminalRestoreGuard;
+    use super::{TerminalRestoreGuard, request_keyboard_enhancement};
     use std::cell::Cell;
+    use std::io::{self, Write};
     use std::rc::Rc;
 
     #[test]
@@ -113,5 +133,34 @@ mod tests {
             guard.disarm();
         }
         assert_eq!(cleanup_count.get(), 0);
+    }
+
+    #[test]
+    fn modified_key_setup_requests_csi_u_disambiguation() {
+        let mut output = Vec::new();
+        request_keyboard_enhancement(&mut output).expect("serialize keyboard enhancement request");
+
+        assert_eq!(output, b"\x1b[>1u");
+    }
+
+    #[test]
+    fn unsupported_keyboard_enhancement_is_optional() {
+        struct UnsupportedWriter;
+
+        impl Write for UnsupportedWriter {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "keyboard enhancement is unavailable",
+                ))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        request_keyboard_enhancement(&mut UnsupportedWriter)
+            .expect("unsupported keyboard enhancement should be optional");
     }
 }

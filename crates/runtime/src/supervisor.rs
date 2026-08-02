@@ -2201,6 +2201,12 @@ mod tests {
         .expect("resume supervisor");
 
         assert_eq!(supervisor.model, "restored-model");
+        let context_stats = supervisor.context_stats();
+        assert_eq!(context_stats.model, "restored-model");
+        assert_eq!(
+            context_stats.context_window,
+            config.memory.context.context_window_target.max(1)
+        );
         let messages = &supervisor.agent().messages;
         assert_eq!(
             messages.iter().filter(|m| m.role == Role::System).count(),

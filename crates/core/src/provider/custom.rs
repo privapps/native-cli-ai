@@ -532,6 +532,7 @@ fn responses_request_body(
     reasoning_effort: &str,
     workspace_root: &Path,
 ) -> Result<Value, ProviderError> {
+    let responses_tools = responses_tool_definitions(tools)?;
     let mut input = Vec::new();
     for message in messages {
         match message.role {
@@ -578,20 +579,8 @@ fn responses_request_body(
         "max_output_tokens": max_tokens,
     });
 
-    if !tools.is_empty() {
-        body["tools"] = Value::Array(
-            tools
-                .iter()
-                .map(|tool| {
-                    serde_json::json!({
-                        "type": "function",
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.parameters,
-                    })
-                })
-                .collect(),
-        );
+    if !responses_tools.is_empty() {
+        body["tools"] = Value::Array(responses_tools);
     }
 
     let reasoning_effort = reasoning_effort.trim();
@@ -600,6 +589,24 @@ fn responses_request_body(
     }
 
     Ok(body)
+}
+
+fn responses_tool_definitions(tools: &[ToolDefinition]) -> Result<Vec<Value>, ProviderError> {
+    let mut definitions = Vec::with_capacity(tools.len());
+    for tool in tools {
+        if let Some(tool_type) = tool.hosted_tool_type() {
+            return Err(ProviderError::RequestFailed(format!(
+                "OpenAI Responses does not support hosted tool `{tool_type}`; only native function tools are supported"
+            )));
+        }
+        definitions.push(serde_json::json!({
+            "type": "function",
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": tool.parameters,
+        }));
+    }
+    Ok(definitions)
 }
 
 fn message_content_text(content: &MessageContent) -> String {
@@ -624,6 +631,15 @@ fn responses_content_value(
                         "text": text,
                     })),
                     ContentPart::Image { media_type, path } => {
+                        let media_type = media_type.trim().to_ascii_lowercase();
+                        if !matches!(
+                            media_type.as_str(),
+                            "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+                        ) {
+                            return Err(ProviderError::RequestFailed(format!(
+                                "unsupported image media type `{media_type}` for Responses input; supported types are image/png, image/jpeg, image/webp, and image/gif"
+                            )));
+                        }
                         let full_path = workspace_root.join(path);
                         let bytes = std::fs::read(&full_path).map_err(|error| {
                             ProviderError::RequestFailed(format!(
@@ -653,6 +669,93 @@ struct ResponsesToolAccumulator {
     arguments: String,
 }
 
+#[derive(Default)]
+struct ResponsesToolState {
+    tools: BTreeMap<String, ResponsesToolAccumulator>,
+    aliases: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+struct ResponsesIdentityCandidate {
+    key: String,
+    value: String,
+}
+
+impl ResponsesToolState {
+    fn resolve(
+        &mut self,
+        candidates: Vec<ResponsesIdentityCandidate>,
+    ) -> Result<String, &'static str> {
+        let Some(canonical) = candidates
+            .iter()
+            .find_map(|candidate| self.aliases.get(&candidate.key))
+            .cloned()
+            .or_else(|| candidates.first().map(|candidate| candidate.key.clone()))
+        else {
+            return Err(
+                "function call is missing a stable identity (call_id, item id, or output_index)",
+            );
+        };
+
+        let fallback_call_id = candidates
+            .first()
+            .map(|candidate| candidate.value.clone())
+            .unwrap_or_default();
+        for candidate in candidates {
+            self.aliases.insert(candidate.key, canonical.clone());
+        }
+        self.tools
+            .entry(canonical.clone())
+            .or_insert_with(|| ResponsesToolAccumulator {
+                call_id: fallback_call_id,
+                ..ResponsesToolAccumulator::default()
+            });
+        Ok(canonical)
+    }
+}
+
+fn responses_identity_candidates(
+    value: &Value,
+    item: Option<&serde_json::Map<String, Value>>,
+) -> Vec<ResponsesIdentityCandidate> {
+    let mut candidates = Vec::new();
+    let mut add = |kind: &str, value: Option<&Value>| {
+        let Some(value) = value else {
+            return;
+        };
+        let value = match value {
+            Value::String(value) if !value.trim().is_empty() => value.to_string(),
+            Value::Number(value) => value.to_string(),
+            _ => return,
+        };
+        candidates.push(ResponsesIdentityCandidate {
+            key: format!("{kind}:{value}"),
+            value,
+        });
+    };
+
+    add(
+        "call_id",
+        item.and_then(|item| item.get("call_id"))
+            .or_else(|| value.get("call_id")),
+    );
+    add("item_id", item.and_then(|item| item.get("id")));
+    add("item_id", value.get("item_id"));
+    add("output_index", value.get("output_index"));
+    candidates
+}
+
+fn explicit_responses_call_id(
+    value: &Value,
+    item: Option<&serde_json::Map<String, Value>>,
+) -> Option<String> {
+    item.and_then(|item| item.get("call_id"))
+        .or_else(|| value.get("call_id"))
+        .and_then(Value::as_str)
+        .filter(|call_id| !call_id.trim().is_empty())
+        .map(str::to_string)
+}
+
 fn spawn_responses_stream(
     response: reqwest::Response,
     provider_name: &'static str,
@@ -665,7 +768,7 @@ fn spawn_responses_stream(
     tokio::spawn(async move {
         let mut buffer = Vec::new();
         let mut event_name = String::new();
-        let mut tools: BTreeMap<String, ResponsesToolAccumulator> = BTreeMap::new();
+        let mut tools = ResponsesToolState::default();
         let mut emitted_tools = BTreeSet::new();
         let mut produced_output = false;
         let mut completed = false;
@@ -758,18 +861,18 @@ fn spawn_responses_stream(
                             return;
                         };
                         if item.get("type").and_then(Value::as_str) == Some("function_call") {
-                            let key = item_key(item, value.get("output_index"));
-                            let entry = tools.entry(key.clone()).or_default();
-                            if let Some(call_id) = item
-                                .get("call_id")
-                                .and_then(Value::as_str)
-                                .filter(|call_id| !call_id.is_empty())
+                            let key = match tools
+                                .resolve(responses_identity_candidates(&value, Some(item)))
                             {
-                                entry.call_id = call_id.to_string();
-                            } else if entry.call_id.is_empty() {
-                                entry.call_id =
-                                    function_call_identity(item, value.get("output_index"))
-                                        .unwrap_or_default();
+                                Ok(key) => key,
+                                Err(message) => {
+                                    send_responses_error(&tx, provider_name, message).await;
+                                    return;
+                                }
+                            };
+                            let entry = tools.tools.get_mut(&key).expect("resolved tool entry");
+                            if let Some(call_id) = explicit_responses_call_id(&value, Some(item)) {
+                                entry.call_id = call_id;
                             }
                             if let Some(name) = item.get("name").and_then(Value::as_str) {
                                 entry.name = name.to_string();
@@ -781,7 +884,7 @@ fn spawn_responses_stream(
                                 let emitted = match emit_responses_tool(
                                     &tx,
                                     provider_name,
-                                    &tools,
+                                    &tools.tools,
                                     &mut emitted_tools,
                                     &key,
                                 )
@@ -804,19 +907,35 @@ fn spawn_responses_stream(
                             .await;
                             return;
                         };
-                        let key = responses_argument_key(&value);
-                        let entry = tools.entry(key.clone()).or_default();
+                        let key = match tools.resolve(responses_identity_candidates(&value, None)) {
+                            Ok(key) => key,
+                            Err(message) => {
+                                send_responses_error(&tx, provider_name, message).await;
+                                return;
+                            }
+                        };
+                        let entry = tools.tools.get_mut(&key).expect("resolved tool entry");
                         entry.arguments.push_str(delta);
                     }
                     "response.function_call_arguments.done" => {
-                        let key = responses_argument_key(&value);
+                        let key = match tools.resolve(responses_identity_candidates(&value, None)) {
+                            Ok(key) => key,
+                            Err(message) => {
+                                send_responses_error(&tx, provider_name, message).await;
+                                return;
+                            }
+                        };
                         if let Some(arguments) = value.get("arguments").and_then(Value::as_str) {
-                            tools.entry(key.clone()).or_default().arguments = arguments.into();
+                            tools
+                                .tools
+                                .get_mut(&key)
+                                .expect("resolved tool entry")
+                                .arguments = arguments.into();
                         }
                         let emitted = match emit_responses_tool(
                             &tx,
                             provider_name,
-                            &tools,
+                            &tools.tools,
                             &mut emitted_tools,
                             &key,
                         )
@@ -828,6 +947,15 @@ fn spawn_responses_stream(
                         produced_output = emitted || emitted_tools.contains(&key);
                     }
                     "response.completed" => {
+                        if tools.tools.keys().any(|key| !emitted_tools.contains(key)) {
+                            send_responses_error(
+                                &tx,
+                                provider_name,
+                                "function call output is incomplete",
+                            )
+                            .await;
+                            return;
+                        }
                         if let Some(usage) = value
                             .get("response")
                             .and_then(|response| response.get("usage"))
@@ -881,6 +1009,11 @@ fn spawn_responses_stream(
             return;
         }
 
+        if tools.tools.keys().any(|key| !emitted_tools.contains(key)) {
+            send_responses_error(&tx, provider_name, "function call output is incomplete").await;
+            return;
+        }
+
         finish_responses_stream(&tx, provider_name, produced_output).await;
     });
 
@@ -912,42 +1045,6 @@ fn is_known_responses_event(event_name: &str) -> bool {
     )
 }
 
-fn item_key(item: &serde_json::Map<String, Value>, output_index: Option<&Value>) -> String {
-    output_index
-        .map(Value::to_string)
-        .or_else(|| {
-            item.get("id")
-                .and_then(Value::as_str)
-                .or_else(|| item.get("call_id").and_then(Value::as_str))
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| "0".into())
-}
-
-fn responses_argument_key(value: &Value) -> String {
-    value
-        .get("output_index")
-        .map(Value::to_string)
-        .or_else(|| {
-            value
-                .get("item_id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| "0".into())
-}
-
-fn function_call_identity(
-    item: &serde_json::Map<String, Value>,
-    output_index: Option<&Value>,
-) -> Option<String> {
-    item.get("id")
-        .and_then(Value::as_str)
-        .filter(|identity| !identity.is_empty())
-        .map(str::to_string)
-        .or_else(|| output_index.map(Value::to_string))
-}
-
 async fn emit_responses_tool(
     tx: &tokio::sync::mpsc::Sender<StreamChunk>,
     provider_name: &'static str,
@@ -962,8 +1059,17 @@ async fn emit_responses_tool(
         send_responses_error(tx, provider_name, "function call item is missing").await;
         return Err(());
     };
-    if tool.call_id.is_empty() || tool.name.is_empty() {
-        send_responses_error(tx, provider_name, "function call is missing its identity").await;
+    if tool.call_id.is_empty() {
+        send_responses_error(
+            tx,
+            provider_name,
+            "function call is missing a stable identity",
+        )
+        .await;
+        return Err(());
+    }
+    if tool.name.trim().is_empty() {
+        send_responses_error(tx, provider_name, "function call is missing its name").await;
         return Err(());
     }
     let Ok(input) = serde_json::from_str(&tool.arguments) else {
@@ -1079,6 +1185,7 @@ impl CustomProvider {
 
     fn emit_debug_request(&self, request: &reqwest::Request, api_key: &str, protocol: &str) {
         let output = format_debug_request(request, api_key, protocol);
+        let _ = std::io::stderr().write_all(output.as_bytes());
         if let Err(error) = append_debug_log(&self.debug_log_path, &output) {
             eprintln!(
                 "nca: failed to write custom provider request diagnostics to {}: {error}",
@@ -1330,9 +1437,46 @@ mod tests {
     use super::*;
     use crate::provider::test_support::{collect_chunks, spawn_sse_server};
     use serde_json::json;
-    use std::io::Read;
-    use std::sync::mpsc;
+    use std::io::{Read, Write};
+    use std::sync::{Mutex, MutexGuard, mpsc};
     use tiny_http::{Header, Request, Response, Server, StatusCode};
+
+    static DEBUG_REQUEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct DebugRequestEnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        previous: Option<String>,
+    }
+
+    impl DebugRequestEnvGuard {
+        fn set(value: Option<&str>) -> Self {
+            let lock = DEBUG_REQUEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let previous = std::env::var("NCA_DEBUG_REQUEST").ok();
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var("NCA_DEBUG_REQUEST", value),
+                    None => std::env::remove_var("NCA_DEBUG_REQUEST"),
+                }
+            }
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for DebugRequestEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.as_deref() {
+                    Some(value) => std::env::set_var("NCA_DEBUG_REQUEST", value),
+                    None => std::env::remove_var("NCA_DEBUG_REQUEST"),
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn openai_probe_lists_models_with_bearer_auth() {
@@ -1653,6 +1797,43 @@ mod tests {
         base_url
     }
 
+    fn spawn_failing_sse_server(body: Vec<u8>) -> String {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("start failing SSE server");
+        let address = listener.local_addr().expect("failing SSE server address");
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("receive failing SSE request");
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let length = stream.read(&mut buffer).expect("read failing SSE request");
+                if length == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..length]);
+            }
+
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:X}\r\n",
+                body.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .expect("write failing SSE headers");
+            stream.write_all(&body).expect("write failing SSE body");
+            stream
+                .write_all(b"\r\n")
+                .expect("write failing SSE chunk terminator");
+            stream.flush().expect("flush failing SSE response");
+            stream
+                .shutdown(std::net::Shutdown::Write)
+                .expect("close failing SSE response");
+        });
+
+        format!("http://{address}")
+    }
+
     struct ChunkedBodyReader {
         chunks: Vec<Vec<u8>>,
         index: usize,
@@ -1874,6 +2055,41 @@ mod tests {
         assert!(debug_output.contains("\"model\": \"responses-model\""));
         assert!(debug_output.contains("authorization: [REDACTED]"));
         assert!(!debug_output.contains("event: "));
+    }
+
+    #[tokio::test]
+    async fn custom_openai_responses_turns_stream_transport_failure_into_provider_error() {
+        let body = br#"event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"partial"}
+
+"#;
+        let base_url = spawn_failing_sse_server(body.to_vec());
+
+        let mut config = NcaConfig::default();
+        config.provider.custom.api_key = Some("custom-test-key".into());
+        config.provider.custom.base_url = base_url;
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
+
+        let provider = CustomProvider::from_config(&config).expect("provider");
+        let stream = provider
+            .chat(&[Message::user("hello")], &[], "", Path::new("."))
+            .await
+            .expect("chat stream");
+        let chunks = collect_chunks(stream).await;
+
+        assert!(
+            matches!(
+                chunks.last(),
+                Some(StreamChunk::Error(message))
+                    if message.contains("Responses stream error")
+            ),
+            "unexpected Responses chunks: {chunks:?}"
+        );
+        assert!(
+            !chunks
+                .iter()
+                .any(|chunk| matches!(chunk, StreamChunk::Done))
+        );
     }
 
     #[tokio::test]
@@ -2113,6 +2329,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn custom_openai_responses_preserves_call_order_and_normalizes_multiple_identities() {
+        let body = concat!(
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"item_0\",\"call_id\":\"call_0\",\"name\":\"first\",\"arguments\":\"\"}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"value\\\":\\\"\"}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"call_id\":\"call_0\",\"delta\":\"one\\\"}\"}\n\n",
+            "event: response.function_call_arguments.done\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\"call_id\":\"call_0\",\"arguments\":\"{\\\"value\\\":\\\"one\\\"}\"}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"item_0\",\"name\":\"first\",\"arguments\":\"{\\\"value\\\":\\\"one\\\"}\"}}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"name\":\"second\",\"arguments\":\"\"}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{}\"}\n\n",
+            "event: response.function_call_arguments.done\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\"output_index\":1,\"arguments\":\"{}\"}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"name\":\"second\",\"arguments\":\"{}\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+        )
+        .to_string();
+        let base_url = spawn_sse_server(body, 200, |_| {});
+        let mut config = NcaConfig::default();
+        config.provider.custom.api_key = Some("custom-test-key".into());
+        config.provider.custom.base_url = base_url;
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
+
+        let provider = CustomProvider::from_config(&config).expect("provider");
+        let stream = provider
+            .chat(&[Message::user("run both")], &[], "", Path::new("."))
+            .await
+            .expect("chat stream");
+        let chunks = collect_chunks(stream).await;
+        let calls = chunks
+            .iter()
+            .filter_map(|chunk| match chunk {
+                StreamChunk::ToolUse(call) => Some((call.id.clone(), call.name.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            calls,
+            [
+                ("call_0".into(), "first".into()),
+                ("1".into(), "second".into())
+            ]
+        );
+        assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
+    }
+
+    #[tokio::test]
     async fn custom_openai_responses_provider_maps_images_and_supported_generation_settings() {
         let body = concat!(
             "event: response.output_text.delta\n",
@@ -2163,7 +2434,7 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_str(&request.body).unwrap();
 
         assert_eq!(payload["max_output_tokens"], 321);
-        assert_eq!(payload.get("temperature"), None);
+        assert!(payload.get("temperature").is_none());
         assert_eq!(payload["reasoning"], json!({"effort": "low"}));
         assert_eq!(
             payload["input"][0]["content"][0],
@@ -2182,7 +2453,7 @@ mod tests {
 
     #[tokio::test]
     async fn custom_openai_responses_omits_temperature_for_models_that_reject_it() {
-        let server = Server::http("127.0.0.1:0").expect("start temperature compatibility server");
+        let server = Server::http("127.0.0.1:0").expect("start temperature rejection server");
         let base_url = match server.server_addr() {
             tiny_http::ListenAddr::IP(addr) => format!("http://{addr}"),
             other => panic!("unsupported listen addr: {other:?}"),
@@ -2192,20 +2463,14 @@ mod tests {
         std::thread::spawn(move || {
             let mut request = server
                 .recv()
-                .expect("receive temperature compatibility request");
+                .expect("receive temperature rejection request");
             let captured = capture_chat_request(&mut request);
             let payload: serde_json::Value = serde_json::from_str(&captured.body).unwrap();
             request_tx
                 .send(captured)
-                .expect("capture temperature compatibility request");
+                .expect("capture temperature rejection request");
 
-            let (status, body, content_type) = if payload.get("temperature").is_some() {
-                (
-                    400,
-                    r#"{"error":{"message":"Unsupported parameter: 'temperature' is not supported with this model.","code":"invalid_request_body"}}"#,
-                    "application/json",
-                )
-            } else {
+            let (status, body, content_type) = if payload.get("temperature").is_none() {
                 (
                     200,
                     concat!(
@@ -2215,6 +2480,12 @@ mod tests {
                         "data: {\"type\":\"response.completed\",\"response\":{}}\n\n"
                     ),
                     "text/event-stream",
+                )
+            } else {
+                (
+                    400,
+                    r#"{"error":{"message":"Unsupported parameter: 'temperature' is not supported with this model.","code":"invalid_request_body"}}"#,
+                    "application/json",
                 )
             };
             request
@@ -2230,20 +2501,201 @@ mod tests {
         config.provider.custom.api_key = Some("custom-test-key".into());
         config.provider.custom.base_url = base_url;
         config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
+        config.provider.custom.temperature = 0.25;
 
         let provider = CustomProvider::from_config(&config).expect("provider");
         let stream = provider
             .chat(&[Message::user("hello")], &[], "", Path::new("."))
             .await
-            .expect("Responses request should omit unsupported temperature");
+            .expect("Responses request should omit rejected temperature parameter");
         let chunks = collect_chunks(stream).await;
-        let request = request_rx
-            .recv()
-            .expect("temperature compatibility request");
+        let request = request_rx.recv().expect("temperature rejection request");
         let payload: serde_json::Value = serde_json::from_str(&request.body).unwrap();
 
-        assert_eq!(payload.get("temperature"), None);
+        assert!(payload.get("temperature").is_none());
         assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
+    }
+
+    #[tokio::test]
+    async fn custom_openai_responses_rejects_unreadable_and_unsupported_images() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("notes.txt"), "not an image")
+            .expect("write unsupported image fixture");
+        let mut config = NcaConfig::default();
+        config.provider.custom.api_key = Some("custom-test-key".into());
+        config.provider.custom.base_url = "http://127.0.0.1:1".into();
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
+        let provider = CustomProvider::from_config(&config).expect("provider");
+
+        let unsupported = provider
+            .chat(
+                &[Message::user_with_parts(vec![ContentPart::Image {
+                    media_type: "text/plain".into(),
+                    path: "notes.txt".into(),
+                }])],
+                &[],
+                "",
+                workspace.path(),
+            )
+            .await;
+        let unsupported = match unsupported {
+            Ok(_) => panic!("unsupported image media type must fail before request"),
+            Err(error) => error,
+        };
+        assert!(
+            unsupported
+                .to_string()
+                .contains("unsupported image media type")
+        );
+
+        let unreadable = provider
+            .chat(
+                &[Message::user_with_parts(vec![ContentPart::Image {
+                    media_type: "image/png".into(),
+                    path: "missing.png".into(),
+                }])],
+                &[],
+                "",
+                workspace.path(),
+            )
+            .await;
+        let unreadable = match unreadable {
+            Ok(_) => panic!("unreadable image must fail before request"),
+            Err(error) => error,
+        };
+        assert!(unreadable.to_string().contains("failed to read image"));
+    }
+
+    #[tokio::test]
+    async fn custom_openai_responses_rejects_hosted_tools_before_transmission() {
+        let mut config = NcaConfig::default();
+        config.provider.custom.api_key = Some("custom-test-key".into());
+        config.provider.custom.base_url = "http://127.0.0.1:1".into();
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
+        let provider = CustomProvider::from_config(&config).expect("provider");
+        let hosted_tool = ToolDefinition::hosted(
+            "web_search_preview",
+            "Search the web",
+            json!({"search_context_size": "medium"}),
+        );
+
+        let error = provider
+            .chat(
+                &[Message::user("search for this")],
+                &[hosted_tool],
+                "",
+                Path::new("."),
+            )
+            .await
+            .expect_err("hosted tools are unsupported by the Responses adapter");
+
+        assert!(matches!(error, ProviderError::RequestFailed(message)
+            if message.contains("hosted tool")
+                && message.contains("web_search_preview")
+                && message.contains("native function tools")));
+    }
+
+    #[tokio::test]
+    async fn custom_openai_responses_rejects_function_calls_without_identity() {
+        let body = concat!(
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"name\":\"lookup\",\"arguments\":\"\"}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{}\"}\n\n"
+        )
+        .to_string();
+        let base_url = spawn_sse_server(body, 200, |_| {});
+        let mut config = NcaConfig::default();
+        config.provider.custom.api_key = Some("custom-test-key".into());
+        config.provider.custom.base_url = base_url;
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
+
+        let provider = CustomProvider::from_config(&config).expect("provider");
+        let stream = provider
+            .chat(&[Message::user("look up src")], &[], "", Path::new("."))
+            .await
+            .expect("chat stream");
+        let chunks = collect_chunks(stream).await;
+
+        assert!(matches!(
+            chunks.as_slice(),
+            [StreamChunk::Error(message)] if message.contains("stable identity")
+        ));
+    }
+
+    #[tokio::test]
+    async fn custom_openai_responses_rejects_function_calls_without_name() {
+        let body = concat!(
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"fc-no-name\",\"arguments\":\"{}\"}}\n\n"
+        )
+        .to_string();
+        let base_url = spawn_sse_server(body, 200, |_| {});
+        let mut config = NcaConfig::default();
+        config.provider.custom.api_key = Some("custom-test-key".into());
+        config.provider.custom.base_url = base_url;
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
+
+        let provider = CustomProvider::from_config(&config).expect("provider");
+        let stream = provider
+            .chat(
+                &[Message::user("invoke the unnamed function")],
+                &[],
+                "",
+                Path::new("."),
+            )
+            .await
+            .expect("chat stream");
+        let chunks = collect_chunks(stream).await;
+
+        assert!(matches!(
+            chunks.as_slice(),
+            [StreamChunk::Error(message)] if message.contains("missing its name")
+        ));
+    }
+
+    #[tokio::test]
+    async fn custom_openai_responses_rejects_invalid_arguments_and_incomplete_calls() {
+        let invalid_body = concat!(
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_invalid\",\"name\":\"lookup\",\"arguments\":\"not-json\"}}\n\n"
+        )
+        .to_string();
+        let base_url = spawn_sse_server(invalid_body, 200, |_| {});
+        let mut config = NcaConfig::default();
+        config.provider.custom.api_key = Some("custom-test-key".into());
+        config.provider.custom.base_url = base_url;
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
+
+        let provider = CustomProvider::from_config(&config).expect("provider");
+        let stream = provider
+            .chat(&[Message::user("invalid args")], &[], "", Path::new("."))
+            .await
+            .expect("chat stream");
+        let chunks = collect_chunks(stream).await;
+        assert!(matches!(
+            chunks.as_slice(),
+            [StreamChunk::Error(message)] if message.contains("invalid JSON")
+        ));
+
+        let incomplete_body = concat!(
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_incomplete\",\"name\":\"lookup\",\"arguments\":\"\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+        )
+        .to_string();
+        config.provider.custom.base_url = spawn_sse_server(incomplete_body, 200, |_| {});
+        let provider = CustomProvider::from_config(&config).expect("provider");
+        let stream = provider
+            .chat(&[Message::user("incomplete args")], &[], "", Path::new("."))
+            .await
+            .expect("chat stream");
+        let chunks = collect_chunks(stream).await;
+        assert!(matches!(
+            chunks.as_slice(),
+            [StreamChunk::Error(message)] if message.contains("incomplete")
+        ));
     }
 
     #[tokio::test]
@@ -2315,6 +2767,82 @@ mod tests {
             chunks.as_slice(),
             [StreamChunk::Error(message)] if message.contains("missing a string delta")
         ));
+    }
+
+    #[tokio::test]
+    async fn custom_openai_responses_surfaces_response_failed_events() {
+        let body = concat!(
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"upstream failed\"}}}\n\n"
+        )
+        .to_string();
+        let base_url = spawn_sse_server(body, 200, |_| {});
+        let mut config = NcaConfig::default();
+        config.provider.custom.api_key = Some("custom-test-key".into());
+        config.provider.custom.base_url = base_url;
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
+
+        let provider = CustomProvider::from_config(&config).expect("provider");
+        let stream = provider
+            .chat(&[Message::user("hello")], &[], "", Path::new("."))
+            .await
+            .expect("chat stream");
+        let chunks = collect_chunks(stream).await;
+
+        assert!(matches!(
+            chunks.as_slice(),
+            [StreamChunk::Error(message)]
+                if message.contains("upstream failed") && message.contains("Responses")
+        ));
+    }
+
+    #[tokio::test]
+    async fn custom_openai_responses_appends_to_versioned_path_prefix() {
+        let body = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+        )
+        .to_string();
+        let (request_tx, request_rx) = mpsc::channel();
+        let origin = spawn_sse_server(body, 200, move |request| {
+            request_tx
+                .send(capture_chat_request(request))
+                .expect("capture Responses request");
+        });
+
+        let mut config = NcaConfig::default();
+        config.provider.custom.api_key = Some("custom-test-key".into());
+        config.provider.custom.base_url = format!("{origin}/zen/v1");
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
+        config.provider.custom.model = "versioned-responses-model".into();
+
+        let provider = CustomProvider::from_config(&config).expect("provider");
+        let stream = provider
+            .chat(
+                &[Message::system("be concise"), Message::user("hello")],
+                &[],
+                "",
+                Path::new("."),
+            )
+            .await
+            .expect("chat stream");
+        let chunks = collect_chunks(stream).await;
+        let request = request_rx.recv().expect("Responses request");
+        let payload: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+
+        assert_eq!(request.url, "/zen/v1/responses");
+        assert_eq!(
+            request.authorization.as_deref(),
+            Some("Bearer custom-test-key")
+        );
+        assert_eq!(payload["model"], "versioned-responses-model");
+        assert_eq!(payload["stream"], true);
+        assert_eq!(payload["store"], false);
+        assert_eq!(payload["input"].as_array().unwrap().len(), 2);
+        assert!(payload.get("previous_response_id").is_none());
+        assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
     }
 
     #[tokio::test]
@@ -2560,6 +3088,34 @@ mod tests {
         assert!(!debug_request_enabled(Some("true")));
         assert!(!debug_request_enabled(Some(" 1")));
         assert!(debug_request_enabled(Some("1")));
+    }
+
+    #[tokio::test]
+    async fn public_custom_chat_respects_exact_debug_environment_values() {
+        for value in [None, Some(""), Some("0"), Some("true"), Some(" 1")] {
+            let _env = DebugRequestEnvGuard::set(value);
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            let base_url = spawn_sse_server(body.to_string(), 200, |_| {});
+            let mut config = NcaConfig::default();
+            config.provider.custom.api_key = Some("custom-test-key".into());
+            config.provider.custom.base_url = base_url;
+            config.provider.custom.compatibility = ProviderCompatibility::OpenAi;
+            let debug_dir = tempfile::tempdir().expect("debug directory");
+            let debug_path = debug_dir.path().join("debug.log");
+            let provider = CustomProvider::from_config(&config)
+                .expect("provider")
+                .with_debug_log_path(&debug_path);
+            let stream = provider
+                .chat(&[Message::user("hello")], &[], "", Path::new("."))
+                .await
+                .expect("chat stream");
+            let chunks = collect_chunks(stream).await;
+            assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
+            assert!(!debug_path.exists(), "unexpected diagnostics for {value:?}");
+        }
     }
 
     #[test]
