@@ -64,6 +64,11 @@ fn bench_render_markdown_block(c: &mut Criterion) {
     c.bench_function("render_markdown_block_80", |b| {
         b.iter(|| black_box(render_markdown_block(black_box(sample), 80).len()));
     });
+
+    let table = "| Name | Role | Status |\n| --- | :---: | ---: |\n| Ada | **Engineer** | ready |\n| Lin | Reviewer | pending |";
+    c.bench_function("render_markdown_table_80", |b| {
+        b.iter(|| black_box(render_markdown_block(black_box(table), 80).len()));
+    });
 }
 
 criterion_group!(

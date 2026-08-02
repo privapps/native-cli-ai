@@ -8,7 +8,7 @@ use crate::tui::busy_indicator;
 use crate::tui::state::{ApprovalRequest, DisplayBlock, TranscriptCache, TuiSessionState};
 use crate::tui::theme;
 use nca_common::event::{BusyState, QuestionSelection};
-use pulldown_cmark::{Event as MdEvent, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, Event as MdEvent, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::sync::OnceLock;
@@ -16,6 +16,7 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{Style as SynStyle, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
+use unicode_width::UnicodeWidthStr;
 
 /// Per flattened transcript line: click selects this answer for `question_id`
 /// (same indices as `transcript_lines_and_hits`).
@@ -657,17 +658,27 @@ fn syntect_to_ratatui(style: SynStyle) -> Style {
 
 /// Render a markdown fragment to wrapped styled lines (headings, lists, code).
 pub fn render_markdown_block(text: &str, width: usize) -> Vec<Line<'static>> {
+    if has_unclosed_fenced_block(text) {
+        return render_unclosed_fenced_fallback(text, width.max(1));
+    }
+
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_TASKLISTS);
     let parser = Parser::new_ext(text, options);
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut current = Line::from(Vec::<Span<'static>>::new());
     let mut in_code = false;
     let mut code_lang = String::new();
     let mut code_buf = String::new();
-    let mut list_depth = 0usize;
+    let mut list_stack: Vec<ListState> = Vec::new();
+    let mut quote_depth = 0usize;
+    let mut style_stack: Vec<Style> = Vec::new();
+    let mut current_style = Style::default().fg(theme::TEXT);
     let mut pending_space = false;
+    let mut table: Option<TableBuilder> = None;
 
     let flush_line = |out: &mut Vec<Line<'static>>, current: &mut Line<'static>| {
         if !current.spans.is_empty() || !current.style.add_modifier.is_empty() {
@@ -677,7 +688,20 @@ pub fn render_markdown_block(text: &str, width: usize) -> Vec<Line<'static>> {
     };
 
     for event in parser {
+        if table.is_some() {
+            if let Some(table_lines) = handle_table_event(&mut table, event, width) {
+                out.extend(table_lines);
+                pending_space = false;
+            }
+            continue;
+        }
+
         match event {
+            MdEvent::Start(Tag::Table(alignments)) => {
+                flush_line(&mut out, &mut current);
+                table = Some(TableBuilder::new(alignments.to_vec()));
+                pending_space = false;
+            }
             MdEvent::Start(Tag::CodeBlock(kind)) => {
                 flush_line(&mut out, &mut current);
                 pending_space = false;
@@ -695,51 +719,192 @@ pub fn render_markdown_block(text: &str, width: usize) -> Vec<Line<'static>> {
                 code_buf.clear();
                 pending_space = false;
             }
-            MdEvent::Code(text) => append_markdown_text(
-                &mut out,
-                &mut current,
-                &text,
-                width,
-                Style::default().fg(theme::TOOL),
-                &mut pending_space,
-            ),
+            MdEvent::Code(text) => {
+                append_quote_prefix(&mut current, quote_depth, width);
+                append_markdown_text(
+                    &mut out,
+                    &mut current,
+                    &text,
+                    width,
+                    current_style.fg(theme::TOOL),
+                    &mut pending_space,
+                );
+            }
             MdEvent::Start(Tag::Heading { .. }) => {
                 flush_line(&mut out, &mut current);
+                style_stack.push(current_style);
+                current_style = current_style
+                    .fg(theme::ASSISTANT)
+                    .add_modifier(Modifier::BOLD);
                 pending_space = false;
             }
             MdEvent::End(TagEnd::Heading(_)) => {
                 flush_line(&mut out, &mut current);
+                current_style = style_stack
+                    .pop()
+                    .unwrap_or_else(|| Style::default().fg(theme::TEXT));
                 pending_space = false;
             }
-            MdEvent::Start(Tag::List(_)) => list_depth += 1,
-            MdEvent::End(TagEnd::List(_)) => list_depth = list_depth.saturating_sub(1),
+            MdEvent::Start(Tag::List(start)) => list_stack.push(ListState {
+                ordered: start.is_some(),
+                next: start.unwrap_or(1),
+            }),
+            MdEvent::End(TagEnd::List(_)) => {
+                flush_line(&mut out, &mut current);
+                list_stack.pop();
+                pending_space = false;
+            }
             MdEvent::Start(Tag::Item) => {
                 flush_line(&mut out, &mut current);
                 pending_space = false;
-                let pad = "  ".repeat(list_depth.saturating_sub(1));
-                current.spans.push(Span::styled(
-                    format!("{pad}- "),
-                    Style::default().fg(theme::MUTED),
-                ));
+                append_quote_prefix(&mut current, quote_depth, width);
+                let (prefix, item_style) = if let Some(list) = list_stack.last_mut() {
+                    let prefix = if list.ordered {
+                        let prefix = format!("{}. ", list.next);
+                        list.next = list.next.saturating_add(1);
+                        prefix
+                    } else {
+                        "- ".to_string()
+                    };
+                    (
+                        format!(
+                            "{}{}",
+                            "  ".repeat(list_stack.len().saturating_sub(1)),
+                            prefix
+                        ),
+                        current_style.fg(theme::MUTED),
+                    )
+                } else {
+                    ("- ".to_string(), current_style.fg(theme::MUTED))
+                };
+                let available = width.max(1).saturating_sub(current.width());
+                current
+                    .spans
+                    .push(Span::styled(bounded_prefix(&prefix, available), item_style));
             }
             MdEvent::End(TagEnd::Item) => {
                 flush_line(&mut out, &mut current);
                 pending_space = false;
             }
-            MdEvent::Start(Tag::Strong) => {}
-            MdEvent::End(TagEnd::Strong) => {}
-            MdEvent::Start(Tag::Emphasis) => {}
-            MdEvent::End(TagEnd::Emphasis) => {}
+            MdEvent::Start(Tag::Strong) => {
+                style_stack.push(current_style);
+                current_style = current_style.add_modifier(Modifier::BOLD);
+            }
+            MdEvent::End(TagEnd::Strong) => {
+                current_style = style_stack
+                    .pop()
+                    .unwrap_or_else(|| Style::default().fg(theme::TEXT));
+            }
+            MdEvent::Start(Tag::Emphasis) => {
+                style_stack.push(current_style);
+                current_style = current_style.add_modifier(Modifier::ITALIC);
+            }
+            MdEvent::End(TagEnd::Emphasis) => {
+                current_style = style_stack
+                    .pop()
+                    .unwrap_or_else(|| Style::default().fg(theme::TEXT));
+            }
+            MdEvent::Start(Tag::Strikethrough) => {
+                style_stack.push(current_style);
+                current_style = current_style.add_modifier(Modifier::CROSSED_OUT);
+            }
+            MdEvent::End(TagEnd::Strikethrough) => {
+                current_style = style_stack
+                    .pop()
+                    .unwrap_or_else(|| Style::default().fg(theme::TEXT));
+            }
+            MdEvent::Start(Tag::Link { .. }) => {
+                style_stack.push(current_style);
+                current_style = current_style
+                    .fg(theme::USER)
+                    .add_modifier(Modifier::UNDERLINED);
+            }
+            MdEvent::End(TagEnd::Link) => {
+                current_style = style_stack
+                    .pop()
+                    .unwrap_or_else(|| Style::default().fg(theme::TEXT));
+            }
+            MdEvent::Start(Tag::Image { .. }) => {
+                style_stack.push(current_style);
+                current_style = current_style
+                    .fg(theme::MUTED)
+                    .add_modifier(Modifier::ITALIC);
+                append_markdown_text(
+                    &mut out,
+                    &mut current,
+                    "[image: ",
+                    width,
+                    current_style,
+                    &mut pending_space,
+                );
+            }
+            MdEvent::End(TagEnd::Image) => {
+                pending_space = false;
+                append_markdown_text(
+                    &mut out,
+                    &mut current,
+                    "]",
+                    width,
+                    current_style,
+                    &mut pending_space,
+                );
+                current_style = style_stack
+                    .pop()
+                    .unwrap_or_else(|| Style::default().fg(theme::TEXT));
+            }
+            MdEvent::Start(Tag::BlockQuote(_)) => {
+                flush_line(&mut out, &mut current);
+                style_stack.push(current_style);
+                current_style = current_style
+                    .fg(theme::MUTED)
+                    .add_modifier(Modifier::ITALIC);
+                quote_depth = quote_depth.saturating_add(1);
+                pending_space = false;
+            }
+            MdEvent::End(TagEnd::BlockQuote(_)) => {
+                flush_line(&mut out, &mut current);
+                quote_depth = quote_depth.saturating_sub(1);
+                current_style = style_stack
+                    .pop()
+                    .unwrap_or_else(|| Style::default().fg(theme::TEXT));
+                pending_space = false;
+            }
+            MdEvent::Rule => {
+                flush_line(&mut out, &mut current);
+                append_quote_prefix(&mut current, quote_depth, width);
+                let rule_width = width.max(1).saturating_sub(current.width()).max(1);
+                current.spans.push(Span::styled(
+                    "─".repeat(rule_width),
+                    Style::default().fg(theme::MUTED),
+                ));
+                flush_line(&mut out, &mut current);
+                pending_space = false;
+            }
+            MdEvent::TaskListMarker(checked) => {
+                let available = width.max(1).saturating_sub(current.width());
+                current.spans.push(Span::styled(
+                    bounded_prefix(if checked { "[x] " } else { "[ ] " }, available),
+                    current_style.fg(theme::MUTED),
+                ));
+                pending_space = false;
+            }
             MdEvent::Text(t) if in_code => code_buf.push_str(&t),
-            MdEvent::Text(t) => append_markdown_text(
-                &mut out,
-                &mut current,
-                &t,
-                width,
-                Style::default().fg(theme::TEXT),
-                &mut pending_space,
-            ),
-            MdEvent::SoftBreak | MdEvent::HardBreak => {
+            MdEvent::Text(t) => {
+                append_quote_prefix(&mut current, quote_depth, width);
+                append_markdown_text(
+                    &mut out,
+                    &mut current,
+                    &t,
+                    width,
+                    current_style,
+                    &mut pending_space,
+                );
+            }
+            MdEvent::SoftBreak => {
+                flush_line(&mut out, &mut current);
+                pending_space = false;
+            }
+            MdEvent::HardBreak => {
                 flush_line(&mut out, &mut current);
                 pending_space = false;
             }
@@ -747,8 +912,50 @@ pub fn render_markdown_block(text: &str, width: usize) -> Vec<Line<'static>> {
                 flush_line(&mut out, &mut current);
                 pending_space = false;
             }
+            MdEvent::Html(html) | MdEvent::InlineHtml(html) => {
+                append_quote_prefix(&mut current, quote_depth, width);
+                append_markdown_text(
+                    &mut out,
+                    &mut current,
+                    &html,
+                    width,
+                    current_style.fg(theme::MUTED),
+                    &mut pending_space,
+                );
+            }
+            MdEvent::InlineMath(math) => append_markdown_text(
+                &mut out,
+                &mut current,
+                &format!("$ {} $", math),
+                width,
+                current_style,
+                &mut pending_space,
+            ),
+            MdEvent::DisplayMath(math) => {
+                flush_line(&mut out, &mut current);
+                append_markdown_text(
+                    &mut out,
+                    &mut current,
+                    &format!("$$ {} $$", math),
+                    width,
+                    current_style,
+                    &mut pending_space,
+                );
+                flush_line(&mut out, &mut current);
+            }
+            MdEvent::FootnoteReference(label) => append_markdown_text(
+                &mut out,
+                &mut current,
+                &format!("[^{}]", label),
+                width,
+                current_style.fg(theme::MUTED),
+                &mut pending_space,
+            ),
             _ => {}
         }
+    }
+    if let Some(table) = table.take() {
+        out.extend(table.render(width));
     }
     flush_line(&mut out, &mut current);
     if out.is_empty() {
@@ -758,6 +965,530 @@ pub fn render_markdown_block(text: &str, width: usize) -> Vec<Line<'static>> {
         )));
     }
     out
+}
+
+fn has_unclosed_fenced_block(text: &str) -> bool {
+    let fence = char::from(96).to_string().repeat(3);
+    text.lines()
+        .filter(|line| line.trim_start().starts_with(&fence))
+        .count()
+        % 2
+        == 1
+}
+
+#[derive(Clone, Copy)]
+struct ListState {
+    ordered: bool,
+    next: u64,
+}
+
+struct TableBuilder {
+    alignments: Vec<Alignment>,
+    rows: Vec<TableRow>,
+    current_row: Option<TableRow>,
+    current_cell: Option<TableCellBuilder>,
+    in_header: bool,
+    style_stack: Vec<Style>,
+    current_style: Style,
+    pending_space: bool,
+}
+
+struct TableRow {
+    header: bool,
+    cells: Vec<TableCell>,
+}
+
+struct TableCell {
+    lines: Vec<Line<'static>>,
+}
+
+struct TableCellBuilder {
+    lines: Vec<Line<'static>>,
+    current: Line<'static>,
+}
+
+impl TableBuilder {
+    fn new(alignments: Vec<Alignment>) -> Self {
+        Self {
+            alignments,
+            rows: Vec::new(),
+            current_row: None,
+            current_cell: None,
+            in_header: false,
+            style_stack: Vec::new(),
+            current_style: Style::default().fg(theme::TEXT),
+            pending_space: false,
+        }
+    }
+
+    fn finish_cell(&mut self) {
+        let Some(mut cell) = self.current_cell.take() else {
+            return;
+        };
+        if !cell.current.spans.is_empty() || cell.lines.is_empty() {
+            cell.lines.push(cell.current);
+        }
+        if let Some(row) = self.current_row.as_mut() {
+            row.cells.push(TableCell { lines: cell.lines });
+        }
+        self.pending_space = false;
+    }
+
+    fn finish_row(&mut self) {
+        self.finish_cell();
+        if let Some(row) = self.current_row.take() {
+            self.rows.push(row);
+        }
+        self.pending_space = false;
+    }
+
+    fn flush_cell_line(&mut self) {
+        let Some(cell) = self.current_cell.as_mut() else {
+            return;
+        };
+        if !cell.current.spans.is_empty() || cell.lines.is_empty() {
+            let current =
+                std::mem::replace(&mut cell.current, Line::from(Vec::<Span<'static>>::new()));
+            cell.lines.push(current);
+        }
+        self.pending_space = false;
+    }
+
+    fn append_text(&mut self, text: &str, style: Style) {
+        let Some(cell) = self.current_cell.as_mut() else {
+            return;
+        };
+        let mut saw_word = false;
+        for word in text.split_whitespace() {
+            if (self.pending_space || saw_word) && !cell.current.spans.is_empty() {
+                cell.current
+                    .spans
+                    .push(Span::styled(" ".to_string(), style));
+            }
+            cell.current
+                .spans
+                .push(Span::styled(word.to_string(), style));
+            self.pending_space = false;
+            saw_word = true;
+        }
+        if saw_word {
+            self.pending_space = text.chars().last().is_some_and(char::is_whitespace);
+        }
+    }
+
+    fn render(mut self, width: usize) -> Vec<Line<'static>> {
+        self.finish_row();
+        if self.rows.is_empty() {
+            return vec![Line::from(Span::styled(
+                "(empty table)",
+                Style::default().fg(theme::MUTED),
+            ))];
+        }
+
+        let columns = self
+            .rows
+            .iter()
+            .map(|row| row.cells.len())
+            .max()
+            .unwrap_or(0)
+            .max(self.alignments.len());
+        if columns == 0 {
+            return vec![Line::from(Span::styled(
+                "(empty table)",
+                Style::default().fg(theme::MUTED),
+            ))];
+        }
+
+        let width = width.max(1);
+        let natural_widths = table_natural_widths(&self.rows, columns);
+        let spaced_separator = " │ ";
+        let tight_separator = "│";
+        let spaced_total = natural_widths.iter().sum::<usize>()
+            + spaced_separator.width() * columns.saturating_sub(1);
+        let separator = if columns == 1 || spaced_total <= width {
+            spaced_separator
+        } else {
+            tight_separator
+        };
+        let separator_width = separator.width();
+        let available = width.saturating_sub(separator_width * columns.saturating_sub(1));
+        if available < columns {
+            return render_table_fallback(&self.rows, width);
+        }
+        let column_widths = table_column_widths(&natural_widths, available);
+        if table_requires_fallback(&self.rows, &column_widths) {
+            return render_table_fallback(&self.rows, width);
+        }
+
+        let mut out = Vec::new();
+        for row in &self.rows {
+            let cells: Vec<Vec<Line<'static>>> = (0..columns)
+                .map(|column| {
+                    row.cells
+                        .get(column)
+                        .map(|cell| wrap_table_cell(cell, column_widths[column]))
+                        .unwrap_or_else(|| vec![Line::default()])
+                })
+                .collect();
+            let row_height = cells.iter().map(Vec::len).max().unwrap_or(1);
+
+            for line_index in 0..row_height {
+                let mut line = Line::from(Vec::<Span<'static>>::new());
+                for column in 0..columns {
+                    if column > 0 {
+                        line.spans.push(Span::styled(
+                            separator.to_string(),
+                            Style::default().fg(theme::MUTED),
+                        ));
+                    }
+                    append_aligned_table_cell(
+                        &mut line,
+                        cells[column].get(line_index),
+                        column_widths[column],
+                        self.alignments
+                            .get(column)
+                            .copied()
+                            .unwrap_or(Alignment::None),
+                    );
+                }
+                out.push(line);
+            }
+
+            if row.header {
+                let divider = if separator == spaced_separator {
+                    "─┼─"
+                } else {
+                    "┼"
+                };
+                let mut line = Line::from(Vec::<Span<'static>>::new());
+                for (column, column_width) in column_widths.iter().enumerate() {
+                    if column > 0 {
+                        line.spans.push(Span::styled(
+                            divider.to_string(),
+                            Style::default().fg(theme::MUTED),
+                        ));
+                    }
+                    line.spans.push(Span::styled(
+                        "─".repeat(*column_width),
+                        Style::default().fg(theme::MUTED),
+                    ));
+                }
+                out.push(line);
+            }
+        }
+        out
+    }
+}
+
+impl TableCellBuilder {
+    fn new() -> Self {
+        Self {
+            lines: Vec::new(),
+            current: Line::from(Vec::<Span<'static>>::new()),
+        }
+    }
+}
+
+fn handle_table_event(
+    table: &mut Option<TableBuilder>,
+    event: MdEvent<'_>,
+    width: usize,
+) -> Option<Vec<Line<'static>>> {
+    if matches!(event, MdEvent::End(TagEnd::Table)) {
+        return table.take().map(|table| table.render(width));
+    }
+
+    let builder = table.as_mut()?;
+    match event {
+        MdEvent::Start(Tag::TableHead) => {
+            builder.in_header = true;
+            builder.current_row = Some(TableRow {
+                header: true,
+                cells: Vec::new(),
+            });
+        }
+        MdEvent::End(TagEnd::TableHead) => {
+            builder.finish_row();
+            builder.in_header = false;
+        }
+        MdEvent::Start(Tag::TableRow) => {
+            builder.current_row = Some(TableRow {
+                header: builder.in_header,
+                cells: Vec::new(),
+            });
+        }
+        MdEvent::End(TagEnd::TableRow) => builder.finish_row(),
+        MdEvent::Start(Tag::TableCell) => {
+            builder.finish_cell();
+            builder.current_cell = Some(TableCellBuilder::new());
+            builder.pending_space = false;
+        }
+        MdEvent::End(TagEnd::TableCell) => builder.finish_cell(),
+        MdEvent::Start(Tag::Strong) => {
+            builder.style_stack.push(builder.current_style);
+            builder.current_style = builder.current_style.add_modifier(Modifier::BOLD);
+        }
+        MdEvent::End(TagEnd::Strong) => {
+            builder.current_style = builder
+                .style_stack
+                .pop()
+                .unwrap_or_else(|| Style::default().fg(theme::TEXT));
+        }
+        MdEvent::Start(Tag::Emphasis) => {
+            builder.style_stack.push(builder.current_style);
+            builder.current_style = builder.current_style.add_modifier(Modifier::ITALIC);
+        }
+        MdEvent::End(TagEnd::Emphasis) => {
+            builder.current_style = builder
+                .style_stack
+                .pop()
+                .unwrap_or_else(|| Style::default().fg(theme::TEXT));
+        }
+        MdEvent::Start(Tag::Strikethrough) => {
+            builder.style_stack.push(builder.current_style);
+            builder.current_style = builder.current_style.add_modifier(Modifier::CROSSED_OUT);
+        }
+        MdEvent::End(TagEnd::Strikethrough) => {
+            builder.current_style = builder
+                .style_stack
+                .pop()
+                .unwrap_or_else(|| Style::default().fg(theme::TEXT));
+        }
+        MdEvent::Start(Tag::Link { .. }) => {
+            builder.style_stack.push(builder.current_style);
+            builder.current_style = builder
+                .current_style
+                .fg(theme::USER)
+                .add_modifier(Modifier::UNDERLINED);
+        }
+        MdEvent::End(TagEnd::Link) => {
+            builder.current_style = builder
+                .style_stack
+                .pop()
+                .unwrap_or_else(|| Style::default().fg(theme::TEXT));
+        }
+        MdEvent::Start(Tag::Image { .. }) => {
+            builder.style_stack.push(builder.current_style);
+            builder.current_style = builder
+                .current_style
+                .fg(theme::MUTED)
+                .add_modifier(Modifier::ITALIC);
+            builder.append_text("[image:", builder.current_style);
+        }
+        MdEvent::End(TagEnd::Image) => {
+            builder.append_text("]", builder.current_style);
+            builder.current_style = builder
+                .style_stack
+                .pop()
+                .unwrap_or_else(|| Style::default().fg(theme::TEXT));
+        }
+        MdEvent::Code(text) => {
+            builder.append_text(&text, builder.current_style.fg(theme::TOOL));
+        }
+        MdEvent::Text(text) => builder.append_text(&text, builder.current_style),
+        MdEvent::Html(html) | MdEvent::InlineHtml(html) => {
+            builder.append_text(&html, builder.current_style.fg(theme::MUTED));
+        }
+        MdEvent::InlineMath(math) => {
+            builder.append_text(&format!("$ {} $", math), builder.current_style);
+        }
+        MdEvent::SoftBreak | MdEvent::HardBreak => builder.flush_cell_line(),
+        MdEvent::TaskListMarker(checked) => {
+            builder.append_text(if checked { "[x]" } else { "[ ]" }, builder.current_style);
+        }
+        _ => {}
+    }
+    None
+}
+
+fn table_natural_widths(rows: &[TableRow], columns: usize) -> Vec<usize> {
+    (0..columns)
+        .map(|column| {
+            rows.iter()
+                .filter_map(|row| row.cells.get(column))
+                .flat_map(|cell| cell.lines.iter().map(Line::width))
+                .max()
+                .unwrap_or(1)
+                .max(1)
+        })
+        .collect()
+}
+
+fn table_column_widths(natural: &[usize], available: usize) -> Vec<usize> {
+    if natural.iter().sum::<usize>() <= available {
+        return natural.to_vec();
+    }
+
+    let fair_share = (available / natural.len()).max(1);
+    let mut widths: Vec<usize> = natural
+        .iter()
+        .map(|width| (*width).min(fair_share).max(1))
+        .collect();
+    let mut remaining = available.saturating_sub(widths.iter().sum::<usize>());
+    while remaining > 0 {
+        let column = (0..natural.len())
+            .max_by_key(|&index| natural[index].saturating_sub(widths[index]))
+            .unwrap_or(0);
+        widths[column] += 1;
+        remaining -= 1;
+    }
+    widths
+}
+
+fn table_requires_fallback(rows: &[TableRow], column_widths: &[usize]) -> bool {
+    rows.iter().any(|row| {
+        row.cells.iter().enumerate().any(|(column, cell)| {
+            let width = column_widths.get(column).copied().unwrap_or(1);
+            cell.lines.iter().any(|line| {
+                line.spans.iter().any(|span| {
+                    span.content
+                        .chars()
+                        .any(|ch| Span::raw(ch.to_string()).width() > width)
+                })
+            })
+        })
+    })
+}
+
+fn wrap_table_cell(cell: &TableCell, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut wrapped = Vec::new();
+    for source in &cell.lines {
+        let mut current = Line::from(Vec::<Span<'static>>::new());
+        for span in &source.spans {
+            let mut chunk = String::new();
+            let mut chunk_width = 0;
+            for ch in span.content.chars() {
+                let char_width = Span::raw(ch.to_string()).width();
+                let (rendered, rendered_width) = if char_width > width {
+                    ("?".to_string(), 1)
+                } else {
+                    (ch.to_string(), char_width)
+                };
+                if rendered_width > 0 && current.width() + chunk_width + rendered_width > width {
+                    if !chunk.is_empty() {
+                        current
+                            .spans
+                            .push(Span::styled(std::mem::take(&mut chunk), span.style));
+                        chunk_width = 0;
+                    }
+                    if current.width() + rendered_width > width {
+                        wrapped.push(current);
+                        current = Line::from(Vec::<Span<'static>>::new());
+                    }
+                }
+                chunk.push_str(&rendered);
+                chunk_width += rendered_width;
+            }
+            if !chunk.is_empty() {
+                current.spans.push(Span::styled(chunk, span.style));
+            }
+        }
+        wrapped.push(current);
+    }
+    if wrapped.is_empty() {
+        wrapped.push(Line::default());
+    }
+    wrapped
+}
+
+fn append_aligned_table_cell(
+    line: &mut Line<'static>,
+    cell: Option<&Line<'static>>,
+    width: usize,
+    alignment: Alignment,
+) {
+    let cell_width = cell.map(Line::width).unwrap_or(0).min(width);
+    let padding = width.saturating_sub(cell_width);
+    let (left, right) = match alignment {
+        Alignment::Right => (padding, 0),
+        Alignment::Center => (padding / 2, padding - padding / 2),
+        Alignment::Left | Alignment::None => (0, padding),
+    };
+    if left > 0 {
+        line.spans.push(Span::raw(" ".repeat(left)));
+    }
+    if let Some(cell) = cell {
+        line.spans.extend(cell.spans.iter().cloned());
+    }
+    if right > 0 {
+        line.spans.push(Span::raw(" ".repeat(right)));
+    }
+}
+
+fn render_table_fallback(rows: &[TableRow], width: usize) -> Vec<Line<'static>> {
+    rows.iter()
+        .flat_map(|row| {
+            row.cells
+                .iter()
+                .flat_map(|cell| wrap_table_cell(cell, width.max(1)).into_iter())
+        })
+        .collect()
+}
+
+fn render_unclosed_fenced_fallback(text: &str, width: usize) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    let mut current = Line::from(Vec::<Span<'static>>::new());
+    let mut pending_space = false;
+    let style = Style::default().fg(theme::TEXT);
+
+    for source_line in text.split('\n') {
+        if source_line.is_empty() {
+            if !current.spans.is_empty() {
+                out.push(current.clone());
+                current = Line::from(Vec::<Span<'static>>::new());
+            }
+            out.push(Line::default());
+            pending_space = false;
+            continue;
+        }
+        append_markdown_text(
+            &mut out,
+            &mut current,
+            source_line,
+            width,
+            style,
+            &mut pending_space,
+        );
+        if !current.spans.is_empty() {
+            out.push(current.clone());
+            current = Line::from(Vec::<Span<'static>>::new());
+        }
+        pending_space = false;
+    }
+    if !current.spans.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+fn bounded_prefix(prefix: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if Span::raw(prefix).width() <= width {
+        return prefix.to_string();
+    }
+    let marker = prefix
+        .chars()
+        .rev()
+        .find(|ch| !ch.is_whitespace())
+        .unwrap_or('?');
+    if Span::raw(marker.to_string()).width() <= width {
+        marker.to_string()
+    } else {
+        "?".to_string()
+    }
+}
+
+fn append_quote_prefix(current: &mut Line<'static>, quote_depth: usize, width: usize) {
+    if quote_depth > 0 && current.spans.is_empty() {
+        let full_prefix = format!("{}│ ", "  ".repeat(quote_depth.saturating_sub(1)));
+        let prefix = bounded_prefix(&full_prefix, width.max(1));
+        current
+            .spans
+            .push(Span::styled(prefix, Style::default().fg(theme::MUTED)));
+    }
 }
 
 /// Append one Markdown text event to the current terminal line.
@@ -801,7 +1532,7 @@ fn append_markdown_word(
     let separator_width = usize::from(separator);
     let word_width = Span::raw(word).width();
 
-    if current.spans.is_empty() || current.width() + separator_width + word_width <= width {
+    if current.width() + separator_width + word_width <= width {
         if separator {
             current.spans.push(Span::styled(" ".to_string(), style));
         }
@@ -809,8 +1540,10 @@ fn append_markdown_word(
         return;
     }
 
-    out.push(current.clone());
-    *current = Line::from(Vec::<Span<'static>>::new());
+    if !current.spans.is_empty() {
+        out.push(current.clone());
+        *current = Line::from(Vec::<Span<'static>>::new());
+    }
     append_long_markdown_word(out, current, word, width, style);
 }
 
@@ -842,8 +1575,18 @@ fn append_long_markdown_word(
         }
 
         if end == 0 {
-            out.push(current.clone());
-            *current = Line::from(Vec::<Span<'static>>::new());
+            if current.spans.is_empty() {
+                let ch_len = remaining
+                    .chars()
+                    .next()
+                    .expect("remaining is non-empty")
+                    .len_utf8();
+                current.spans.push(Span::styled("?".to_string(), style));
+                remaining = &remaining[ch_len..];
+            } else {
+                out.push(current.clone());
+                *current = Line::from(Vec::<Span<'static>>::new());
+            }
             continue;
         }
 
@@ -875,30 +1618,73 @@ fn highlight_code_block(lang: &str, code: &str, width: usize) -> Vec<Line<'stati
     let theme = &ts.themes["base16-ocean.dark"];
     let mut h = HighlightLines::new(syntax, theme);
     let mut lines = Vec::new();
+    let code_width = width.max(1);
     for line in LinesWithEndings::from(code) {
-        let mut spans = Vec::new();
+        let mut fragments = Vec::new();
         if let Ok(parts) = h.highlight_line(line, ss) {
-            for fragment in parts {
-                spans.push(Span::styled(
-                    fragment.1.to_string(),
-                    syntect_to_ratatui(fragment.0),
-                ));
-            }
+            fragments.extend(parts.into_iter().map(|(style, text)| {
+                (
+                    syntect_to_ratatui(style),
+                    text.trim_end_matches(&['\r', '\n'][..]).to_string(),
+                )
+            }));
         }
-        if spans.is_empty() {
-            for wrapped in wrap_text(line.trim_end(), width.saturating_sub(2)) {
-                lines.push(Line::from(vec![
-                    Span::styled("  ", Style::default().fg(theme::MUTED)),
-                    Span::styled(wrapped, Style::default().fg(theme::MUTED)),
-                ]));
-            }
-        } else {
-            let mut row = vec![Span::styled("  ", Style::default().fg(theme::MUTED))];
-            row.extend(spans);
-            lines.push(Line::from(row));
+        if fragments.is_empty() {
+            fragments.push((
+                Style::default().fg(theme::MUTED),
+                line.trim_end().to_string(),
+            ));
         }
+        append_wrapped_code_fragments(&mut lines, &fragments, code_width);
+    }
+    if code.is_empty() {
+        append_wrapped_code_fragments(
+            &mut lines,
+            &[(Style::default().fg(theme::MUTED), String::new())],
+            code_width,
+        );
     }
     lines
+}
+
+fn append_wrapped_code_fragments(
+    lines: &mut Vec<Line<'static>>,
+    fragments: &[(Style, String)],
+    width: usize,
+) {
+    let prefix = if width >= 3 { "  " } else { "" };
+    let mut current = Line::from(Span::styled(
+        prefix.to_string(),
+        Style::default().fg(theme::MUTED),
+    ));
+    let mut wrote_content = false;
+
+    for (style, text) in fragments {
+        for ch in text.chars() {
+            let char_width = Span::raw(ch.to_string()).width();
+            if char_width == 0 {
+                current.spans.push(Span::styled(ch.to_string(), *style));
+                continue;
+            }
+            if current.width().saturating_add(char_width) > width {
+                if wrote_content {
+                    lines.push(current);
+                    current = Line::from(Span::styled(
+                        prefix.to_string(),
+                        Style::default().fg(theme::MUTED),
+                    ));
+                }
+                if current.width().saturating_add(char_width) > width {
+                    current.spans.push(Span::styled("?".to_string(), *style));
+                    wrote_content = true;
+                    continue;
+                }
+            }
+            current.spans.push(Span::styled(ch.to_string(), *style));
+            wrote_content = true;
+        }
+    }
+    lines.push(current);
 }
 
 pub fn parse_md_line(line: &str) -> Line<'static> {
