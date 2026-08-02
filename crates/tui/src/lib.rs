@@ -7,6 +7,7 @@
 
 pub mod clipboard;
 pub mod file_mentions;
+pub mod goal;
 pub mod image_attach;
 pub mod ipc_pending;
 pub mod prompt;

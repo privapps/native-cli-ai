@@ -27,6 +27,15 @@ pub struct NcaConfig {
 }
 
 impl NcaConfig {
+    /// Validate configuration values whose invalid form would make an
+    /// interactive operation unsafe or unbounded.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.session.max_goal_iterations == 0 {
+            return Err(ConfigError::InvalidGoalIterations);
+        }
+        Ok(())
+    }
+
     /// Load config from defaults, global file, workspace file, and environment.
     pub fn load() -> Result<Self, ConfigError> {
         let workspace_root = env::current_dir().map_err(|source| ConfigError::Io {
@@ -55,6 +64,7 @@ impl NcaConfig {
         }
 
         config.apply_env();
+        config.validate()?;
 
         // Best-effort migrate legacy project/.nca and ~/.nca into the product home.
         if let Err(err) = migrate_workspace_data_if_needed(workspace_root) {
@@ -73,6 +83,7 @@ impl NcaConfig {
             let partial = load_partial(&path)?;
             config.merge(partial);
         }
+        config.validate()?;
         Ok(config)
     }
 
@@ -84,6 +95,7 @@ impl NcaConfig {
             let partial = load_partial(&local_path)?;
             config.merge(partial);
         }
+        config.validate()?;
         Ok(config)
     }
 
@@ -1069,6 +1081,8 @@ pub enum ConfigError {
     },
     #[error("failed to patch config file {path}: {message}")]
     PatchToml { path: PathBuf, message: String },
+    #[error("invalid session.max_goal_iterations: must be greater than zero")]
+    InvalidGoalIterations,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1984,6 +1998,13 @@ pub struct SessionConfig {
     #[serde(alias = "max_turn_per_run")]
     pub max_turns_per_run: u32,
     pub max_tool_calls_per_turn: u32,
+    /// Maximum number of normal turns used by one autonomous `/goal` run.
+    #[serde(
+        default = "default_max_goal_iterations",
+        rename = "max_goal_iterations",
+        alias = "max-goal-iterations"
+    )]
+    pub max_goal_iterations: u32,
     pub checkpoint_interval: u32,
     /// File that stores the last active session ID for auto-resume.
     pub last_session_file: PathBuf,
@@ -1998,11 +2019,16 @@ impl Default for SessionConfig {
             history_dir: PathBuf::from(".nca/sessions"),
             max_turns_per_run: 128,
             max_tool_calls_per_turn: 200,
+            max_goal_iterations: default_max_goal_iterations(),
             checkpoint_interval: 5,
             last_session_file: PathBuf::from(".nca/.last_session"),
             auto_compact_on_finish: false,
         }
     }
+}
+
+fn default_max_goal_iterations() -> u32 {
+    20
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2360,6 +2386,9 @@ impl SessionConfig {
         if let Some(max_tool_calls_per_turn) = partial.max_tool_calls_per_turn {
             self.max_tool_calls_per_turn = max_tool_calls_per_turn;
         }
+        if let Some(max_goal_iterations) = partial.max_goal_iterations {
+            self.max_goal_iterations = max_goal_iterations;
+        }
         if let Some(checkpoint_interval) = partial.checkpoint_interval {
             self.checkpoint_interval = checkpoint_interval;
         }
@@ -2478,6 +2507,8 @@ struct PartialSessionConfig {
     #[serde(alias = "max_turn_per_run")]
     max_turns_per_run: Option<u32>,
     max_tool_calls_per_turn: Option<u32>,
+    #[serde(alias = "max-goal-iterations")]
+    max_goal_iterations: Option<u32>,
     checkpoint_interval: Option<u32>,
     last_session_file: Option<PathBuf>,
     auto_compact_on_finish: Option<bool>,
@@ -2806,6 +2837,32 @@ mod tests {
         let partial: PartialNcaConfig = toml::from_str(raw).expect("parse");
         let session = partial.session.expect("session table");
         assert_eq!(session.max_turns_per_run, Some(99));
+    }
+
+    #[test]
+    fn goal_iteration_budget_defaults_and_merges_without_breaking_legacy_config() {
+        let mut config = NcaConfig::default();
+        assert_eq!(config.session.max_goal_iterations, 20);
+
+        let legacy: PartialNcaConfig =
+            toml::from_str("[session]\nmax_turns_per_run = 99\n").expect("parse legacy config");
+        config.merge(legacy);
+        assert_eq!(config.session.max_goal_iterations, 20);
+
+        let configured: PartialNcaConfig = toml::from_str("[session]\nmax_goal_iterations = 7\n")
+            .expect("parse configured budget");
+        config.merge(configured);
+        assert_eq!(config.session.max_goal_iterations, 7);
+    }
+
+    #[test]
+    fn zero_goal_iteration_budget_is_rejected() {
+        let mut config = NcaConfig::default();
+        config.session.max_goal_iterations = 0;
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidGoalIterations)
+        ));
     }
 
     #[test]

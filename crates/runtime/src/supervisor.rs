@@ -825,6 +825,32 @@ impl Supervisor {
         self.todos.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
+    pub fn last_turn_tool_error(&self) -> Option<String> {
+        self.agent.last_turn_tool_error().map(str::to_string)
+    }
+
+    /// Clear the authoritative todo list for a new autonomous objective.
+    ///
+    /// The reset uses the same event and persistence paths as an agent todo
+    /// update, so interactive renderers and resumed sessions observe the
+    /// cleared snapshot without introducing goal-specific state.
+    pub async fn reset_todos(&self) -> Result<(), String> {
+        {
+            let mut guard = self
+                .todos
+                .lock()
+                .map_err(|_| "todo store lock poisoned".to_string())?;
+            guard.clear();
+        }
+
+        if let Some(tx) = self.agent.event_sender() {
+            tx.send(AgentEvent::TodosUpdated { todos: Vec::new() })
+                .await
+                .map_err(|_| "failed to emit TodosUpdated (session ended?)".to_string())?;
+        }
+        self.save().await
+    }
+
     pub fn compact_summary(&self) -> String {
         build_parent_summary(&self.agent.messages)
     }
@@ -1899,7 +1925,7 @@ mod tests {
     use nca_common::event::AgentCommand;
     use nca_common::message::{Message, Role};
     use nca_common::session::{SessionMeta, SessionState, SessionStatus};
-    use nca_common::todo::AgentTodo;
+    use nca_common::todo::{AgentTodo, TodoStatus};
     use std::fs;
     use std::sync::mpsc as std_mpsc;
     use tiny_http::{Header, Response, Server};
@@ -2060,6 +2086,51 @@ mod tests {
 
         supervisor.finish(EndReason::Completed).await;
         unsafe { std::env::remove_var("NCA_HOME") };
+    }
+
+    #[tokio::test]
+    async fn reset_todos_broadcasts_and_persists_an_empty_authoritative_snapshot() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut config = nca_common::config::NcaConfig::default();
+        config.session.history_dir = workspace.path().join("sessions");
+        config.session.last_session_file = workspace.path().join("last-session");
+        config.memory.file_path = workspace.path().join("memory.json");
+        config.provider.default = ProviderKind::Custom;
+        config.provider.custom.base_url = "http://127.0.0.1:1".into();
+        config.provider.custom.api_key = Some("test-key".into());
+        config.provider.custom.model = "test-model".into();
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAi;
+        config.model.default_model = "test-model".into();
+        config.memory.context.auto_detect_context_window = false;
+        config.memory.context.query_provider_models_api = false;
+
+        let mut supervisor = Supervisor::create(SupervisorConfig {
+            config: config.clone(),
+            workspace_root: workspace.path().to_path_buf(),
+            safe_mode: true,
+            interactive_approvals: false,
+            session_id: Some("reset-todos-test".into()),
+            approval_handler: None,
+            orchestration_context: None,
+            execution: ExecutionContext::normal(),
+            explicitly_requested_skills: Vec::new(),
+        })
+        .await
+        .expect("create supervisor");
+        supervisor.todos.lock().expect("todo lock").push(AgentTodo {
+            id: "stale".into(),
+            content: "stale objective".into(),
+            status: TodoStatus::InProgress,
+            source: None,
+        });
+
+        supervisor.reset_todos().await.expect("reset todos");
+        assert!(supervisor.todos().is_empty());
+        let store = SessionStore::new(resolve_sessions_dir(&config, workspace.path()));
+        let saved = store.load("reset-todos-test").await.expect("saved session");
+        assert!(saved.todos.is_empty());
+
+        supervisor.finish(EndReason::Completed).await;
     }
 
     #[tokio::test]

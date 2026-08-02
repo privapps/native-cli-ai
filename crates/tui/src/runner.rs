@@ -224,6 +224,14 @@ impl SessionRuntime {
         self.supervisor.todos()
     }
 
+    pub fn last_turn_tool_error(&self) -> Option<String> {
+        self.supervisor.last_turn_tool_error()
+    }
+
+    pub async fn reset_todos(&self) -> Result<(), String> {
+        self.supervisor.reset_todos().await
+    }
+
     pub fn compact_summary(&self) -> String {
         self.supervisor.compact_summary()
     }

@@ -40,6 +40,9 @@ pub struct AgentLoop {
     /// Opt-in provider-request smart compaction (canonical history always kept).
     smart_compaction_mode: SmartCompactionMode,
     research_context: std::sync::Arc<ResearchContext>,
+    /// Error from an unsuccessful tool in the most recent user-level turn.
+    /// This is invocation state, not persisted session metadata.
+    last_turn_tool_error: Option<String>,
 }
 
 impl AgentLoop {
@@ -71,6 +74,7 @@ impl AgentLoop {
             hooks,
             smart_compaction_mode: SmartCompactionMode::Off,
             research_context,
+            last_turn_tool_error: None,
         }
     }
 
@@ -102,6 +106,7 @@ impl AgentLoop {
         attachments: &[ImageAttachment],
     ) -> Result<String, ProviderError> {
         self.cancel_flag.store(false, Ordering::SeqCst);
+        self.last_turn_tool_error = None;
         let user_msg = if attachments.is_empty() {
             Message::user(user_input)
         } else {
@@ -588,6 +593,13 @@ impl AgentLoop {
                 final_results.push(result);
             }
 
+            if let Some(error) = final_results.iter().find_map(|result| {
+                (!result.success)
+                    .then(|| result.error.clone().unwrap_or_else(|| "tool failed".into()))
+            }) {
+                self.last_turn_tool_error = Some(error);
+            }
+
             if let Some(hooks) = &self.hooks {
                 for result in &final_results {
                     let hook_event = if result.success {
@@ -751,6 +763,10 @@ impl AgentLoop {
 
     pub fn cancel_handle(&self) -> Arc<AtomicBool> {
         self.cancel_flag.clone()
+    }
+
+    pub fn last_turn_tool_error(&self) -> Option<&str> {
+        self.last_turn_tool_error.as_deref()
     }
 
     fn is_cancelled(&self) -> bool {

@@ -500,6 +500,124 @@ impl Repl {
         }
     }
 
+    /// Run one YOLO-gated autonomous objective through the same normal turn
+    /// path used by ordinary interactive input.
+    async fn run_goal(&mut self, objective: Option<&str>, out: ReplOutput<'_>) {
+        if let Err(error) = self.runtime.config().validate() {
+            out.eprintln(&format!("[goal] {error}"));
+            return;
+        }
+
+        let existing = self.runtime.todos();
+        if objective.is_none() && existing.is_empty() {
+            out.eprintln(
+                "[goal] no incomplete checklist to continue; use `/goal <objective>` to start a new goal",
+            );
+            return;
+        }
+        if objective.is_none() && crate::goal::is_complete(&existing) {
+            out.eprintln(
+                "[goal] the existing checklist is already complete; use `/goal <objective>` for a new goal",
+            );
+            return;
+        }
+
+        let mut prompt;
+        if let Some(objective) = objective {
+            if let Err(error) = self.runtime.reset_todos().await {
+                out.eprintln(&format!("[goal] could not reset checklist: {error}"));
+                return;
+            }
+            out.println("[goal] starting fresh objective");
+            prompt = crate::goal::initial_prompt(objective);
+        } else {
+            out.println("[goal] continuing existing checklist");
+            prompt = crate::goal::continuation_prompt().to_string();
+        }
+
+        let limit = self.runtime.config().session.max_goal_iterations;
+        let cancel = self.runtime.cancel_handle();
+        let mut previous: Option<Vec<nca_common::todo::AgentTodo>> = None;
+        let mut unchanged = 0_u32;
+
+        for iteration in 1..=limit {
+            out.println(&format!("[goal] iteration {iteration}/{limit}"));
+            let response = match self.runtime.run_turn(&prompt).await {
+                Ok(response) => response,
+                Err(error) => {
+                    let reason = if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                        "cancelled".to_string()
+                    } else {
+                        error.to_string()
+                    };
+                    let _ = self.runtime.save().await;
+                    out.println(&format!(
+                        "[goal] incomplete after {iteration} iteration(s): {reason}"
+                    ));
+                    return;
+                }
+            };
+
+            if let ReplOutput::Stdio = &out
+                && !response.trim().is_empty()
+            {
+                out.println(&response);
+            }
+
+            if let Some(error) = self.runtime.last_turn_tool_error() {
+                let _ = self.runtime.save().await;
+                out.println(&format!(
+                    "[goal] incomplete after {iteration} iteration(s): tool error: {error}"
+                ));
+                return;
+            }
+
+            let todos = self.runtime.todos();
+            if crate::goal::is_complete(&todos) {
+                out.println(&format!(
+                    "[goal] completed after {iteration} iteration(s): all checklist items are completed"
+                ));
+                return;
+            }
+            if todos.is_empty() {
+                out.println(&format!(
+                    "[goal] incomplete after {iteration} iteration(s): checklist is empty"
+                ));
+                return;
+            }
+            if crate::goal::has_cancelled_item(&todos) {
+                out.println(&format!(
+                    "[goal] incomplete after {iteration} iteration(s): checklist contains a cancelled item"
+                ));
+                return;
+            }
+            if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = self.runtime.save().await;
+                out.println(&format!(
+                    "[goal] incomplete after {iteration} iteration(s): cancelled"
+                ));
+                return;
+            }
+
+            unchanged =
+                crate::goal::unchanged_snapshot_count(previous.as_deref(), &todos, unchanged);
+            previous = Some(todos);
+            if unchanged >= 2 {
+                out.println(&format!(
+                    "[goal] incomplete after {iteration} iteration(s): checklist made no progress for two consecutive snapshots"
+                ));
+                return;
+            }
+            if iteration == limit {
+                out.println(&format!(
+                    "[goal] incomplete after {iteration} iteration(s): iteration limit reached"
+                ));
+                return;
+            }
+            prompt = crate::goal::continuation_prompt().to_string();
+        }
+    }
+
     /// Open the configured external editor (`NCA_EDITOR`, `[ui].editor`, `EDITOR`, `vim`).
     async fn open_external_editor(&self, seed: Option<&str>) -> Option<String> {
         let editor_cmd = self.runtime.config().effective_editor_command();
@@ -681,12 +799,22 @@ impl Repl {
         line: &str,
         tui_state: &Arc<Mutex<TuiSessionState>>,
     ) -> anyhow::Result<bool> {
+        let is_goal = line.split_whitespace().next() == Some("/goal");
+        if is_goal && let Ok(mut g) = tui_state.lock() {
+            g.set_busy(true);
+        }
         if self
             .handle_command(line, ReplOutput::Tui(tui_state))
             .await?
         {
+            if is_goal && let Ok(mut g) = tui_state.lock() {
+                g.set_busy(false);
+            }
             Ok(true)
         } else {
+            if is_goal && let Ok(mut g) = tui_state.lock() {
+                g.set_busy(false);
+            }
             if let Ok(mut g) = tui_state.lock() {
                 g.should_exit = true;
                 g.mark_dirty();
@@ -1032,6 +1160,13 @@ impl Repl {
             "/stop" => {
                 self.runtime.request_cancel();
                 out.println("[stop] cancelling current turn…");
+            }
+            "/goal" => {
+                if !self.runtime.execution_context().yolo {
+                    out.eprintln("/goal requires a session started with --yolo");
+                } else {
+                    self.run_goal((!rest.is_empty()).then_some(rest), out).await;
+                }
             }
             "/help" => {
                 let mut help_lines = vec![
@@ -3318,16 +3453,165 @@ fn parse_permission_mode(raw: &str) -> Option<PermissionMode> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::build_session_runtime;
+    use crate::runner::{build_resumed_session_runtime, build_session_runtime};
     use crate::tui::app::dispatch_custom_provider_key;
     use crate::tui::input::{ConnectModalKeyResult, handle_connect_modal_key};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc as std_mpsc;
     use std::sync::{Arc, Mutex};
     use tiny_http::{Header, Response, Server, StatusCode};
 
     static NEXT_TEST_RUNTIME_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn goal_tool_response(call_id: &str, status: &str) -> String {
+        let arguments = serde_json::json!({
+            "todos": [{
+                "id": "step-1",
+                "content": format!("complete the objective ({call_id})"),
+                "status": status
+            }]
+        })
+        .to_string();
+        let event = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": "update_todos",
+                            "arguments": arguments
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        format!("data: {event}\n\ndata: [DONE]\n\n")
+    }
+
+    fn goal_text_response(text: &str) -> String {
+        let event = serde_json::json!({
+            "choices": [{
+                "delta": {"content": text},
+                "finish_reason": "stop"
+            }]
+        });
+        format!("data: {event}\n\ndata: [DONE]\n\n")
+    }
+
+    fn goal_unknown_tool_response() -> String {
+        let event = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "unknown-tool-call",
+                        "type": "function",
+                        "function": {"name": "missing_goal_tool", "arguments": "{}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        format!("data: {event}\n\ndata: [DONE]\n\n")
+    }
+
+    fn spawn_goal_provider_with_delay(
+        responses: Vec<String>,
+        delay: std::time::Duration,
+    ) -> (String, std_mpsc::Receiver<String>) {
+        let server = Server::http("127.0.0.1:0").expect("goal provider fixture");
+        let address = match server.server_addr() {
+            tiny_http::ListenAddr::IP(address) => address,
+            other => panic!("unsupported provider address: {other:?}"),
+        };
+        let (body_tx, body_rx) = std_mpsc::channel();
+        std::thread::spawn(move || {
+            for response in responses {
+                let mut request = server.recv().expect("goal provider request");
+                let mut body = String::new();
+                request
+                    .as_reader()
+                    .read_to_string(&mut body)
+                    .expect("read goal provider body");
+                body_tx.send(body).expect("capture goal provider body");
+                std::thread::sleep(delay);
+                request
+                    .respond(
+                        Response::from_string(response).with_header(
+                            Header::from_bytes("Content-Type", "text/event-stream")
+                                .expect("content type header"),
+                        ),
+                    )
+                    .expect("goal provider response");
+            }
+        });
+        (format!("http://{address}"), body_rx)
+    }
+
+    async fn goal_repl(
+        responses: Vec<String>,
+    ) -> (
+        Repl,
+        Arc<Mutex<TuiSessionState>>,
+        tempfile::TempDir,
+        std_mpsc::Receiver<String>,
+    ) {
+        goal_repl_with_delay(responses, std::time::Duration::ZERO).await
+    }
+
+    async fn goal_repl_with_delay(
+        responses: Vec<String>,
+        delay: std::time::Duration,
+    ) -> (
+        Repl,
+        Arc<Mutex<TuiSessionState>>,
+        tempfile::TempDir,
+        std_mpsc::Receiver<String>,
+    ) {
+        let workspace = tempfile::tempdir().expect("goal workspace");
+        let (base_url, bodies) = spawn_goal_provider_with_delay(responses, delay);
+        let mut config = NcaConfig::default();
+        config.session.history_dir = workspace.path().join("sessions");
+        config.session.last_session_file = workspace.path().join("last-session");
+        config.memory.file_path = workspace.path().join("memory.json");
+        config.provider.default = ProviderKind::Custom;
+        config.provider.custom.base_url = base_url;
+        config.provider.custom.api_key = Some("goal-test-key".into());
+        config.provider.custom.model = "goal-test-model".into();
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAi;
+        config.model.default_model = "goal-test-model".into();
+        config.memory.context.auto_detect_context_window = false;
+        config.memory.context.query_provider_models_api = false;
+        let runtime = build_session_runtime(
+            config,
+            workspace.path(),
+            false,
+            true,
+            false,
+            Some(format!(
+                "goal-repl-test-{}-{}",
+                std::process::id(),
+                NEXT_TEST_RUNTIME_ID.fetch_add(1, Ordering::Relaxed)
+            )),
+            None,
+            None,
+        )
+        .await
+        .expect("goal runtime");
+        let state = Arc::new(Mutex::new(TuiSessionState::new(
+            runtime.session_id().to_string(),
+            runtime.model().to_string(),
+            "@build".into(),
+            "YOLO".into(),
+            PathBuf::from(workspace.path()),
+        )));
+        (Repl::new(runtime, false, false), state, workspace, bodies)
+    }
 
     async fn test_repl(
         configure_custom: bool,
@@ -3850,6 +4134,266 @@ mod tests {
         assert_eq!(state.custom_setup_base_url(), "https://gateway.example/v1");
         assert_eq!(state.custom_setup_model_hint(), "gateway-model");
         assert!(state.custom_setup_api_key().is_empty());
+    }
+
+    #[tokio::test]
+    async fn goal_is_rejected_before_side_effects_in_non_yolo_session() {
+        let (mut repl, state, _workspace) = test_repl(false).await;
+        repl.handle_command("/goal ship it", ReplOutput::Tui(&state))
+            .await
+            .expect("goal command");
+
+        let state = state.lock().expect("state lock");
+        assert!(state.blocks.iter().any(|block| matches!(
+            block,
+            DisplayBlock::System(message)
+                if message.contains("/goal requires a session started with --yolo")
+        )));
+        assert!(repl.runtime.todos().is_empty());
+    }
+
+    #[tokio::test]
+    async fn yolo_goal_loops_until_all_items_complete() {
+        let (mut repl, state, _workspace, bodies) = goal_repl(vec![
+            goal_tool_response("call-1", "in_progress"),
+            goal_text_response("made a start"),
+            goal_tool_response("call-2", "completed"),
+            goal_text_response("verified completion"),
+        ])
+        .await;
+        repl.handle_command("/goal ship the objective", ReplOutput::Tui(&state))
+            .await
+            .expect("goal command");
+
+        assert!(crate::goal::is_complete(&repl.runtime.todos()));
+        let _ = bodies
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("first provider request");
+        let _ = bodies
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("second provider request");
+        let _ = bodies
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("third provider request");
+        let _ = bodies
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("fourth provider request");
+        let state = state.lock().expect("state lock");
+        assert!(state.blocks.iter().any(|block| matches!(
+            block,
+            DisplayBlock::System(message) if message.contains("completed after 2 iteration")
+        )));
+    }
+
+    #[tokio::test]
+    async fn goal_reports_empty_checklist_as_incomplete() {
+        let (mut repl, state, _workspace, bodies) =
+            goal_repl(vec![goal_text_response("nothing to do")]).await;
+        repl.handle_command("/goal empty objective", ReplOutput::Tui(&state))
+            .await
+            .expect("goal command");
+        let _ = bodies
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("provider request");
+        let state = state.lock().expect("state lock");
+        assert!(state.blocks.iter().any(|block| matches!(
+            block,
+            DisplayBlock::System(message) if message.contains("checklist is empty")
+        )));
+    }
+
+    #[tokio::test]
+    async fn goal_stops_after_two_unchanged_todo_snapshots() {
+        let responses = ["1", "2", "3"]
+            .into_iter()
+            .flat_map(|id| {
+                [
+                    goal_tool_response("stall", "in_progress"),
+                    goal_text_response(id),
+                ]
+            })
+            .collect();
+        let (mut repl, state, _workspace, bodies) = goal_repl(responses).await;
+        repl.handle_command("/goal stalled objective", ReplOutput::Tui(&state))
+            .await
+            .expect("goal command");
+        for _ in 0..6 {
+            let _ = bodies
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("provider request");
+        }
+        let state = state.lock().expect("state lock");
+        assert!(state.blocks.iter().any(|block| matches!(
+            block,
+            DisplayBlock::System(message)
+                if message.contains("no progress for two consecutive snapshots")
+        )));
+    }
+
+    #[tokio::test]
+    async fn goal_respects_outer_iteration_limit_independent_of_turn_budget() {
+        let responses = [
+            goal_tool_response("cap-1", "in_progress"),
+            goal_text_response("one"),
+            goal_tool_response("cap-2", "in_progress"),
+            goal_text_response("two"),
+        ];
+        let (mut repl, state, _workspace, bodies) = goal_repl(responses.into()).await;
+        repl.runtime.config_mut().session.max_goal_iterations = 2;
+        repl.handle_command("/goal capped objective", ReplOutput::Tui(&state))
+            .await
+            .expect("goal command");
+        for _ in 0..4 {
+            let _ = bodies
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("provider request");
+        }
+        let state = state.lock().expect("state lock");
+        assert!(state.blocks.iter().any(|block| matches!(
+            block,
+            DisplayBlock::System(message) if message.contains("iteration limit reached")
+        )));
+    }
+
+    #[tokio::test]
+    async fn goal_treats_cancelled_items_as_incomplete() {
+        let (mut repl, state, _workspace, bodies) = goal_repl(vec![
+            goal_tool_response("cancelled", "cancelled"),
+            goal_text_response("stopped"),
+        ])
+        .await;
+        repl.handle_command("/goal cancelled objective", ReplOutput::Tui(&state))
+            .await
+            .expect("goal command");
+        for _ in 0..2 {
+            let _ = bodies
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("provider request");
+        }
+        let state = state.lock().expect("state lock");
+        assert!(state.blocks.iter().any(|block| matches!(
+            block,
+            DisplayBlock::System(message) if message.contains("cancelled item")
+        )));
+    }
+
+    #[tokio::test]
+    async fn goal_reports_provider_failure_as_incomplete() {
+        let (mut repl, state, _workspace, _bodies) = goal_repl(Vec::new()).await;
+        repl.handle_command("/goal unavailable objective", ReplOutput::Tui(&state))
+            .await
+            .expect("goal command");
+        let state = state.lock().expect("state lock");
+        assert!(state.blocks.iter().any(|block| matches!(
+            block,
+            DisplayBlock::System(message)
+                if message.contains("incomplete after 1 iteration")
+        )));
+    }
+
+    #[tokio::test]
+    async fn goal_stops_when_a_tool_returns_an_error_even_if_the_turn_finishes() {
+        let (mut repl, state, _workspace, bodies) = goal_repl(vec![
+            goal_unknown_tool_response(),
+            goal_text_response("the provider continued after the tool failure"),
+        ])
+        .await;
+        repl.handle_command("/goal tool failure objective", ReplOutput::Tui(&state))
+            .await
+            .expect("goal command");
+        for _ in 0..2 {
+            let _ = bodies
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("provider request");
+        }
+        let state = state.lock().expect("state lock");
+        assert!(state.blocks.iter().any(|block| matches!(
+            block,
+            DisplayBlock::System(message) if message.contains("tool error")
+        )));
+        assert!(!state.blocks.iter().any(|block| matches!(
+            block,
+            DisplayBlock::System(message) if message.contains("completed after")
+        )));
+    }
+
+    #[tokio::test]
+    async fn goal_cancellation_stops_after_the_current_turn() {
+        let (mut repl, state, _workspace, bodies) = goal_repl_with_delay(
+            vec![goal_text_response("cancelled by user")],
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        let cancel = repl.runtime.cancel_handle();
+        let watcher = std::thread::spawn(move || {
+            let _ = bodies.recv_timeout(std::time::Duration::from_secs(1));
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        repl.handle_command("/goal cancellable objective", ReplOutput::Tui(&state))
+            .await
+            .expect("goal command");
+        watcher.join().expect("cancellation watcher");
+        let state = state.lock().expect("state lock");
+        assert!(state.blocks.iter().any(|block| matches!(
+            block,
+            DisplayBlock::System(message) if message.contains("cancelled")
+        )));
+    }
+
+    #[tokio::test]
+    async fn incomplete_goal_can_continue_after_session_resume() {
+        let (mut repl, state, workspace, bodies) = goal_repl(vec![
+            goal_tool_response("resume-1", "in_progress"),
+            goal_text_response("paused"),
+            goal_tool_response("resume-2", "completed"),
+            goal_text_response("verified"),
+        ])
+        .await;
+        repl.runtime.config_mut().session.max_goal_iterations = 1;
+        repl.handle_command("/goal resumable objective", ReplOutput::Tui(&state))
+            .await
+            .expect("initial goal command");
+        assert!(!crate::goal::is_complete(&repl.runtime.todos()));
+        for _ in 0..2 {
+            let _ = bodies
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("initial provider request");
+        }
+
+        let session_id = repl.runtime.session_id().to_string();
+        let config = repl.runtime.config().clone();
+        repl.runtime.finish(EndReason::Completed).await;
+        drop(repl);
+
+        let runtime = build_resumed_session_runtime(
+            config,
+            workspace.path(),
+            false,
+            true,
+            false,
+            &session_id,
+            None,
+        )
+        .await
+        .expect("resume goal session");
+        let resumed_state = Arc::new(Mutex::new(TuiSessionState::new(
+            session_id,
+            runtime.model().to_string(),
+            "@build".into(),
+            "YOLO".into(),
+            PathBuf::from(workspace.path()),
+        )));
+        let mut resumed = Repl::new(runtime, false, false);
+        resumed
+            .handle_command("/goal", ReplOutput::Tui(&resumed_state))
+            .await
+            .expect("continue resumed goal");
+        for _ in 0..2 {
+            let _ = bodies
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("resume provider request");
+        }
+        assert!(crate::goal::is_complete(&resumed.runtime.todos()));
     }
 
     #[tokio::test]

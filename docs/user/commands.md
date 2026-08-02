@@ -71,7 +71,15 @@ nca --no-tui
 
 # Bypass all permission prompts
 nca --permission-mode bypass-permissions
+
+# Start a YOLO-only autonomous checklist loop in the interactive session
+nca --yolo
 ```
+
+In an interactive YOLO session, use `/goal <objective>` to start a fresh
+checklist-driven run or bare `/goal` to continue an existing incomplete
+checklist. See [Interactive Mode](./interactive-mode.md#autonomous-goals) for
+completion and recovery rules. There is no top-level `nca goal` command.
 
 ## Reasoning Effort
 

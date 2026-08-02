@@ -101,6 +101,15 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         "",
         Always
     ),
+    command!(
+        "goal",
+        "/goal",
+        [],
+        "Run an autonomous goal (YOLO only)",
+        Agent,
+        "",
+        Always
+    ),
     command!("skills", "/skills", [], "Browse skills", Agent, "", Always),
     command!(
         "memory",
@@ -393,5 +402,13 @@ mod tests {
         let spec = resolve_command("/todos").expect("todos command");
         assert_eq!(spec.id, "todos");
         assert_eq!(spec.category, CommandCategory::Session);
+    }
+
+    #[test]
+    fn goal_command_is_registered_as_yolo_only() {
+        let spec = resolve_command("/goal").expect("goal command");
+        assert_eq!(spec.id, "goal");
+        assert!(spec.description.contains("YOLO only"));
+        assert_eq!(spec.availability, CommandAvailability::Always);
     }
 }

@@ -137,10 +137,15 @@ See [Permissions](./permissions.md) for full details on each mode.
 history_dir = ".nca/sessions"
 max_turns_per_run = 128             # Max agent turns per session run
 max_tool_calls_per_turn = 200       # Max tool calls in a single turn
+max_goal_iterations = 20            # Outer turns for a YOLO-only /goal run
 checkpoint_interval = 5             # Save checkpoint every N turns
 last_session_file = ".nca/.last_session"
 auto_compact_on_finish = false      # Auto-summarize when session ends
 ```
+
+`max_goal_iterations` applies only to the interactive `/goal` loop. It is
+independent of the per-turn model/tool budget, defaults to `20` when omitted,
+and must be greater than zero.
 
 ### `[harness]` — System Prompt and Instructions
 

@@ -104,6 +104,8 @@ Type `/` to access slash commands. In the TUI, this opens an inline autocomplete
 | `/new` | Start a new session |
 | `/export` | Export the current session to markdown |
 | `/stop` | Cancel the current agent turn |
+| `/goal <objective>` | Run a checklist-driven autonomous objective (YOLO only) |
+| `/goal` | Continue an existing incomplete checklist (YOLO only) |
 
 ### Agent Profiles
 
@@ -124,6 +126,39 @@ Available agent profiles:
 | `@review` | Focused code review agent |
 | `@fix` | Bug diagnosis and fix agent |
 | `@test` | Testing and validation agent |
+
+### Autonomous Goals
+
+`/goal` is available only in a session started with `--yolo`. It is rejected
+before any todo reset or model request in non-YOLO sessions. Use an objective
+to start fresh:
+
+```text
+/goal implement the caching change and verify its tests
+```
+
+This clears the current checklist, asks the agent to create a fresh verified
+checklist, and submits visible continuation turns until the checklist is
+resolved. Bare `/goal` continues an existing incomplete checklist after a
+cancellation, interruption, or iteration cap.
+
+A goal succeeds only when the authoritative todo list is non-empty and every
+item is `completed`. Empty or cancelled checklists, provider/tool failures,
+cancellation, two consecutive unchanged todo snapshots, and the iteration
+limit are reported as incomplete. The default outer limit is 20 iterations;
+configure it with:
+
+```toml
+[session]
+max_goal_iterations = 20
+```
+
+The setting counts normal `run_turn` calls and is independent of
+`max_turns_per_run`. A value of zero is rejected. In the TUI, Esc or Ctrl+C
+cancels the current turn and prevents further continuation; the remaining
+todo state is saved when possible. The line REPL retains sequential input
+behavior. `/goal` does not add a top-level CLI command, IPC command, new event
+variant, background resume mode, or persisted active-goal metadata.
 
 ### Model and Provider
 
