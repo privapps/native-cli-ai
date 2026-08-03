@@ -17,7 +17,7 @@ Settings merge in order: **defaults → global → workspace → environment var
 
 ```toml
 [provider]
-default = "minimax"   # "minimax" | "openrouter" | "anthropic" | "openai"
+default = "minimax"   # "minimax" | "openrouter" | "anthropic" | "openai" | "custom"
 
 [provider.minimax]
 api_key_env = "MINIMAX_API_KEY"     # Environment variable to read
@@ -248,7 +248,7 @@ search_retry_attempts = 1
 user_agent = "nca/0.5 (+https://github.com/user/native-cli-ai)"
 ```
 
-`web_search` searches Bing RSS first and uses DuckDuckGo HTML as a fallback when Bing returns an empty, blocked, malformed, or failed response. The DuckDuckGo fallback has a process-wide serialized limiter shared by runtime sessions, with minimum request-start spacing and bounded anti-bot cooldown/backoff; Bing does not consume that DuckDuckGo limiter. Transport failures and HTTP 408, 425, 429, or 5xx responses use `search_retry_attempts`; recognized DuckDuckGo HTTP 202 anti-bot challenges use `search_challenge_retries` (three retries by default) through the same limiter and bounded cooldown. Empty results and parser failures immediately move to fallback. Both retry settings are capped at 10; when only the legacy `search_challenge_retries` key is present it remains a compatibility alias for transient retries as well. These settings do not limit unrelated tools. Separate nca processes have separate DuckDuckGo limiters. Search requests use the neutral `user_agent` identity; the legacy `search_user_agent` key remains loadable for configuration compatibility but is ignored, so nca does not spoof a browser.
+`web_search` searches Bing RSS first and uses DuckDuckGo HTML as a fallback when Bing returns an empty, blocked, malformed, or failed response. The DuckDuckGo fallback has a process-wide serialized limiter shared by runtime sessions, with minimum request-start spacing and bounded anti-bot cooldown/backoff; Bing does not consume that DuckDuckGo limiter. Transport failures and HTTP 408, 425, 429, or 5xx responses use `search_retry_attempts`; recognized DuckDuckGo HTTP 202 anti-bot challenges use `search_challenge_retries` (three retries by default) through the same limiter and bounded cooldown. Retry delays grow exponentially from `search_cooldown_ms` and are capped by `search_max_cooldown_ms`; a successful DuckDuckGo request clears the blocked cooldown state. Empty results and parser failures immediately move to fallback. Both retry settings are capped at 10; when only the legacy `search_challenge_retries` key is present it remains a compatibility alias for transient retries as well. These settings do not limit unrelated tools. Separate nca processes have separate DuckDuckGo limiters. Search requests use the neutral `user_agent` identity; the legacy `search_user_agent` key remains loadable for configuration compatibility but is ignored, so nca does not spoof a browser.
 
 ### `[ui]` — Interface Settings
 

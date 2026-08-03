@@ -105,6 +105,14 @@ nca -r
 nca --resume
 ```
 
+Resume loads the saved session snapshot before the new runtime can update
+session pointers or persist a replacement snapshot. The restored model,
+messages, todo list, summaries, parent/child lineage, and worktree metadata
+determine the resumed runtime. nca then refreshes the runtime-owned harness
+prompt, replacing any prior generated system prompt while preserving the
+non-system conversation history, and starts one current context/research
+boundary for the next turn.
+
 ### Auto-Resume Behavior
 
 By default, when you run `nca` without any arguments:

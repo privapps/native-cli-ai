@@ -71,6 +71,9 @@ flowchart LR
 - **`runtime::worktree`**: Isolated git worktree creation, cleanup, and merge per agent run.
 - **`runtime::bash_tool`**: bounded shell-backed command execution, registered by the supervisor.
   `runtime::pty::PtyManager` additionally provides portable interactive PTY sessions.
+- **`core::provider::custom`**: Protocol adapters for Custom OpenAI Chat Completions,
+  OpenAI Responses, and Anthropic-compatible endpoints, including capability
+  discovery, request construction, streaming, and protocol-specific failures.
 
 ### Evidence-bounded financial research
 
@@ -80,7 +83,11 @@ retrieval and publication timestamps remain detailed provenance. The financial w
 through the `financial-research` skill. Generic web tools collect source-attributed evidence, while
 the financial resolver owns issuer, period, authority, status, conflict, and fallback rules.
 Generic `write_file` stays domain-neutral; `write_validated_financial_report` is the validation-aware
-persistence path.
+persistence path. Financial-looking final responses are annotated with the same
+verification status and warning semantics before they reach human, JSON, or
+NDJSON consumers. A resumed session begins a new turn boundary, so its
+date-sensitive evidence is refreshed rather than inherited as an implicit
+current date.
 
 ---
 
@@ -107,8 +114,12 @@ The system prompt is layered by `core::harness::build_system_prompt` from a runt
 
 The runtime reads `AGENTS.md` only at the configured workspace root. Its full
 text is additive and is kept separate from the root-level `##` sections that
-are projected into the skill catalog; refreshing the prompt does not duplicate
-conversation history.
+are projected into the skill catalog. `AgentLoop::set_system_prompt` replaces
+the prior runtime-generated system message at index zero, so refreshes do not
+accumulate duplicate prompts or duplicate conversation history. Resume loads
+the persisted model, messages, todos, summaries, lineage, and worktree metadata
+before the resumed session pointer is updated, then performs one prompt and
+context initialization using the restored identity.
 
 ```mermaid
 sequenceDiagram
@@ -143,13 +154,69 @@ sequenceDiagram
 
 ### Streaming
 
-Provider responses are streamed token-by-token via `tokio::sync::mpsc` using MiniMax SSE. The CLI can render:
+Provider responses are streamed token-by-token via `tokio::sync::mpsc`. MiniMax,
+OpenAI-compatible Chat Completions, Custom Responses, and Anthropic-compatible
+adapters map their wire-specific SSE events into the shared provider stream
+contract. The CLI can render:
 
 - human-readable live progress
 - NDJSON `EventEnvelope` stream mode
 - no stream, with only final output
 
-Tool-use blocks are collected, executed by the registry, and replayed to MiniMax as `tool` messages until a final assistant response is produced.
+Tool-use blocks are collected and executed by the registry until a final
+assistant response is produced. Adapters map the tool loop back to their wire
+protocol: Chat/Anthropic paths replay tool messages, while Custom Responses
+uses native function-call and function-call-output items.
+
+### Provider protocol and lifecycle invariants
+
+Custom Responses requests use the configured path prefix plus `/responses`,
+Bearer authentication, `stream: true`, `store: false`,
+`max_output_tokens`, and optional nested `reasoning.effort`; configured
+`temperature` is intentionally omitted. Native text/image input and nca
+function tools are supported, while hosted tools, unsupported images, malformed
+known events, invalid UTF-8, missing function-call identity/name/arguments, and
+empty completions fail explicitly.
+
+Responses function-call identities are normalized at the stream boundary. An
+explicit `call_id` wins; a stable function-item ID or `output_index` is used as
+the fallback key, allowing split arguments and rotating event IDs to remain
+associated with the correct call and preserving stream order.
+
+The permissive `model.reasoning_effort` setting is sent only to OpenAI-compatible
+Chat/Responses requests: Chat uses the root `reasoning_effort` property and
+Responses uses `reasoning.effort`. The literal `nil` or an empty value omits it;
+Anthropic-compatible requests never receive the field.
+
+When `NCA_DEBUG_REQUEST=1`, Custom Chat and Responses adapters append the final
+redacted request to `./debug.log` and warn on stderr if the log cannot be
+written. Response bodies, streams, parsed events, errors, tool output, and
+completion text are never written to the diagnostic log.
+
+### TUI transcript rendering
+
+`nca-tui` renders completed and streaming assistant blocks through the same
+native Markdown path. The renderer buffers tables for compact aligned columns,
+wraps cells and highlighted code to display-cell width, styles common inline
+and block constructs, and uses visible fallbacks for malformed or unsupported
+content. It does not alter raw message content, persisted sessions, replay, or
+clipboard output.
+
+### Goal loop and capability gates
+
+Interactive `/goal` is a YOLO-only loop over ordinary agent turns and the
+existing todo/event seams; it does not add an IPC command, goal event variant,
+or persisted active-goal protocol. Fresh goals reset the todo list, continuation
+goals reuse incomplete todos, and cancellation, provider/tool failure, no
+progress, or the outer iteration cap produce an explicit incomplete result.
+`TodosUpdated` is a full-list replacement event and is therefore part of goal
+replay and resume behavior.
+
+Financial report tools are registered behind the existing tool registry but are
+hidden until the `financial-research` skill is explicitly invoked, except for
+YOLO sessions. The validated writer remains in the full/write tool set and
+requires an official, current-turn validated report before touching the target
+file.
 
 ### Search and edit flow
 
@@ -208,6 +275,7 @@ pub enum AgentEvent {
     ChildSessionCompleted { parent_session_id: String, child_session_id: String, status: String },
     QuestionRequested { question: InteractiveQuestionPayload },
     QuestionResolved { question_id: String, selection: QuestionSelection },
+    TodosUpdated { todos: Vec<AgentTodo> },
 }
 ```
 

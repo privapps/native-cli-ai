@@ -33,4 +33,8 @@ for-test/
 .scratch/
 .archive/
 skills
+!.agents/
+!.agents/skills/
+!.agents/skills/autoresearch/
+!.agents/skills/autoresearch/SKILL.md
 graphify-out/

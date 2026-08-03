@@ -17,9 +17,19 @@ These tools are always available, including in [safe mode](./permissions.md).
 | `git_diff` | Show `git diff` (staged or unstaged) |
 | `web_search` | Search the web via Bing with DuckDuckGo fallback, retaining URL, authority, retrieval, and available publication metadata |
 | `fetch_url` | Fetch and extract text content from a URL, retaining source and publication metadata |
+
+Financial-report tools are registered with the read-only tool set but remain
+hidden until the agent explicitly invokes the `financial-research` skill. A
+YOLO session enables the capability automatically. `write_validated_financial_report`
+is a separate write tool and is available only with the full tool set and the
+usual write permissions.
+
+### Financial Research Tools
+
+| Tool | Description |
+|------|-------------|
 | `resolve_latest_financial_report` | Resolve the newest eligible observed result for an issuer and cadence, with explicit fallback status and limitations |
 | `validate_financial_report` | Validate a reported financial-period candidate against the current as-of boundary and observed official evidence |
-| `write_validated_financial_report` | Persist a report only when the current turn has a validated official report and complete verification metadata |
 
 ### Write Tools
 
@@ -36,6 +46,7 @@ Available in standard mode. Requires appropriate [permissions](./permissions.md)
 | `move_path` | Move a file or directory |
 | `copy_path` | Copy a file |
 | `delete_path` | Delete a file or directory |
+| `write_validated_financial_report` | Write a report only when the current turn has a validated official report and complete verification metadata |
 
 ### Execution Tools
 
@@ -132,7 +143,7 @@ Search the public web and return titles, URLs, snippets, and provenance metadata
 - `issuer` (string, optional) — Issuer name to bind inferred report metadata to the requested company
 - `as_of` is supplied by the runtime turn context and is not a caller-controlled field
 
-**Behavior:** Searches Bing RSS first, then falls back to DuckDuckGo HTML when Bing is empty, blocked, malformed, or unavailable. Provider retries and per-provider request serialization happen inside the tool. Results are returned as JSON with the query, date-only UTC turn `as_of`, retrieval timestamp, URL, source authority, available publication metadata, and an `eligible_as_of` flag. Unknown metadata remains `null`; the upstream search response is not assumed to support an exact date filter. If both providers fail, the tool returns one provider-aware failure and the agent does not repeat the exhausted search operation automatically.
+**Behavior:** Searches Bing RSS first, then falls back to DuckDuckGo HTML when Bing is empty, blocked, malformed, or unavailable. Bing uses a GET RSS request with `q`, English locale, and RSS-format query parameters. DuckDuckGo uses the Capelin-compatible POST form profile and resolves its redirect URLs to destination URLs. Transport failures and retryable HTTP statuses are retried inside the provider operation. DuckDuckGo additionally uses one process-wide serialized limiter shared by runtime sessions, with request-start spacing and bounded challenge cooldown; Bing does not use that limiter. Results are returned as JSON with the query, date-only UTC turn `as_of`, retrieval timestamp, URL, source authority, available publication metadata, and an `eligible_as_of` flag. Unknown metadata remains `null`; the upstream search response is not assumed to support an exact date filter. If both providers fail, the tool returns one provider-aware failure and the agent does not repeat the exhausted search operation automatically.
 
 #### Search failure classification and recovery
 
@@ -143,7 +154,7 @@ without treating every failed response as malformed markup:
 |---------|---------|----------|
 | `no usable results` | The provider returned a legitimate empty-results page | Falls back to the other provider; it is not reported as a parser failure |
 | Parser failure (for example, `response contained no recognized structured results`) | The response was non-empty but did not match the provider parser | Falls back immediately; inspect the other provider or use `fetch_url` |
-| `provider returned an anti-bot challenge (HTTP <status>)` | The provider blocked the request or presented a challenge | HTTP 202 DuckDuckGo challenges use the configured challenge retry budget; other blocking is surfaced as non-retryable |
+| `provider returned an anti-bot challenge (HTTP <status>)` | The provider blocked the request or presented a challenge | Recognized DuckDuckGo HTTP 202 challenges use the configured challenge retry budget and shared cooldown; other blocking is surfaced as non-retryable |
 | Transport or retryable HTTP failure | The request could not complete or the provider returned 408, 425, 429, or 5xx | Retries according to the search retry budget and cooldown settings |
 
 If both providers fail, `web_search` returns one error containing both provider
@@ -181,6 +192,13 @@ An `annual` request uses the newest eligible annual result when one exists. If a
 
 When a financial-looking final response cannot satisfy the verification metadata requirements, nca annotates structured JSON with `verification_status: "unverified"` and a `verification_warning`; it does not silently promote the response to verified. The fallback or unavailable limitation remains part of the structured resolution.
 
+The same as-of, verification, provenance, and fallback semantics are carried
+through human output, `--json`, and `--stream ndjson`. Human output renders the
+content for the terminal, while JSON and NDJSON preserve the fields for
+automation. A resumed session refreshes the turn's as-of date before new
+evidence is evaluated; it does not reuse stale research context from the prior
+turn.
+
 ---
 
 ### `write_file`
@@ -192,6 +210,18 @@ Create or overwrite a file inside the workspace.
 - `content` (string, required) — File contents
 
 **Behavior:** Creates parent directories if needed. Path must resolve within workspace. Generic `write_file` does not inspect or classify content. Use `write_validated_financial_report` for financial output; it requires a validated report from the current research turn and refuses before changing the filesystem when verification is absent.
+
+---
+
+### `write_validated_financial_report`
+
+Writes a report inside the workspace only after the current turn has produced
+an eligible, official validated report. The content must disclose the shared
+`as_of` date, issuer, reporting calendar, report type, period end, publication
+status and date, source retrieval timestamp, and source URL. Missing evidence,
+an ineligible period, a secondary-only source, incomplete metadata, or a
+required cadence fallback that is not disclosed causes an explicit refusal
+before the target file is touched.
 
 ---
 

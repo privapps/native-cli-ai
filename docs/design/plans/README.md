@@ -21,6 +21,8 @@ Each plan should identify its status, date, related specification, and verificat
 - [Autoresearch Git test stability](2026-07-31-autoresearch-git-test-stability.md)
 - [Documentation organization](2026-07-31-documentation-organization-implementation.md)
 - [Validation failures follow-up](2026-08-01-validation-fixes.md)
+- [Archived feature documentation update](2026-08-02-archive-feature-documentation.md)
+- [CI failure fixes](2026-08-02-ci-failures.md)
 - [AGENTS.md-backed instructions and skills](agents-md-skills.md)
 - [Autoresearch](autoresearch.md)
 - [Branch chip](branch-chip.md)

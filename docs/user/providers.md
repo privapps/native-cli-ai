@@ -213,12 +213,14 @@ OpenAI Responses custom endpoints use:
 - `GET <base path>/models` with Bearer authentication for the setup probe when the gateway exposes model discovery.
 - `POST <base path>/responses` with Bearer authentication, `stream = true`, and `store = false` for agent turns.
 - Native Responses input items, function calls, function-call outputs, and SSE events. Existing nca function tools are supported; provider-hosted tools are not.
-- The complete canonical session history on every request; nca does not use `previous_response_id`.
+- Text and `image/png`, `image/jpeg`, `image/webp`, and `image/gif` attachments are mapped to native input blocks. An unreadable image or unsupported media type fails the request explicitly; it is not silently omitted.
+- Function-call arguments may arrive in split events and multiple calls retain stream order. nca preserves an explicit `call_id`; when it is absent, a stable function-item ID or `output_index` becomes the internal identity. Rotating event IDs are associated with that stable identity. Missing identity, function name, valid JSON arguments, or a complete output fails explicitly, as do malformed known events, provider failures, invalid UTF-8, and empty completions.
+- By default, the complete canonical session history is sent on every request; nca does not use `previous_response_id`. With `[memory.context].smart_compaction_mode = "on"`, only a compact provider-request view is sent while session JSON and canonical agent history remain complete.
 - The configured `temperature` setting is retained for compatibility but omitted from Responses requests because model support varies. No retry or fallback request is made for this field.
 
 The TUI performs the cheap protocol-specific probe before activation. Malformed URLs, invalid environment-variable names, and missing credentials are blocking errors. Network, authentication, protocol, and endpoint failures offer **Retry**, **Save anyway**, or **Cancel**. **Save anyway** activates the manually configured provider without requiring model discovery. Probe errors are sanitized before display.
 
-Model discovery is best-effort: OpenAI-compatible and OpenAI Responses endpoints use `<base path>/models` with Bearer authentication, and Anthropic-compatible endpoints use the paginated `<base path>/models` API with Anthropic headers. A failed discovery request does not prevent a manually entered model ID from being used.
+Model discovery is best-effort: OpenAI-compatible and OpenAI Responses endpoints use `<base path>/models` with Bearer authentication, and Anthropic-compatible endpoints use the paginated `<base path>/models` API with Anthropic headers. Successful responses must have the expected model-catalog shape; malformed, empty, unauthorized, or unavailable catalogs fall back to the existing static/empty result behavior. A failed discovery request does not prevent a manually entered model ID from being used.
 
 Provider capabilities are dispatched through one runtime seam. Settings access (selected model,
 base URL, API-key environment name, and credential presence) is centralized, while model catalogs
@@ -238,7 +240,7 @@ missing credentials retain the static context-limit or empty-catalog fallback.
 Notes:
 
 - `compatibility = "openai"` selects the OpenAI-compatible wire format.
-- `compatibility = "openai-responses"` selects the OpenAI Responses wire format. CLI aliases include `responses` and `openai-responses`.
+- `compatibility = "openai-responses"` selects the OpenAI Responses wire format. CLI aliases include `responses`, `openai-responses`, and `openai_responses`.
 - `compatibility = "anthropic"` selects the Anthropic-compatible wire format.
 - After setup, use `/model <name>` to switch the active model ID.
 - Press `c` in the provider picker for a quick-reference help card

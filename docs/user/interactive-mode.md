@@ -92,6 +92,26 @@ When a terminal or multiplexer does not support bracketed paste, use the
 external editor or explicit modified-Enter flow instead of relying on ordinary
 Enter events to delimit pasted paragraphs.
 
+## Assistant Markdown Rendering
+
+Assistant blocks in the full-screen TUI use the same native Markdown renderer
+while streaming and after the response is complete. Common structure remains
+visible: headings, paragraphs and breaks, blockquotes, ordered and unordered
+lists, task markers, rules, inline code, links, bold, italics, and
+strikethrough.
+
+Markdown tables are buffered long enough to measure their columns. The TUI
+renders compact aligned columns, a header divider, and the declared left,
+center, or right alignment. Narrow tables wrap cell text to the available
+terminal width; long highlighted code lines are wrapped as well. Display-cell
+width is used, so wide and combining Unicode remains bounded and aligned.
+
+Malformed or incomplete fenced Markdown remains readable through a plain-text
+fallback. Images, raw HTML, math, and other unsupported elements use visible
+text or alt-text fallbacks where possible instead of silently removing the
+response. Rendering changes presentation only: the raw assistant content,
+session persistence, replay, and clipboard output remain unchanged.
+
 ### Slash Commands (`/`)
 
 Type `/` to access slash commands. In the TUI, this opens an inline autocomplete menu.

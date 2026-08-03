@@ -1449,6 +1449,7 @@ async fn cancel_session(
     let store =
         nca_runtime::session_store::SessionStore::new(resolve_sessions_dir(config, workspace_root));
     let mut session = store.load(session_id).await.map_err(anyhow::Error::msg)?;
+    #[cfg(unix)]
     let socket_path = session.meta.socket_path.clone();
 
     if let Some(socket_path) = session.meta.socket_path.clone() {
