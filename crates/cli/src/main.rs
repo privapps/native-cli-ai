@@ -431,9 +431,30 @@ impl CliPermissionMode {
     }
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    match try_main().await {
+fn main() -> ExitCode {
+    let handle = std::thread::Builder::new()
+        .name("nca-main".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("build nca Tokio runtime");
+            runtime.block_on(try_main())
+        });
+
+    let result = match handle {
+        Ok(handle) => match handle.join() {
+            Ok(result) => result,
+            Err(_) => {
+                eprintln!("nca main thread panicked");
+                Err(anyhow::anyhow!("nca main thread panicked"))
+            }
+        },
+        Err(error) => Err(anyhow::anyhow!("failed to start nca main thread: {error}")),
+    };
+
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("Error: {error}");

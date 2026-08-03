@@ -603,6 +603,7 @@ impl SlashEntry {
                 let tag = match source {
                     SkillSource::AgentsMd => " (AGENTS.md)",
                     SkillSource::FileSystem => " (skill dir)",
+                    SkillSource::BuiltIn => " (built-in)",
                 };
                 let manual = if *manual_only { " · manual-only" } else { "" };
                 format!(

@@ -31,6 +31,7 @@ pub enum SkillContextMode {
 pub enum SkillSource {
     AgentsMd,
     FileSystem,
+    BuiltIn,
 }
 
 pub struct SkillCatalog;
@@ -87,6 +88,18 @@ impl SkillCatalog {
                 {
                     skills.push(skill);
                 }
+            }
+        }
+
+        // Built-in skills are the final fallback: repository and user skills
+        // retain precedence, while shipped workflows remain available in a
+        // clean checkout and from installed binaries.
+        for skill in builtin_skills() {
+            if !skills
+                .iter()
+                .any(|existing: &Skill| existing.command == skill.command)
+            {
+                skills.push(skill);
             }
         }
 
@@ -182,6 +195,7 @@ impl Skill {
         let source_tag = match self.source {
             SkillSource::AgentsMd => " [AGENTS.md]",
             SkillSource::FileSystem => "",
+            SkillSource::BuiltIn => " [built-in]",
         };
         let description = self.presentation_description();
         let manual_tag = if self.allow_implicit_invocation {
@@ -263,6 +277,7 @@ impl Skill {
         let source_tag = match self.source {
             SkillSource::AgentsMd => " [AGENTS.md]",
             SkillSource::FileSystem => "",
+            SkillSource::BuiltIn => " [built-in]",
         };
         let label = if self.display_name.is_some() {
             format!(" ({})", self.display_label())
@@ -279,6 +294,7 @@ impl Skill {
         match self.source {
             SkillSource::AgentsMd => "agents-md",
             SkillSource::FileSystem => "filesystem",
+            SkillSource::BuiltIn => "built-in",
         }
     }
 
@@ -325,6 +341,27 @@ impl Skill {
 
         expanded
     }
+}
+
+fn builtin_skills() -> Vec<Skill> {
+    vec![Skill {
+        name: "Autoresearch".into(),
+        display_name: None,
+        description: Some(
+            "Discover and explicitly run bounded metric-driven research programs".into(),
+        ),
+        short_description: None,
+        command: "autoresearch".into(),
+        model: None,
+        permission_mode: None,
+        context: SkillContextMode::Inline,
+        directory: PathBuf::from("<built-in>/autoresearch"),
+        body: include_str!("../assets/autoresearch/SKILL.md")
+            .trim()
+            .to_string(),
+        source: SkillSource::BuiltIn,
+        allow_implicit_invocation: false,
+    }]
 }
 
 fn parse_skill_file(path: &Path) -> Result<Skill, String> {
