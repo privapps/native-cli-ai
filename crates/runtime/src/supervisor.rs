@@ -76,6 +76,9 @@ pub struct Supervisor {
     hooks: Option<HookRunner>,
     context_manager: ContextManager,
     last_summary_at_tokens: usize,
+    /// Monotonic generation incremented whenever automatic context compaction
+    /// replaces the retained message history.
+    context_compaction_epoch: u64,
 }
 
 /// Configuration for creating a new supervised session.
@@ -307,6 +310,7 @@ impl Supervisor {
             hooks: hook_runner,
             context_manager,
             last_summary_at_tokens: 0,
+            context_compaction_epoch: 0,
         };
 
         if let Some(loaded) = restored {
@@ -552,6 +556,13 @@ impl Supervisor {
         self.context_manager.stats(&self.agent.messages)
     }
 
+    /// Return the generation of automatic context compaction. Interactive
+    /// prompt layers use this to avoid treating dropped skill context as
+    /// still present in the conversation.
+    pub fn context_compaction_epoch(&self) -> u64 {
+        self.context_compaction_epoch
+    }
+
     async fn make_context_manager(config: &NcaConfig, model: &str) -> ContextManager {
         let model_limits = model_limits_api::resolve_model_limits(config, model).await;
         let context_window = if config.memory.context.auto_detect_context_window {
@@ -649,6 +660,7 @@ impl Supervisor {
                 .context_manager
                 .get_sliding_window(&self.agent.messages, None);
             self.agent.messages = compacted;
+            self.context_compaction_epoch = self.context_compaction_epoch.saturating_add(1);
             return Ok(());
         }
 
@@ -663,6 +675,7 @@ impl Supervisor {
                 self.agent.messages = self
                     .context_manager
                     .apply_summary(&self.agent.messages, &summary);
+                self.context_compaction_epoch = self.context_compaction_epoch.saturating_add(1);
                 self.last_summary_at_tokens = self
                     .context_manager
                     .stats(&self.agent.messages)
@@ -692,6 +705,7 @@ impl Supervisor {
                     .context_manager
                     .get_sliding_window(&self.agent.messages, None);
                 self.agent.messages = compacted;
+                self.context_compaction_epoch = self.context_compaction_epoch.saturating_add(1);
                 self.last_summary_at_tokens = self
                     .context_manager
                     .stats(&self.agent.messages)
@@ -899,6 +913,7 @@ impl Supervisor {
         self.status = SessionStatus::Running;
         self.created_at = Utc::now();
         self.last_summary_at_tokens = 0;
+        self.context_compaction_epoch = 0;
         self.session_store =
             SessionStore::new(resolve_sessions_dir(&self.config, &self.workspace_root));
         self.refresh_system_prompt();
@@ -976,6 +991,12 @@ impl Supervisor {
     /// its manual-only skill from the normal skill surface.
     pub fn authorize_autoresearch(&self) {
         self.agent.tools.authorize_autoresearch();
+    }
+
+    /// Activate the financial tool capability after the user explicitly
+    /// selects the manual-only financial research skill.
+    pub fn authorize_financial_research(&self) {
+        self.agent.tools.enable_financial_research();
     }
 
     pub fn agent_mut(&mut self) -> &mut AgentLoop {

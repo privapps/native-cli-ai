@@ -3,6 +3,8 @@ pub mod approval;
 pub mod code_intel;
 pub mod context_view;
 pub mod cost;
+pub mod evidence;
+pub mod financial_policy;
 pub mod harness;
 pub mod hooks;
 pub mod provider;

@@ -48,6 +48,8 @@ tokio::task_local! {
     static EXECUTION_YOLO: bool;
 }
 
+pub const FINANCIAL_RESEARCH_SKILL_COMMAND: &str = "financial-research";
+
 /// Returns whether the current tool invocation is running under yolo.
 /// Tool implementations use this to bypass nca-level guards while retaining
 /// actual OS and subprocess errors.
@@ -79,6 +81,13 @@ impl ToolRegistry {
         self.research_context.clone()
     }
 
+    /// Return the generic evidence ledger shared by the registry's research
+    /// tools. Financial validation remains behind `ResearchContext`; generic
+    /// collectors can observe this ledger without depending on that policy.
+    pub fn evidence_ledger(&self) -> Arc<crate::evidence::EvidenceLedger> {
+        self.research_context.evidence_ledger()
+    }
+
     pub fn financial_research_capability(&self) -> Arc<AtomicBool> {
         self.financial_research_enabled.clone()
     }
@@ -90,6 +99,10 @@ impl ToolRegistry {
     pub fn enable_financial_research(&self) {
         self.financial_research_enabled
             .store(true, Ordering::Release);
+    }
+
+    pub fn financial_research_enabled(&self) -> bool {
+        self.financial_research_enabled.load(Ordering::Acquire)
     }
 
     pub fn set_yolo(&mut self, yolo: bool) {

@@ -120,7 +120,7 @@ impl ToolExecutor for InvokeSkillTool {
         }) {
             let body = skill.expanded_body();
             self.recent_skills.record(&skill.command);
-            if skill.command == "financial-research"
+            if skill.command == crate::tools::FINANCIAL_RESEARCH_SKILL_COMMAND
                 && let Some(capability) = &self.financial_research_capability
             {
                 capability.store(true, Ordering::Release);

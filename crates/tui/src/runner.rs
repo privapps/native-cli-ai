@@ -139,6 +139,10 @@ impl SessionRuntime {
         &self.supervisor.model
     }
 
+    pub fn context_compaction_epoch(&self) -> u64 {
+        self.supervisor.context_compaction_epoch()
+    }
+
     pub fn workspace_root(&self) -> &std::path::Path {
         &self.supervisor.workspace_root
     }
@@ -173,6 +177,12 @@ impl SessionRuntime {
     /// it through the normal skill command surface.
     pub fn authorize_autoresearch(&self) {
         self.supervisor.authorize_autoresearch();
+    }
+
+    /// Activate financial tools after an explicit `/financial-research`
+    /// command has loaded the manual-only skill instructions.
+    pub fn authorize_financial_research(&self) {
+        self.supervisor.authorize_financial_research();
     }
 
     pub fn set_permission_mode(&mut self, mode: PermissionMode) {

@@ -1,7 +1,5 @@
-use crate::research::{
-    EvidenceRecord, ResearchContext, classify_source_authority, infer_report_metadata_for_issuer,
-    parse_publication_date,
-};
+use crate::evidence::{GenericEvidenceRecord, classify_source_authority, parse_publication_date};
+use crate::research::ResearchContext;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use nca_common::config::WebConfig;
@@ -699,10 +697,6 @@ impl ToolExecutor for WebSearchTool {
                         "items": { "type": "string" },
                         "description": "Optional domains to prefer, such as an issuer investor-relations site or sec.gov"
                     },
-                    "issuer": {
-                        "type": "string",
-                        "description": "Optional issuer name; provide this for financial-report resolution so result metadata is tied to the named issuer"
-                    },
                 },
                 "required": ["query"]
             }),
@@ -744,25 +738,20 @@ impl ToolExecutor for WebSearchTool {
 
         let retrieved_at = Utc::now();
         let as_of = self.context.as_of();
-        let issuer = call.input["issuer"].as_str();
         let results = rows
             .into_iter()
             .map(|row| {
                 let authority = classify_source_authority(&row.url);
-                let report_metadata = infer_report_metadata_for_issuer(
-                    &format!("{} {}", row.title, row.snippet),
-                    issuer,
-                );
-                self.context.record_evidence(EvidenceRecord {
+                self.context.record_generic_evidence(GenericEvidenceRecord {
                     url: row.url.clone(),
                     title: Some(row.title.clone()),
                     snippet: Some(row.snippet.clone()),
+                    content: None,
                     retrieved_at,
                     response_status: None,
                     http_date: None,
                     published_at: row.published_at,
                     authority,
-                    report_metadata: report_metadata.clone(),
                 });
                 json!({
                     "title": row.title,
@@ -771,7 +760,6 @@ impl ToolExecutor for WebSearchTool {
                     "published_at": row.published_at,
                     "retrieved_at": retrieved_at,
                     "source_authority": authority,
-                    "report_metadata": report_metadata,
                     "eligible_as_of": row.published_at.map(|date| date.date_naive() <= as_of),
                 })
             })

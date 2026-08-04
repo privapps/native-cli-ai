@@ -695,8 +695,19 @@ impl AgentLoop {
             }
         };
 
-        let verification_warning = self.research_context.final_response_warning(&final_text);
-        let final_text = self.research_context.annotate_final_response(&final_text);
+        // Financial output verification is an opt-in capability.  The shared
+        // research context is present for generic evidence collection, but a
+        // normal turn must not infer a financial workflow from response text.
+        let verification_warning = self
+            .tools
+            .financial_research_enabled()
+            .then(|| self.research_context.final_response_warning(&final_text))
+            .flatten();
+        let final_text = if self.tools.financial_research_enabled() {
+            self.research_context.annotate_final_response(&final_text)
+        } else {
+            final_text
+        };
         self.emit(AgentEvent::MessageReceived {
             role: "assistant".into(),
             content: final_text.clone(),

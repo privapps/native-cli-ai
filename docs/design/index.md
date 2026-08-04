@@ -26,3 +26,7 @@ design history:
 New workflow specs are not written under `docs/` and existing specs are never
 overwritten. See the [documentation hub](../README.md) for the complete
 artifact and validation rules.
+
+The completed [`$`-prefixed skill references archive manifest](../../.archive/dollar-prefixed-skill-references/archive-manifest.md)
+records the validated workflow bundle, its `PASS` report, and the files moved
+out of `.scratch/`.

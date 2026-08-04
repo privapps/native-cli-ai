@@ -344,24 +344,45 @@ impl Skill {
 }
 
 fn builtin_skills() -> Vec<Skill> {
-    vec![Skill {
-        name: "Autoresearch".into(),
-        display_name: None,
-        description: Some(
-            "Discover and explicitly run bounded metric-driven research programs".into(),
-        ),
-        short_description: None,
-        command: "autoresearch".into(),
-        model: None,
-        permission_mode: None,
-        context: SkillContextMode::Inline,
-        directory: PathBuf::from("<built-in>/autoresearch"),
-        body: include_str!("../assets/autoresearch/SKILL.md")
-            .trim()
-            .to_string(),
-        source: SkillSource::BuiltIn,
-        allow_implicit_invocation: false,
-    }]
+    vec![
+        Skill {
+            name: "Autoresearch".into(),
+            display_name: None,
+            description: Some(
+                "Discover and explicitly run bounded metric-driven research programs".into(),
+            ),
+            short_description: None,
+            command: "autoresearch".into(),
+            model: None,
+            permission_mode: None,
+            context: SkillContextMode::Inline,
+            directory: PathBuf::from("<built-in>/autoresearch"),
+            body: include_str!("../assets/autoresearch/SKILL.md")
+                .trim()
+                .to_string(),
+            source: SkillSource::BuiltIn,
+            allow_implicit_invocation: false,
+        },
+        Skill {
+            name: "Financial Research".into(),
+            display_name: None,
+            description: Some(
+                "Evidence-bounded financial report research with explicit verification and fallback states."
+                    .into(),
+            ),
+            short_description: None,
+            command: "financial-research".into(),
+            model: None,
+            permission_mode: None,
+            context: SkillContextMode::Inline,
+            directory: PathBuf::from("<built-in>/financial-research"),
+            body: include_str!("../assets/financial-research/SKILL.md")
+                .trim()
+                .to_string(),
+            source: SkillSource::BuiltIn,
+            allow_implicit_invocation: false,
+        },
+    ]
 }
 
 fn parse_skill_file(path: &Path) -> Result<Skill, String> {

@@ -1,7 +1,5 @@
-use crate::research::{
-    EvidenceRecord, ResearchContext, classify_source_authority, infer_report_metadata_for_issuer,
-    parse_publication_date,
-};
+use crate::evidence::{GenericEvidenceRecord, classify_source_authority, parse_publication_date};
+use crate::research::ResearchContext;
 use chrono::{DateTime, Utc};
 use nca_common::config::WebConfig;
 use nca_common::tool::{ToolCall, ToolDefinition, ToolResult};
@@ -55,10 +53,6 @@ impl ToolExecutor for FetchUrlTool {
                 "type": "object",
                 "properties": {
                     "url": { "type": "string" },
-                    "issuer": {
-                        "type": "string",
-                        "description": "Optional issuer name; provide this for financial-report resolution so the page must visibly name the issuer"
-                    }
                 },
                 "required": ["url"]
             }),
@@ -142,20 +136,22 @@ impl ToolExecutor for FetchUrlTool {
         let retrieved_at = Utc::now();
         let published_at = extract_publication_date(&body);
         let authority = classify_source_authority(&final_url);
-        let report_metadata =
-            infer_report_metadata_for_issuer(&normalized, call.input["issuer"].as_str());
-        self.context.record_evidence(EvidenceRecord {
+        let content = normalized
+            .chars()
+            .take(self.config.max_fetch_chars)
+            .collect::<String>();
+        self.context.record_generic_evidence(GenericEvidenceRecord {
             url: final_url.clone(),
             title: first_html_element(&body, "title")
                 .map(|(_, content)| html_fragment_text(&content))
                 .filter(|title| !title.is_empty()),
             snippet: None,
+            content: Some(content.clone()),
             retrieved_at,
             response_status: Some(status.as_u16()),
             http_date,
             published_at,
             authority,
-            report_metadata: report_metadata.clone(),
         });
 
         ToolResult {
@@ -169,14 +165,10 @@ impl ToolExecutor for FetchUrlTool {
                     "retrieved_at": retrieved_at,
                     "http_date": http_date,
                     "published_at": published_at,
-                    "report_metadata": report_metadata,
                     "source_authority": authority,
                     "eligible_as_of": published_at.map(|date| date.date_naive() <= self.context.as_of()),
                 },
-                "content": normalized
-                    .chars()
-                    .take(self.config.max_fetch_chars)
-                    .collect::<String>(),
+                "content": content,
             }))
             .unwrap_or_else(|_| "{\"content\":\"\"}".into()),
             error: None,

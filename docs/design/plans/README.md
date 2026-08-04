@@ -4,6 +4,10 @@ Plans in this directory describe current or recently completed implementation wo
 
 Each plan should identify its status, date, related specification, and verification state.
 
+Completed workflow artifacts are archived separately from these design plans.
+See the [`$`-prefixed skill references archive manifest](../../../.archive/dollar-prefixed-skill-references/archive-manifest.md)
+for its spec, tickets, validation report, and move inventory.
+
 ## Canonical plans
 
 - [`/copy` latest assistant response](2026-07-29-copy-command.md)
@@ -22,6 +26,8 @@ Each plan should identify its status, date, related specification, and verificat
 - [Documentation organization](2026-07-31-documentation-organization-implementation.md)
 - [Validation failures follow-up](2026-08-01-validation-fixes.md)
 - [Archived feature documentation update](2026-08-02-archive-feature-documentation.md)
+- [Dollar-prefixed skill references](2026-08-03-dollar-prefixed-skill-references.md)
+- [Dollar-prefixed skill references — ticket 04 acceptance](2026-08-03-dollar-prefixed-skill-references-ticket-04.md)
 - [CI failure fixes](2026-08-02-ci-failures.md)
 - [AGENTS.md-backed instructions and skills](agents-md-skills.md)
 - [Autoresearch](autoresearch.md)

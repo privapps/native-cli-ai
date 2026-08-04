@@ -1,11 +1,14 @@
 //! Full-screen session TUI: transcript, streaming assistant, composer.
 
 use crate::file_mentions;
+use crate::skill_references::{
+    apply_skill_reference_completion_with_space, matching_skill_reference_commands,
+};
 use crate::tui::composer::{
     PaletteRow, SLASH_PANEL_MAX_ROWS, apply_at_completion, apply_selected_at_completion,
-    at_completion_active, at_completion_matches, branch_picker_enter_command,
+    at_completion_active, at_completion_matches, at_panel_height, branch_picker_enter_command,
     composer_chrome_height, composer_input_height_with_width, composer_render_model_with_width,
-    delete_completed_at_mention, filter_palette_rows, filter_slash_entries,
+    cursor_byte_index, delete_completed_at_mention, filter_palette_rows, filter_slash_entries,
     filtered_branch_indices, insert_text_at_cursor, load_slash_entries, move_cursor_end,
     move_cursor_home, move_cursor_vertical_with_width, normalize_paste, palette_command_for_label,
     palette_selectable_indices, sanitize_single_line_paste, slash_panel_visible,
@@ -38,6 +41,7 @@ use crossterm::{
 use nca_common::config::{ProviderCompatibility, ProviderKind};
 use nca_common::event::{BusyState, QuestionSelection};
 use nca_core::approval::suggest_allow_pattern;
+use nca_core::skills::SkillCatalog;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -401,6 +405,13 @@ pub fn run_blocking(
         g.workspace_root.clone()
     };
     let slash_entries = load_slash_entries(&workspace_root, &skill_directories);
+    let mut dollar_skill_commands = SkillCatalog::discover(&workspace_root, &skill_directories)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|skill| skill.command)
+        .collect::<Vec<_>>();
+    dollar_skill_commands.sort();
+    dollar_skill_commands.dedup();
     let (workspace_files_tx, workspace_files_rx) = std::sync::mpsc::channel();
     let discovery_root = workspace_root.clone();
     std::thread::spawn(move || {
@@ -468,12 +479,18 @@ pub fn run_blocking(
                 let slash_filtered = filter_slash_entries(&slash_entries, &g.input_buffer);
                 let at_matches =
                     at_completion_matches(&workspace_files, &g.input_buffer, g.cursor_char_idx);
+                let dollar_matches = matching_skill_reference_commands(
+                    &g.input_buffer,
+                    cursor_byte_index(&g.input_buffer, g.cursor_char_idx),
+                    &dollar_skill_commands,
+                );
                 let chrome_h = composer_chrome_height(
                     &slash_entries,
                     &workspace_files,
                     &g.input_buffer,
                     g.cursor_char_idx,
-                );
+                )
+                .max(at_panel_height(dollar_matches.len()));
                 let auxiliary_rows = usize::from(!g.staged_image_attachments.is_empty()) + 1;
                 let preview_area = Rect::new(0, 0, cur_size.0, cur_size.1);
                 let (preview_main_area, _) = layout_with_sidebar(preview_area);
@@ -992,6 +1009,49 @@ pub fn run_blocking(
                             )
                             .style(Style::default().bg(theme::SURFACE));
                         frame.render_widget(at_w, sr);
+                    } else if !dollar_matches.is_empty() {
+                        let n_show = dollar_matches.len().min(SLASH_PANEL_MAX_ROWS);
+                        let max_scroll = dollar_matches.len().saturating_sub(n_show);
+                        let pick = g
+                            .at_menu_index
+                            .min(dollar_matches.len().saturating_sub(1));
+                        let list_scroll = pick
+                            .saturating_sub(n_show.saturating_sub(1))
+                            .min(max_scroll);
+                        let mut lines = Vec::new();
+                        for (i, command) in dollar_matches[list_scroll..list_scroll + n_show]
+                            .iter()
+                            .enumerate()
+                        {
+                            let global = list_scroll + i;
+                            let style = if global == pick {
+                                Style::default()
+                                    .fg(Color::Black)
+                                    .bg(theme::USER)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().fg(theme::TEXT)
+                            };
+                            lines.push(Line::from(Span::styled(format!(" {command}"), style)));
+                        }
+                        if dollar_matches.len() > n_show {
+                            lines.push(Line::from(Span::styled(
+                                format!(" ─ {}/{} · ↑↓ Tab", pick + 1, dollar_matches.len()),
+                                Style::default().fg(theme::MUTED),
+                            )));
+                        }
+                        let dollar_panel = Paragraph::new(Text::from(lines))
+                            .block(
+                                Block::default()
+                                    .borders(Borders::ALL)
+                                    .border_style(Style::default().fg(theme::BORDER))
+                                    .title(Span::styled(
+                                        " skills ($ reference) ",
+                                        Style::default().fg(theme::MUTED),
+                                    )),
+                            )
+                            .style(Style::default().bg(theme::SURFACE));
+                        frame.render_widget(dollar_panel, sr);
                     }
                 }
 
@@ -2108,12 +2168,18 @@ pub fn run_blocking(
                     let slash_filtered = filter_slash_entries(&slash_entries, &g.input_buffer);
                     let at_matches =
                         at_completion_matches(&workspace_files, &g.input_buffer, g.cursor_char_idx);
+                    let dollar_matches = matching_skill_reference_commands(
+                        &g.input_buffer,
+                        cursor_byte_index(&g.input_buffer, g.cursor_char_idx),
+                        &dollar_skill_commands,
+                    );
                     let sh = composer_chrome_height(
                         &slash_entries,
                         &workspace_files,
                         &g.input_buffer,
                         g.cursor_char_idx,
-                    );
+                    )
+                    .max(at_panel_height(dollar_matches.len()));
                     let input_h = composer_input_height_with_width(
                         &g.input_buffer,
                         usize::from(!g.staged_image_attachments.is_empty()) + 1,
@@ -2215,6 +2281,28 @@ pub fn run_blocking(
                                     g.cursor_char_idx = cidx;
                                 }
                             }
+                        } else if !dollar_matches.is_empty() {
+                            let n_show = dollar_matches.len().min(SLASH_PANEL_MAX_ROWS);
+                            let max_scroll = dollar_matches.len().saturating_sub(n_show);
+                            let pick = g.at_menu_index.min(dollar_matches.len().saturating_sub(1));
+                            let list_scroll = pick
+                                .saturating_sub(n_show.saturating_sub(1))
+                                .min(max_scroll);
+                            if (inner_y as usize) < n_show {
+                                let idx = list_scroll + inner_y as usize;
+                                if let Some(choice) = dollar_matches.get(idx)
+                                    && let Some((buf, cidx)) =
+                                        apply_skill_reference_completion_with_space(
+                                            &g.input_buffer,
+                                            cursor_byte_index(&g.input_buffer, g.cursor_char_idx),
+                                            choice,
+                                        )
+                                {
+                                    g.input_buffer = buf;
+                                    g.cursor_char_idx = cidx;
+                                    g.at_menu_index = idx;
+                                }
+                            }
                         }
                     }
 
@@ -2227,6 +2315,11 @@ pub fn run_blocking(
                     }
                 }
                 Event::Key(key) => {
+                    let dollar_matches = matching_skill_reference_commands(
+                        &g.input_buffer,
+                        cursor_byte_index(&g.input_buffer, g.cursor_char_idx),
+                        &dollar_skill_commands,
+                    );
                     if g.command_palette_open() {
                         match (key.code, key.modifiers) {
                             (KeyCode::Esc, _) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
@@ -2885,6 +2978,17 @@ pub fn run_blocking(
                             {
                                 g.input_buffer = buf;
                                 g.cursor_char_idx = cidx;
+                            } else if let Some(choice) = dollar_matches
+                                .get(g.at_menu_index.min(dollar_matches.len().saturating_sub(1)))
+                                && let Some((buf, cidx)) =
+                                    apply_skill_reference_completion_with_space(
+                                        &g.input_buffer,
+                                        cursor_byte_index(&g.input_buffer, g.cursor_char_idx),
+                                        choice,
+                                    )
+                            {
+                                g.input_buffer = buf;
+                                g.cursor_char_idx = cidx;
                             } else {
                                 let slash_filtered =
                                     filter_slash_entries(&slash_entries, &g.input_buffer);
@@ -2968,6 +3072,19 @@ pub fn run_blocking(
                                     g.at_menu_index,
                                     true,
                                 )
+                            {
+                                g.input_buffer = buf;
+                                g.cursor_char_idx = cidx;
+                                continue;
+                            }
+                            if let Some(choice) = dollar_matches
+                                .get(g.at_menu_index.min(dollar_matches.len().saturating_sub(1)))
+                                && let Some((buf, cidx)) =
+                                    apply_skill_reference_completion_with_space(
+                                        &g.input_buffer,
+                                        cursor_byte_index(&g.input_buffer, g.cursor_char_idx),
+                                        choice,
+                                    )
                             {
                                 g.input_buffer = buf;
                                 g.cursor_char_idx = cidx;
@@ -3130,6 +3247,15 @@ pub fn run_blocking(
                             {
                                 g.at_menu_index = g.at_menu_index.saturating_sub(1);
                             } else {
+                                let dollar_matches = matching_skill_reference_commands(
+                                    &g.input_buffer,
+                                    cursor_byte_index(&g.input_buffer, g.cursor_char_idx),
+                                    &dollar_skill_commands,
+                                );
+                                if !dollar_matches.is_empty() {
+                                    g.at_menu_index = g.at_menu_index.saturating_sub(1);
+                                    continue;
+                                }
                                 let slash_filtered =
                                     filter_slash_entries(&slash_entries, &g.input_buffer);
                                 if !slash_filtered.is_empty()
@@ -3169,6 +3295,16 @@ pub fn run_blocking(
                                 let n = at_matches.len();
                                 g.at_menu_index = (g.at_menu_index + 1) % n;
                             } else {
+                                let dollar_matches = matching_skill_reference_commands(
+                                    &g.input_buffer,
+                                    cursor_byte_index(&g.input_buffer, g.cursor_char_idx),
+                                    &dollar_skill_commands,
+                                );
+                                if !dollar_matches.is_empty() {
+                                    let n = dollar_matches.len();
+                                    g.at_menu_index = (g.at_menu_index + 1) % n;
+                                    continue;
+                                }
                                 let slash_filtered =
                                     filter_slash_entries(&slash_entries, &g.input_buffer);
                                 if !slash_filtered.is_empty()
@@ -3281,8 +3417,10 @@ mod approval_parse_tests {
         approval_shortcut_action, branch_picker_enter_command, delete_completed_at_mention,
         dispatch_custom_provider_key, dispatch_paste, escape_cancels_active_turn,
         filter_slash_entries, filtered_branch_indices, handle_newline_key, load_slash_entries,
-        primary_input_mode,
+        matching_skill_reference_commands, primary_input_mode,
     };
+    use crate::skill_references::apply_skill_reference_completion_with_space;
+    use crate::tui::composer::cursor_byte_index;
     use crate::tui::composer::{completed_at_mention_range_before_cursor, composer_line};
     use crate::tui::state::{CustomProviderSetupStep, TuiSessionState};
     use crate::tui::transcript::parse_approval_verdict;
@@ -3687,6 +3825,55 @@ mod approval_parse_tests {
         assert_eq!(
             crate::tui::composer::at_completion_matches(&workspace_files, buffer, cursor),
             vec!["src/main.rs"]
+        );
+    }
+
+    #[test]
+    fn dollar_completion_dispatch_preserves_inline_text_and_whitespace() {
+        let commands = vec![
+            "manual-only".into(),
+            "research-alpha".into(),
+            "research-beta".into(),
+        ];
+        let line = "before $research after";
+        let cursor = line.find("$research").unwrap() + "$research".len();
+        let matches =
+            matching_skill_reference_commands(line, cursor_byte_index(line, cursor), &commands);
+        assert_eq!(matches, ["$research-alpha", "$research-beta"]);
+
+        let (selected, selected_cursor) = apply_skill_reference_completion_with_space(
+            line,
+            cursor_byte_index(line, cursor),
+            &matches[0],
+        )
+        .expect("active dollar token should be selectable");
+        assert_eq!(selected, "before $research-alpha after");
+        assert_eq!(selected_cursor, "before $research-alpha".chars().count());
+
+        let end_line = "before $research";
+        let end_cursor = end_line.chars().count();
+        let end_matches = matching_skill_reference_commands(
+            end_line,
+            cursor_byte_index(end_line, end_cursor),
+            &commands,
+        );
+        let (selected, selected_cursor) = apply_skill_reference_completion_with_space(
+            end_line,
+            cursor_byte_index(end_line, end_cursor),
+            &end_matches[0],
+        )
+        .expect("line-end dollar token should be selectable");
+        assert_eq!(selected, "before $research-alpha ");
+        assert_eq!(selected_cursor, selected.chars().count());
+
+        let escaped = r"before \$research";
+        assert!(
+            matching_skill_reference_commands(
+                escaped,
+                cursor_byte_index(escaped, escaped.chars().count()),
+                &commands,
+            )
+            .is_empty()
         );
     }
 

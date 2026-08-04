@@ -1,16 +1,11 @@
-use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
+use crate::evidence::{EvidenceLedger, GenericEvidenceRecord};
+pub use crate::evidence::{
+    SourceAuthority, canonical_url, classify_source_authority, parse_publication_date,
+};
+use crate::financial_policy::FinancialResearchPolicy;
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::cmp::Ordering;
-use std::sync::{Arc, Mutex};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SourceAuthority {
-    Official,
-    Secondary,
-    Unknown,
-}
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReportEvidenceMetadata {
@@ -32,7 +27,7 @@ impl ReportEvidenceMetadata {
             && self.status.is_none()
     }
 
-    fn merge_missing_from(&mut self, incoming: Self) {
+    pub(crate) fn merge_missing_from(&mut self, incoming: Self) {
         if self.issuer.is_none() {
             self.issuer = incoming.issuer;
         }
@@ -50,16 +45,6 @@ impl ReportEvidenceMetadata {
         }
         if self.status.is_none() {
             self.status = incoming.status;
-        }
-    }
-}
-
-impl SourceAuthority {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Official => "official",
-            Self::Secondary => "secondary",
-            Self::Unknown => "unknown",
         }
     }
 }
@@ -133,7 +118,7 @@ impl ReportCadence {
         }
     }
 
-    fn accepts(self, report_type: ReportType) -> bool {
+    pub(crate) fn accepts(self, report_type: ReportType) -> bool {
         match self {
             Self::Latest => true,
             Self::Annual => matches!(report_type, ReportType::Annual),
@@ -198,7 +183,7 @@ impl ReportStatus {
         }
     }
 
-    fn is_eligible(self) -> bool {
+    pub(crate) fn is_eligible(self) -> bool {
         matches!(self, Self::Reported | Self::Filed)
     }
 }
@@ -229,6 +214,7 @@ pub struct ValidatedFinancialReport {
 pub enum ResolutionStatus {
     Resolved,
     Fallback,
+    Conflict,
     Unavailable,
 }
 
@@ -265,6 +251,8 @@ pub enum ReportValidationError {
     PublicationDateUnknown,
     #[error("source publication date does not match the observed source")]
     PublicationDateMismatch,
+    #[error("conflicting official evidence prevents verification: {0}")]
+    ConflictingEvidence(String),
     #[error("observed source metadata does not match the declared {0}")]
     SourceMetadataMismatch(&'static str),
     #[error("observed source metadata is unavailable for {0}")]
@@ -284,18 +272,9 @@ pub enum ReportValidationError {
 }
 
 #[derive(Debug, Clone)]
-struct ResearchState {
-    as_of: NaiveDate,
-    observations: Vec<EvidenceRecord>,
-    evidence: Vec<EvidenceRecord>,
-    validated_report: Option<ValidatedFinancialReport>,
-    resolution: Option<FinancialReportResolution>,
-    conflicts: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
 pub struct ResearchContext {
-    state: Arc<Mutex<ResearchState>>,
+    ledger: Arc<EvidenceLedger>,
+    policy: Arc<FinancialResearchPolicy>,
 }
 
 pub trait IntoTurnDate {
@@ -316,191 +295,58 @@ impl IntoTurnDate for DateTime<Utc> {
 
 impl ResearchContext {
     pub fn new<T: IntoTurnDate>(as_of: T) -> Self {
+        Self::with_ledger(Arc::new(EvidenceLedger::new(as_of.into_turn_date())))
+    }
+
+    pub fn with_ledger(ledger: Arc<EvidenceLedger>) -> Self {
         Self {
-            state: Arc::new(Mutex::new(ResearchState {
-                as_of: as_of.into_turn_date(),
-                observations: Vec::new(),
-                evidence: Vec::new(),
-                validated_report: None,
-                resolution: None,
-                conflicts: Vec::new(),
-            })),
+            policy: Arc::new(FinancialResearchPolicy::with_ledger(ledger.clone())),
+            ledger,
         }
+    }
+
+    pub fn evidence_ledger(&self) -> Arc<EvidenceLedger> {
+        self.ledger.clone()
+    }
+
+    /// Access the financial interpretation boundary used by specialized tools.
+    pub fn financial_policy(&self) -> Arc<FinancialResearchPolicy> {
+        self.policy.clone()
+    }
+
+    /// Record provenance-only evidence from a generic collector while
+    /// preserving invalidation of any financial capability affected by it.
+    pub fn record_generic_evidence(&self, evidence: GenericEvidenceRecord) {
+        self.policy.record_generic_evidence(evidence);
     }
 
     pub fn begin_turn(&self, as_of: NaiveDate) {
-        if let Ok(mut state) = self.state.lock() {
-            state.as_of = as_of;
-            state.observations.clear();
-            state.evidence.clear();
-            state.validated_report = None;
-            state.resolution = None;
-            state.conflicts.clear();
-        }
+        self.policy.begin_turn(as_of);
     }
 
     pub fn as_of(&self) -> NaiveDate {
-        self.state
-            .lock()
-            .map(|state| state.as_of)
-            .unwrap_or_else(|_| Utc::now().date_naive())
+        self.ledger.as_of()
     }
 
-    pub fn record_evidence(&self, mut evidence: EvidenceRecord) {
-        evidence.url = canonical_url(&evidence.url);
-        let Ok(mut state) = self.state.lock() else {
-            return;
-        };
-        state.observations.push(evidence.clone());
-        if let Some(index) = state
-            .evidence
-            .iter()
-            .position(|existing| existing.url == evidence.url)
-        {
-            let previous = state.evidence[index].clone();
-            record_evidence_conflicts(&mut state.conflicts, &previous, &evidence);
-            let existing = &mut state.evidence[index];
-            if existing.published_at.is_none() {
-                existing.published_at = evidence.published_at;
-            }
-            if existing.response_status.is_none() {
-                existing.response_status = evidence.response_status;
-            }
-            if existing.http_date.is_none() {
-                existing.http_date = evidence.http_date;
-            }
-            if let Some(incoming) = evidence.report_metadata {
-                if let Some(metadata) = existing.report_metadata.as_mut() {
-                    metadata.merge_missing_from(incoming);
-                } else {
-                    existing.report_metadata = Some(incoming);
-                }
-            }
-            if existing.title.is_none() {
-                existing.title = evidence.title;
-            }
-            if existing.snippet.is_none() {
-                existing.snippet = evidence.snippet;
-            }
-            if existing.authority == SourceAuthority::Unknown {
-                existing.authority = evidence.authority;
-            }
-            return;
-        }
-        state.evidence.push(evidence);
+    pub fn record_evidence(&self, evidence: EvidenceRecord) {
+        self.policy.record_evidence(evidence);
     }
 
     pub fn evidence(&self) -> Vec<EvidenceRecord> {
-        self.state
-            .lock()
-            .map(|state| state.evidence.clone())
-            .unwrap_or_default()
+        self.policy.evidence()
     }
 
     /// Return every source observation, including repeated or conflicting
     /// observations that were merged into the normalized evidence view.
     pub fn observations(&self) -> Vec<EvidenceRecord> {
-        self.state
-            .lock()
-            .map(|state| state.observations.clone())
-            .unwrap_or_default()
+        self.policy.observations()
     }
 
     pub fn validate_candidate(
         &self,
-        mut candidate: FinancialReportCandidate,
+        candidate: FinancialReportCandidate,
     ) -> Result<ValidatedFinancialReport, ReportValidationError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| ReportValidationError::SourceNotObserved)?;
-        let as_of = state.as_of;
-
-        if !candidate.status.is_eligible() {
-            return Err(ReportValidationError::IneligibleStatus(
-                candidate.status.as_str().into(),
-            ));
-        }
-        if candidate.period_end > as_of {
-            return Err(ReportValidationError::PeriodInFuture {
-                period_end: candidate.period_end,
-                as_of,
-            });
-        }
-        if candidate.publication_date.date_naive() > as_of {
-            return Err(ReportValidationError::PublicationInFuture {
-                publication_date: candidate.publication_date.date_naive(),
-                as_of,
-            });
-        }
-
-        let url = canonical_url(&candidate.publication_url);
-        let evidence = state
-            .evidence
-            .iter()
-            .find(|evidence| evidence.url == url)
-            .ok_or(ReportValidationError::SourceNotObserved)?;
-        if evidence.authority != SourceAuthority::Official {
-            return Err(ReportValidationError::SourceNotOfficial);
-        }
-        let observed_date = evidence
-            .published_at
-            .ok_or(ReportValidationError::PublicationDateUnknown)?;
-        if observed_date != candidate.publication_date {
-            return Err(ReportValidationError::PublicationDateMismatch);
-        }
-        let metadata = evidence.report_metadata.as_ref().ok_or(
-            ReportValidationError::SourceMetadataUnavailable("reporting period"),
-        )?;
-        let observed_issuer = metadata
-            .issuer
-            .as_deref()
-            .ok_or(ReportValidationError::SourceMetadataUnavailable("issuer"))?;
-        if !same_issuer(observed_issuer, &candidate.issuer) {
-            return Err(ReportValidationError::SourceMetadataMismatch("issuer"));
-        }
-        let period_label = metadata.period_label.as_deref().ok_or(
-            ReportValidationError::SourceMetadataUnavailable("reporting period"),
-        )?;
-        if !period_label.eq_ignore_ascii_case(&candidate.period_label) {
-            return Err(ReportValidationError::SourceMetadataMismatch(
-                "reporting period",
-            ));
-        }
-        if metadata.period_end != Some(candidate.period_end) {
-            return Err(ReportValidationError::SourceMetadataMismatch("period end"));
-        }
-        if metadata.report_type != Some(candidate.report_type) {
-            return Err(ReportValidationError::SourceMetadataMismatch("report type"));
-        }
-        if metadata.calendar != Some(candidate.calendar) {
-            return Err(ReportValidationError::SourceMetadataMismatch(
-                "reporting calendar",
-            ));
-        }
-        if metadata.status != Some(candidate.status) {
-            return Err(ReportValidationError::SourceMetadataMismatch("status"));
-        }
-
-        candidate.publication_url = url;
-        let validated = ValidatedFinancialReport {
-            candidate,
-            as_of,
-            source_authority: evidence.authority,
-            source_retrieved_at: evidence.retrieved_at,
-            source_http_date: evidence.http_date,
-        };
-
-        let should_promote = state
-            .validated_report
-            .as_ref()
-            .map(|current| is_newer_report(&validated, current))
-            .unwrap_or(true);
-        if should_promote {
-            state.validated_report = Some(validated.clone());
-        }
-        state.resolution = None;
-        Ok(validated)
+        self.policy.validate_candidate(candidate)
     }
 
     /// Select the newest eligible observed result for a requested cadence.
@@ -514,442 +360,24 @@ impl ResearchContext {
         issuer: &str,
         requested_cadence: ReportCadence,
     ) -> FinancialReportResolution {
-        let issuer = issuer.trim().to_string();
-        let as_of = self.as_of();
-        let requested_candidates = self.eligible_candidates(&issuer, requested_cadence);
-        let mut conflicts = self.conflicts();
-        append_period_conflicts(&mut conflicts, &requested_candidates);
-        let requested_selected = self.validate_first(requested_candidates);
-        let newer_annual_blocked = requested_cadence == ReportCadence::Annual
-            && requested_selected.as_ref().is_some_and(|selected| {
-                self.has_ineligible_newer_annual(&issuer, selected.candidate.period_end)
-            });
-        let selected = requested_selected;
-        let mut status = if selected.is_some() {
-            ResolutionStatus::Resolved
-        } else {
-            ResolutionStatus::Unavailable
-        };
-        let mut limitation = None;
-
-        if newer_annual_blocked {
-            status = ResolutionStatus::Fallback;
-            limitation = Some(format!(
-                "The newest observed annual period was not eligible as of {}; the newest eligible prior annual result is shown as a fallback.",
-                as_of
-            ));
-        }
-
-        let selected = if selected.is_none() && requested_cadence == ReportCadence::Annual {
-            let fallback =
-                self.validate_first(self.eligible_candidates(&issuer, ReportCadence::Quarterly));
-            if fallback.is_some() {
-                status = ResolutionStatus::Fallback;
-                limitation = Some(format!(
-                    "No eligible annual report was observed as of {}; the newest eligible quarterly result is shown as a fallback and must not be treated as annual.",
-                    as_of
-                ));
-            }
-            fallback
-        } else {
-            selected
-        };
-
-        if selected.is_none() && limitation.is_none() {
-            limitation = Some(match requested_cadence {
-                ReportCadence::Annual => format!(
-                    "No eligible annual or quarterly result was observed as of {}.",
-                    as_of
-                ),
-                ReportCadence::Quarterly => {
-                    format!("No eligible quarterly result was observed as of {}.", as_of)
-                }
-                ReportCadence::Latest => format!(
-                    "No eligible official reported result was observed as of {}.",
-                    as_of
-                ),
-            });
-        }
-
-        let resolution = FinancialReportResolution {
-            issuer,
-            requested_cadence,
-            as_of,
-            status,
-            selected,
-            limitation,
-            conflicts,
-        };
-        if let Ok(mut state) = self.state.lock() {
-            state.validated_report = resolution.selected.clone();
-            state.resolution = Some(resolution.clone());
-        }
-        resolution
-    }
-
-    fn conflicts(&self) -> Vec<String> {
-        self.state
-            .lock()
-            .map(|state| state.conflicts.clone())
-            .unwrap_or_default()
-    }
-
-    fn eligible_candidates(
-        &self,
-        issuer: &str,
-        requested_cadence: ReportCadence,
-    ) -> Vec<FinancialReportCandidate> {
-        let Ok(state) = self.state.lock() else {
-            return Vec::new();
-        };
-        let as_of = state.as_of;
-        let mut candidates = state
-            .evidence
-            .iter()
-            .filter_map(|evidence| {
-                if evidence.authority != SourceAuthority::Official {
-                    return None;
-                }
-                let metadata = evidence.report_metadata.as_ref()?;
-                let publication_date = evidence.published_at?;
-                let observed_issuer = metadata.issuer.as_deref()?;
-                if !same_issuer(observed_issuer, issuer) {
-                    return None;
-                }
-                let period_label = metadata.period_label.clone()?;
-                let period_end = metadata.period_end?;
-                let report_type = metadata.report_type?;
-                let calendar = metadata.calendar?;
-                let status = metadata.status?;
-                if !status.is_eligible()
-                    || period_end > as_of
-                    || publication_date.date_naive() > as_of
-                    || !requested_cadence.accepts(report_type)
-                {
-                    return None;
-                }
-                Some(FinancialReportCandidate {
-                    issuer: issuer.to_string(),
-                    report_type,
-                    period_label,
-                    period_end,
-                    calendar,
-                    status,
-                    publication_url: canonical_url(&evidence.url),
-                    publication_date,
-                })
-            })
-            .collect::<Vec<_>>();
-        candidates.sort_by(compare_candidate_order_desc);
-        candidates
-    }
-
-    fn has_ineligible_newer_annual(&self, issuer: &str, selected_period_end: NaiveDate) -> bool {
-        let Ok(state) = self.state.lock() else {
-            return false;
-        };
-        state.evidence.iter().any(|evidence| {
-            if evidence.authority != SourceAuthority::Official {
-                return false;
-            }
-            let Some(metadata) = evidence.report_metadata.as_ref() else {
-                return false;
-            };
-            let Some(observed_issuer) = metadata.issuer.as_deref() else {
-                return false;
-            };
-            let Some(period_end) = metadata.period_end else {
-                return false;
-            };
-            if !same_issuer(observed_issuer, issuer)
-                || metadata.report_type != Some(ReportType::Annual)
-                || period_end <= selected_period_end
-            {
-                return false;
-            }
-            let status_eligible = metadata.status.is_some_and(ReportStatus::is_eligible);
-            let period_completed = period_end <= state.as_of;
-            let publication_available = evidence
-                .published_at
-                .is_some_and(|published_at| published_at.date_naive() <= state.as_of);
-            !(status_eligible && period_completed && publication_available)
-        })
-    }
-
-    fn validate_first(
-        &self,
-        candidates: Vec<FinancialReportCandidate>,
-    ) -> Option<ValidatedFinancialReport> {
-        candidates
-            .into_iter()
-            .find_map(|candidate| self.validate_candidate(candidate).ok())
+        self.policy.resolve_latest_report(issuer, requested_cadence)
     }
 
     pub fn validated_report(&self) -> Option<ValidatedFinancialReport> {
-        self.state
-            .lock()
-            .ok()
-            .and_then(|state| state.validated_report.clone())
+        self.policy.validated_report()
     }
 
     pub fn validate_report_output(&self, output: &str) -> Result<(), ReportValidationError> {
-        if !looks_like_financial_report(output) {
-            return Ok(());
-        }
-        let Some(validated) = self.validated_report() else {
-            return Err(ReportValidationError::OutputNotValidated);
-        };
-        if !contains_as_of(output, validated.as_of) {
-            return Err(ReportValidationError::OutputMissingAsOf);
-        }
-        if !output.contains(&validated.candidate.period_label) {
-            return Err(ReportValidationError::OutputPeriodMismatch(
-                validated.candidate.period_label,
-            ));
-        }
-        let candidate = &validated.candidate;
-        let period_end = candidate.period_end.to_string();
-        let output_lower = output.to_ascii_lowercase();
-        let required_fields = [
-            (candidate.issuer.as_str(), "issuer"),
-            (candidate.report_type.as_str(), "report type"),
-            (candidate.calendar.as_str(), "reporting calendar"),
-            (period_end.as_str(), "period end"),
-            (candidate.status.as_str(), "publication status"),
-        ];
-        for (value, field) in required_fields {
-            if !output_lower.contains(&value.to_ascii_lowercase()) {
-                return Err(ReportValidationError::OutputMetadataMissing(field));
-            }
-        }
-        if !contains_datetime(output, candidate.publication_date) {
-            return Err(ReportValidationError::OutputMetadataMissing(
-                "publication date",
-            ));
-        }
-        if !contains_datetime(output, validated.source_retrieved_at) {
-            return Err(ReportValidationError::OutputMetadataMissing(
-                "source retrieval timestamp",
-            ));
-        }
-        if !output.contains(&candidate.publication_url) {
-            return Err(ReportValidationError::OutputMissingSource);
-        }
-        if self
-            .state
-            .lock()
-            .ok()
-            .and_then(|state| state.resolution.clone())
-            .is_some_and(|resolution| {
-                resolution.status == ResolutionStatus::Fallback
-                    && !contains_fallback_disclosure(output)
-            })
-        {
-            return Err(ReportValidationError::OutputMissingFallbackDisclosure);
-        }
-        Ok(())
+        self.policy.validate_report_output(output)
     }
 
     pub fn final_response_warning(&self, output: &str) -> Option<String> {
-        if !looks_like_financial_report(output) || self.validate_report_output(output).is_ok() {
-            return None;
-        }
-        let mut warning = "Verification status: unverified. This financial report did not pass the as-of, source, and reporting-period checks; treat its figures as unverified until an authoritative source is confirmed.".to_string();
-        if let Ok(state) = self.state.lock()
-            && let Some(limitation) = state
-                .resolution
-                .as_ref()
-                .and_then(|resolution| resolution.limitation.as_deref())
-        {
-            warning.push_str(" Research limitation: ");
-            warning.push_str(limitation);
-        }
-        Some(warning)
+        self.policy.final_response_warning(output)
     }
 
     pub fn annotate_final_response(&self, output: &str) -> String {
-        let Some(warning) = self.final_response_warning(output) else {
-            return output.to_string();
-        };
-
-        if let Ok(mut value) = serde_json::from_str::<Value>(output)
-            && let Value::Object(object) = &mut value
-        {
-            object.insert(
-                "verification_status".into(),
-                Value::String("unverified".into()),
-            );
-            object.insert("verification_warning".into(), Value::String(warning));
-            return serde_json::to_string_pretty(&value).unwrap_or_else(|_| output.to_string());
-        }
-
-        let lines: Vec<&str> = output
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .collect();
-        if lines.len() > 1
-            && lines
-                .iter()
-                .all(|line| serde_json::from_str::<Value>(line).is_ok())
-        {
-            let warning_record = serde_json::json!({
-                "verification_status": "unverified",
-                "verification_warning": warning,
-            });
-            return format!("{}\n{}", output.trim_end(), warning_record);
-        }
-
-        format!("{warning}\n\n{output}")
+        self.policy.annotate_final_response(output)
     }
-}
-
-pub fn canonical_url(url: &str) -> String {
-    url.trim().trim_end_matches('/').to_string()
-}
-
-fn record_evidence_conflicts(
-    conflicts: &mut Vec<String>,
-    existing: &EvidenceRecord,
-    incoming: &EvidenceRecord,
-) {
-    if let (Some(existing_date), Some(incoming_date)) =
-        (existing.published_at, incoming.published_at)
-        && existing_date != incoming_date
-    {
-        conflicts.push(format!(
-            "Conflicting publication dates were observed for {}: {} and {}.",
-            existing.url,
-            existing_date.to_rfc3339(),
-            incoming_date.to_rfc3339()
-        ));
-    }
-
-    let Some(existing_metadata) = existing.report_metadata.as_ref() else {
-        return;
-    };
-    let Some(incoming_metadata) = incoming.report_metadata.as_ref() else {
-        return;
-    };
-    if let (Some(existing_period), Some(incoming_period)) = (
-        &existing_metadata.period_label,
-        &incoming_metadata.period_label,
-    ) && existing_period != incoming_period
-    {
-        conflicts.push(format!(
-            "Conflicting reporting periods were observed for {}: {} and {}.",
-            existing.url, existing_period, incoming_period
-        ));
-    }
-    if let (Some(existing_issuer), Some(incoming_issuer)) =
-        (&existing_metadata.issuer, &incoming_metadata.issuer)
-        && !same_issuer(existing_issuer, incoming_issuer)
-    {
-        conflicts.push(format!(
-            "Conflicting issuers were observed for {}: {} and {}.",
-            existing.url, existing_issuer, incoming_issuer
-        ));
-    }
-    if let (Some(existing_end), Some(incoming_end)) =
-        (existing_metadata.period_end, incoming_metadata.period_end)
-        && existing_end != incoming_end
-    {
-        conflicts.push(format!(
-            "Conflicting period ends were observed for {}: {} and {}.",
-            existing.url, existing_end, incoming_end
-        ));
-    }
-}
-
-fn append_period_conflicts(conflicts: &mut Vec<String>, candidates: &[FinancialReportCandidate]) {
-    for (index, candidate) in candidates.iter().enumerate() {
-        let Some(other) = candidates[index + 1..]
-            .iter()
-            .find(|other| other.period_end == candidate.period_end)
-        else {
-            continue;
-        };
-        let message = format!(
-            "Multiple eligible official sources cover period end {}; selected the newest publication among {} and {}.",
-            candidate.period_end, candidate.publication_url, other.publication_url
-        );
-        if !conflicts.contains(&message) {
-            conflicts.push(message);
-        }
-    }
-}
-
-fn is_newer_report(
-    candidate: &ValidatedFinancialReport,
-    current: &ValidatedFinancialReport,
-) -> bool {
-    (
-        candidate.candidate.period_end,
-        candidate.candidate.publication_date,
-        source_authority_rank(candidate.source_authority),
-    ) > (
-        current.candidate.period_end,
-        current.candidate.publication_date,
-        source_authority_rank(current.source_authority),
-    )
-}
-
-fn compare_candidate_order_desc(
-    left: &FinancialReportCandidate,
-    right: &FinancialReportCandidate,
-) -> Ordering {
-    right
-        .period_end
-        .cmp(&left.period_end)
-        .then_with(|| right.publication_date.cmp(&left.publication_date))
-        .then_with(|| right.report_type.as_str().cmp(left.report_type.as_str()))
-        .then_with(|| right.publication_url.cmp(&left.publication_url))
-}
-
-fn source_authority_rank(authority: SourceAuthority) -> u8 {
-    match authority {
-        SourceAuthority::Official => 2,
-        SourceAuthority::Secondary => 1,
-        SourceAuthority::Unknown => 0,
-    }
-}
-
-pub fn classify_source_authority(url: &str) -> SourceAuthority {
-    let lower = url.to_ascii_lowercase();
-    let Some((_, host_and_path)) = lower.split_once("://") else {
-        return SourceAuthority::Unknown;
-    };
-    let host = host_and_path.split('/').next().unwrap_or_default();
-    let path = host_and_path
-        .split_once('/')
-        .map(|(_, path)| path)
-        .unwrap_or_default();
-    if host == "sec.gov"
-        || host.ends_with(".gov")
-        || host.starts_with("investor.")
-        || host.starts_with("ir.")
-        || path.contains("investor-relations")
-        || path.contains("/investors/")
-    {
-        SourceAuthority::Official
-    } else if !host.is_empty() {
-        SourceAuthority::Secondary
-    } else {
-        SourceAuthority::Unknown
-    }
-}
-
-pub fn parse_publication_date(value: &str) -> Option<DateTime<Utc>> {
-    let value = value.trim();
-    if let Ok(value) = DateTime::parse_from_rfc3339(value) {
-        return Some(value.with_timezone(&Utc));
-    }
-    if let Ok(value) = DateTime::parse_from_rfc2822(value) {
-        return Some(value.with_timezone(&Utc));
-    }
-    NaiveDate::parse_from_str(value, "%Y-%m-%d")
-        .ok()
-        .and_then(|date| date.and_hms_opt(0, 0, 0))
-        .map(|date| DateTime::<Utc>::from_naive_utc_and_offset(date, Utc))
 }
 
 pub fn infer_report_metadata(text: &str) -> Option<ReportEvidenceMetadata> {
@@ -976,18 +404,29 @@ pub fn infer_report_metadata_for_issuer(
     if let Some(issuer) = issuer.map(str::trim).filter(|issuer| !issuer.is_empty()) {
         let lower_text = text.to_ascii_lowercase();
         let lower_issuer = issuer.to_ascii_lowercase();
-        if lower_text.contains(&lower_issuer) {
+        if contains_issuer_name(&lower_text, &lower_issuer) {
             metadata.issuer = Some(issuer.to_string());
         }
     }
     Some(metadata)
 }
 
-fn same_issuer(left: &str, right: &str) -> bool {
-    left.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .eq_ignore_ascii_case(&right.split_whitespace().collect::<Vec<_>>().join(" "))
+fn contains_issuer_name(text: &str, issuer: &str) -> bool {
+    if issuer.is_empty() {
+        return false;
+    }
+    let mut offset = 0;
+    while let Some(relative) = text[offset..].find(issuer) {
+        let start = offset + relative;
+        let end = start + issuer.len();
+        let starts_at_boundary = start == 0 || !text.as_bytes()[start - 1].is_ascii_alphanumeric();
+        let ends_at_boundary = end == text.len() || !text.as_bytes()[end].is_ascii_alphanumeric();
+        if starts_at_boundary && ends_at_boundary {
+            return true;
+        }
+        offset = end.max(start + 1);
+    }
+    false
 }
 
 fn infer_calendar(lower: &str) -> Option<ReportingCalendar> {
@@ -1122,40 +561,6 @@ pub fn looks_like_financial_report(output: &str) -> bool {
         || lower.contains("cy19")
         || lower.contains("cy20");
     financial_metric && (report_language || structured_report_metadata || period_token)
-}
-
-fn contains_as_of(output: &str, as_of: NaiveDate) -> bool {
-    let date = as_of.to_string();
-    output.lines().any(|line| {
-        let lower = line.to_ascii_lowercase();
-        (lower.contains("as of")
-            || lower.contains("as-of")
-            || lower.contains("as_of")
-            || lower.contains("as-of:"))
-            && line.contains(&date)
-    })
-}
-
-fn contains_datetime(output: &str, value: DateTime<Utc>) -> bool {
-    output.contains(&value.to_rfc3339())
-        || output.contains(&value.to_rfc3339_opts(SecondsFormat::Secs, true))
-}
-
-fn contains_fallback_disclosure(output: &str) -> bool {
-    let lower = output.to_ascii_lowercase();
-    let identifies_annual = lower.contains("annual");
-    let explains_limitation = [
-        "not available",
-        "not published",
-        "not yet",
-        "unavailable",
-        "no eligible",
-        "fallback",
-        "instead",
-    ]
-    .iter()
-    .any(|phrase| lower.contains(phrase));
-    identifies_annual && explains_limitation
 }
 
 #[cfg(test)]
@@ -1545,6 +950,10 @@ mod tests {
             classify_source_authority("https://news.example.com/story"),
             SourceAuthority::Secondary
         );
+        assert_eq!(
+            classify_source_authority("https://sec.gov:443/Archives/x"),
+            SourceAuthority::Official
+        );
     }
 
     #[test]
@@ -1578,6 +987,48 @@ mod tests {
         let unknown = infer_report_metadata("Issuer investor relations page").unwrap_or_default();
         assert_eq!(unknown.period_label, None);
         assert_eq!(unknown.period_end, None);
+    }
+
+    #[test]
+    fn issuer_matching_uses_name_boundaries() {
+        let metadata = infer_report_metadata_for_issuer(
+            "Pineapple FY2025 annual results, period ended 2025-06-30; reported revenue.",
+            Some("Apple"),
+        )
+        .expect("financial metadata");
+        assert_eq!(metadata.issuer, None);
+
+        let metadata = infer_report_metadata_for_issuer(
+            "Apple Inc. FY2025 annual results, period ended 2025-06-30; reported revenue.",
+            Some("Apple"),
+        )
+        .expect("financial metadata");
+        assert_eq!(metadata.issuer.as_deref(), Some("Apple"));
+    }
+
+    #[test]
+    fn generic_and_financial_observations_keep_their_metadata_alignment() {
+        let context = ResearchContext::new(as_of());
+        context.record_generic_evidence(GenericEvidenceRecord {
+            url: "https://news.example.com/notes".into(),
+            title: Some("Neutral notes".into()),
+            snippet: None,
+            content: None,
+            retrieved_at: as_of(),
+            response_status: Some(200),
+            http_date: None,
+            published_at: None,
+            authority: SourceAuthority::Secondary,
+        });
+        context.record_evidence(evidence(
+            "https://investor.example.com/results",
+            Some(as_of()),
+        ));
+
+        let observations = context.observations();
+        assert_eq!(observations.len(), 2);
+        assert!(observations[0].report_metadata.is_none());
+        assert!(observations[1].report_metadata.is_some());
     }
 
     #[test]
@@ -1629,6 +1080,17 @@ mod tests {
             ReportingCalendar::Fiscal,
             ReportStatus::Reported,
         ));
+        let candidate = FinancialReportCandidate {
+            issuer: "Microsoft".into(),
+            report_type: ReportType::Annual,
+            period_label: "FY2026".into(),
+            period_end: NaiveDate::from_ymd_opt(2026, 6, 30).unwrap(),
+            calendar: ReportingCalendar::Fiscal,
+            status: ReportStatus::Reported,
+            publication_url: "https://investor.example.com/results-primary".into(),
+            publication_date: as_of() - chrono::Duration::days(10),
+        };
+        context.validate_candidate(candidate.clone()).unwrap();
         context.record_evidence(evidence_with_metadata(
             "https://investor.example.com/results-correction",
             as_of() - chrono::Duration::days(5),
@@ -1640,13 +1102,26 @@ mod tests {
         ));
 
         let resolution = context.resolve_latest_report("Microsoft", ReportCadence::Latest);
-        assert_eq!(resolution.status, ResolutionStatus::Resolved);
+        assert_eq!(resolution.status, ResolutionStatus::Conflict);
+        assert!(resolution.selected.is_none());
         assert!(
             resolution
                 .conflicts
                 .iter()
                 .any(|conflict| conflict.contains("Multiple eligible official sources"))
         );
+        assert!(
+            resolution
+                .limitation
+                .as_deref()
+                .is_some_and(|limitation| limitation.contains("unverified"))
+        );
+        assert!(context.validated_report().is_none());
+        assert!(matches!(
+            context.validate_candidate(candidate),
+            Err(ReportValidationError::ConflictingEvidence(_))
+        ));
+        assert!(context.validated_report().is_none());
     }
 
     #[test]

@@ -740,8 +740,7 @@ async fn fallback_results_record_evidence_and_metadata() {
     );
     let result = tool
         .execute(&call(serde_json::json!({
-            "query": "financial report",
-            "issuer": "Example"
+            "query": "financial report"
         })))
         .await;
     bing.handle.join().expect("Bing fixture thread");
@@ -754,6 +753,8 @@ async fn fallback_results_record_evidence_and_metadata() {
     let output: serde_json::Value = serde_json::from_str(&result.output).expect("search JSON");
     assert!(output["results"][0]["retrieved_at"].is_string());
     assert!(output["results"][0]["source_authority"].is_string());
+    assert!(output["results"][0].get("report_metadata").is_none());
+    assert!(context.evidence()[0].report_metadata.is_none());
 }
 
 #[tokio::test]

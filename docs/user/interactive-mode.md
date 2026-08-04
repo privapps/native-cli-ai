@@ -36,6 +36,61 @@ Empty provider responses that are still retrying stay in **thinking** (soft retr
 
 Type your message and press **Enter** to send it to the agent.
 
+### `$skill` References (Guidance Only)
+
+Use `$skill` inside an ordinary interactive prompt to select a discovered
+skill as bounded task guidance:
+
+```text
+$research compare these designs
+Use $rust-review to inspect this change.
+```
+
+A dollar reference is not a command and does not execute a skill. It does not
+change the active model, permission mode, tool capabilities, authorization,
+worktree, or session topology. The existing `/skill` command path remains the
+explicit skill-execution path, including any skill-specific `model`,
+`permission_mode`, or `context: fork` metadata. The model may also use the
+existing `invoke_skill` tool when that tool is available; `$skill` does not
+grant permission to call it.
+
+Reference resolution is exact and case-sensitive. After `$`, nca takes the
+maximal `[A-Za-z0-9._-]+` candidate and resolves it only if that complete
+command is in the current discovered catalog. A reference may start the
+prompt or follow a non-identifier boundary. Unknown candidates are preserved,
+including shell-like `$HOME`, `$1`, currency-like text, and names that are not
+in the catalog. Escape a known-looking reference as `\$skill` to send literal
+`$skill`; the escape backslash is removed. A path-like continuation is kept
+literal as a whole, so `$research/bar` and `$research\bar` are not partially
+resolved. Punctuation is not stripped to find a shorter name: `$research.`
+resolves only if the dotted command `research.` exists.
+
+The same context-independent rules apply in prose, code spans, fenced code,
+and multiline input. Multiple references are deduplicated in first-appearance
+order. nca parses the original interactive text once, before `@file`
+expansion; dollar text introduced by an `@file` or by selected skill content
+is not parsed recursively. Unknown and escaped text remains in the cleaned
+`User request:` section.
+
+Selected content is expanded and inserted below the system and workspace
+instructions in a labeled block as untrusted task guidance. Each skill body is
+limited to 32,000 Unicode characters and newly injected bodies in one turn
+share a 96,000-character aggregate limit. Truncated content includes a visible
+`[skill context truncated]` marker; bodies that arrive after the aggregate
+limit are visibly marked as omitted. The first successful use in this running
+interactive process includes the full bounded body. Later unchanged uses show
+an already-loaded marker. A failed provider turn does not mark the body as
+loaded; changed bodies and references after completed compaction are loaded
+again. Loaded markers are process-local and are not restored across restart or
+session resume.
+
+Catalog failures, empty selected bodies, and other selected-context
+preparation failures are reported locally before the user message is sent.
+Missing optional supporting files retain the existing expanded-body behavior
+when the remaining body is non-empty. `$` references are available only in
+interactive TUI and line-REPL input; one-shot, server, and subagent protocols
+do not interpret them.
+
 ### Shell Commands (`!`)
 
 Prefix with `!` to run a shell command directly. The output is captured and fed into the conversation context.
@@ -64,6 +119,19 @@ fallback when a terminal or multiplexer does not preserve the Shift modifier
 on Enter. Bracketed terminal paste inserts the
 whole payload atomically, preserving paragraph breaks while normalizing CRLF
 and CR to LF; a trailing newline remains in the draft and never submits it.
+
+Some terminals and multiplexers do not preserve modified Enter events. If
+Shift+Enter or Alt+Enter submits instead of inserting a newline inside tmux,
+enable extended-key reporting in `~/.tmux.conf`:
+
+```tmux
+set -s extended-keys on
+set -s extended-keys-format csi-u
+```
+
+Reload or recreate the tmux session after changing the configuration. Ctrl+J
+remains the reliable fallback when the terminal cannot report modified keys.
+
 The composer grows to eight visible rows and follows the cursor for longer
 drafts. Up/Down navigate a non-empty draft, while an empty draft keeps their
 transcript-scrolling behavior. Use **Ctrl+X E** for the external editor when

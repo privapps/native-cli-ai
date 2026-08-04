@@ -4,6 +4,10 @@ use crate::file_mentions::{
 };
 use crate::prompt::NcaPrompt;
 use crate::runner::{SessionRuntime, dispatch_question_answer, dispatch_tool_approval};
+use crate::skill_references::{
+    LoadedSkillContext, PreparedSkillPrompt, complete_skill_references,
+    prepare_skill_references_with_context,
+};
 use crate::slash_commands::{help_lines as registry_help_lines, visible_commands};
 use crate::tui::custom_provider_flow::{CustomProviderProbeOutcome, CustomProviderSetupTransition};
 use crate::tui::{
@@ -297,6 +301,19 @@ pub struct Repl {
     agent_profile: AgentProfile,
     current_agent_label: String,
     pending_custom_setup: Option<CustomProviderSetupSubmission>,
+    loaded_skill_context: LoadedSkillContext,
+}
+
+#[derive(Debug, Clone)]
+struct ReplCompleter {
+    workspace_root: PathBuf,
+    skill_directories: Vec<PathBuf>,
+}
+
+impl ReplCompleter {
+    fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
+        complete_repl_input(line, pos, &self.workspace_root, &self.skill_directories)
+    }
 }
 
 impl Repl {
@@ -313,6 +330,46 @@ impl Repl {
             agent_profile,
             current_agent_label,
             pending_custom_setup: None,
+            loaded_skill_context: LoadedSkillContext::default(),
+        }
+    }
+
+    fn prepare_interactive_prompt(
+        &self,
+        input: &str,
+    ) -> Result<(PreparedSkillPrompt, String), String> {
+        let prepared = prepare_skill_references_with_context(
+            input,
+            self.runtime.workspace_root(),
+            &self.runtime.config().harness.skill_directories,
+            &self.loaded_skill_context,
+        )?;
+        let expanded = expand_at_file_mentions_default(
+            prepared.cleaned_request(),
+            self.runtime.workspace_root(),
+        )
+        .map_err(|error| format!("file mention expansion: {error}"))?;
+        let rendered = prepared.render_with_loaded_context(&expanded, &self.loaded_skill_context);
+        Ok((prepared, rendered))
+    }
+
+    fn finish_skill_prompt_turn(
+        &mut self,
+        prepared: PreparedSkillPrompt,
+        context_epoch: u64,
+        succeeded: bool,
+    ) {
+        if self.runtime.context_compaction_epoch() != context_epoch {
+            // Automatic compaction may have dropped the user turn that
+            // carried the skill body. Make the next explicit reference load
+            // it again instead of relying on a stale marker.
+            self.loaded_skill_context.clear();
+        } else if succeeded {
+            prepared.mark_loaded(&mut self.loaded_skill_context);
+        } else if prepared.has_selected_skills() {
+            // A failed selected-skill turn must be retryable with the full
+            // context, even when an earlier turn had loaded the same skill.
+            self.loaded_skill_context.clear();
         }
     }
 
@@ -397,21 +454,21 @@ impl Repl {
                         continue;
                     }
 
-                    let expanded = match expand_at_file_mentions_default(
-                        &input,
-                        self.runtime.workspace_root(),
-                    ) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            eprintln!("file mention expansion: {e}");
+                    let (prepared, prompt) = match self.prepare_interactive_prompt(&input) {
+                        Ok(prompt) => prompt,
+                        Err(error) => {
+                            eprintln!("{error}");
                             continue;
                         }
                     };
-                    match self.runtime.run_turn(&expanded).await {
+                    let context_epoch = self.runtime.context_compaction_epoch();
+                    match self.runtime.run_turn(&prompt).await {
                         Ok(output) => {
+                            self.finish_skill_prompt_turn(prepared, context_epoch, true);
                             println!("{output}");
                         }
                         Err(err) => {
+                            self.finish_skill_prompt_turn(prepared, context_epoch, false);
                             eprintln!("error: {err}");
                         }
                     }
@@ -1100,7 +1157,11 @@ impl Repl {
     }
 
     fn build_editor(&self) -> anyhow::Result<Reedline> {
-        Self::build_line_editor(Some(self.history_path.clone()))
+        let editor = Self::build_line_editor(Some(self.history_path.clone()))?;
+        Ok(editor.with_completer(Box::new(ReplCompleter {
+            workspace_root: self.runtime.workspace_root().to_path_buf(),
+            skill_directories: self.runtime.config().harness.skill_directories.clone(),
+        })))
     }
 
     /// Build the production line editor with optional persistent history.
@@ -1664,6 +1725,7 @@ impl Repl {
             }
             "/compact" => {
                 let summary = self.runtime.compact_summary();
+                self.loaded_skill_context.clear();
                 self.runtime.set_session_summary(Some(summary.clone()));
                 self.runtime
                     .append_memory_note("session-summary", Some(summary.clone()))
@@ -2099,19 +2161,29 @@ impl Repl {
                             }
                             out.println("[editor] loaded into composer — press Enter to send");
                         } else {
-                            let expanded = match expand_at_file_mentions_default(
-                                &text,
-                                self.runtime.workspace_root(),
-                            ) {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    out.eprintln(&format!("file mention expansion: {e}"));
-                                    text
+                            match self.prepare_interactive_prompt(&text) {
+                                Ok((prepared, prompt)) => {
+                                    let context_epoch = self.runtime.context_compaction_epoch();
+                                    match self.runtime.run_turn(&prompt).await {
+                                        Ok(o) => {
+                                            self.finish_skill_prompt_turn(
+                                                prepared,
+                                                context_epoch,
+                                                true,
+                                            );
+                                            println!("{o}")
+                                        }
+                                        Err(e) => {
+                                            self.finish_skill_prompt_turn(
+                                                prepared,
+                                                context_epoch,
+                                                false,
+                                            );
+                                            eprintln!("error: {e}")
+                                        }
+                                    }
                                 }
-                            };
-                            match self.runtime.run_turn(&expanded).await {
-                                Ok(o) => println!("{o}"),
-                                Err(e) => eprintln!("error: {e}"),
+                                Err(e) => eprintln!("{e}"),
                             }
                         }
                     }
@@ -2221,6 +2293,7 @@ impl Repl {
             },
             "/new" => {
                 let summary = self.runtime.compact_summary();
+                self.loaded_skill_context.clear();
                 self.runtime.set_session_summary(Some(summary.clone()));
                 self.runtime
                     .append_memory_note("session-summary", Some(summary))
@@ -2381,6 +2454,9 @@ impl Repl {
 
         if skill.command == nca_core::tools::autoresearch::AGENT_SKILL_COMMAND {
             self.runtime.authorize_autoresearch();
+        }
+        if skill.command == nca_core::tools::FINANCIAL_RESEARCH_SKILL_COMMAND {
+            self.runtime.authorize_financial_research();
         }
 
         if let Some(model) = &skill.model {
@@ -3161,17 +3237,15 @@ impl Repl {
                         }
                         continue;
                     }
-                    let expanded =
-                        match expand_at_file_mentions_default(&line, self.runtime.workspace_root())
-                        {
-                            Ok(s) => s,
-                            Err(e) => {
-                                if let Ok(mut g) = tui_state.lock() {
-                                    g.push_error(format!("file mentions: {e}"));
-                                }
-                                continue;
+                    let (prepared, prompt) = match self.prepare_interactive_prompt(&line) {
+                        Ok(prompt) => prompt,
+                        Err(error) => {
+                            if let Ok(mut g) = tui_state.lock() {
+                                g.push_error(error);
                             }
-                        };
+                            continue;
+                        }
+                    };
                     if let Ok(mut g) = tui_state.lock() {
                         g.set_busy(true);
                     }
@@ -3182,13 +3256,16 @@ impl Repl {
                     } else {
                         Vec::new()
                     };
+                    let context_epoch = self.runtime.context_compaction_epoch();
                     let turn = if attachments.is_empty() {
-                        self.runtime.run_turn(&expanded).await
+                        self.runtime.run_turn(&prompt).await
                     } else {
                         self.runtime
-                            .run_turn_with_images(&expanded, attachments)
+                            .run_turn_with_images(&prompt, attachments)
                             .await
                     };
+                    let succeeded = turn.is_ok();
+                    self.finish_skill_prompt_turn(prepared, context_epoch, succeeded);
                     if let Err(e) = turn
                         && let Ok(mut g) = tui_state.lock()
                     {
@@ -3254,100 +3331,120 @@ impl Repl {
     }
 }
 
-/// Tab completion for REPL commands and skills
-impl Completer for Repl {
-    fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
-        let mut suggestions = Vec::new();
+/// Tab completion for REPL commands, files, and skill references.
+fn complete_repl_input(
+    line: &str,
+    pos: usize,
+    workspace_root: &Path,
+    skill_directories: &[PathBuf],
+) -> Vec<Suggestion> {
+    let mut suggestions = complete_skill_references(line, pos, workspace_root, skill_directories);
+    if !suggestions.is_empty() {
+        return suggestions;
+    }
 
-        if let Some((at_byte, prefix)) = at_token_before_cursor(line, pos) {
-            let files = discover_workspace_files(self.runtime.workspace_root());
-            for path in filter_paths_prefix(&files, &prefix) {
+    if let Some((at_byte, prefix)) = at_token_before_cursor(line, pos) {
+        let files = discover_workspace_files(workspace_root);
+        for path in filter_paths_prefix(&files, &prefix) {
+            suggestions.push(Suggestion {
+                value: format!("@{path}"),
+                description: Some("workspace file".to_string()),
+                extra: None,
+                span: reedline::Span {
+                    start: at_byte,
+                    end: pos,
+                },
+                append_whitespace: false,
+                style: None,
+            });
+        }
+        if !suggestions.is_empty() {
+            return suggestions;
+        }
+    }
+
+    // Complete REPL commands starting with /
+    if line.starts_with('/') {
+        for spec in visible_commands() {
+            if spec.name.starts_with(line) {
                 suggestions.push(Suggestion {
-                    value: format!("@{path}"),
-                    description: Some("workspace file".to_string()),
+                    value: spec.name.to_string(),
+                    description: Some(spec.description.to_string()),
                     extra: None,
-                    span: reedline::Span {
-                        start: at_byte,
-                        end: pos,
-                    },
-                    append_whitespace: false,
+                    span: reedline::Span { start: 0, end: 0 },
+                    append_whitespace: true,
                     style: None,
                 });
             }
-            if !suggestions.is_empty() {
-                return suggestions;
+        }
+    }
+
+    // Complete bash mode commands (starting with !)
+    if line.starts_with('!') {
+        // Common shell commands
+        let bash_commands = [
+            "git", "ls", "cat", "find", "grep", "npm", "cargo", "make", "docker", "curl",
+        ];
+        for cmd in bash_commands {
+            let full = format!("!{}", cmd);
+            if full.starts_with(line) {
+                suggestions.push(Suggestion {
+                    value: full,
+                    description: Some("Shell command".to_string()),
+                    extra: None,
+                    span: reedline::Span { start: 0, end: 0 },
+                    append_whitespace: true,
+                    style: None,
+                });
             }
         }
+    }
 
-        // Complete REPL commands starting with /
-        if line.starts_with('/') {
-            for spec in visible_commands() {
-                if spec.name.starts_with(line) {
-                    suggestions.push(Suggestion {
-                        value: spec.name.to_string(),
-                        description: Some(spec.description.to_string()),
-                        extra: None,
-                        span: reedline::Span { start: 0, end: 0 },
-                        append_whitespace: true,
-                        style: None,
-                    });
-                }
+    // Keep slash-style skill commands available alongside the built-in
+    // commands. Dollar references are completed by the helper above.
+    if let Ok(skills) = SkillCatalog::discover(workspace_root, skill_directories) {
+        for skill in skills {
+            let skill_cmd = format!("/{}", skill.command);
+            if skill_cmd.starts_with(line) {
+                suggestions.push(Suggestion {
+                    value: skill_cmd,
+                    description: Some(format!(
+                        "{} — {} [{}]{}",
+                        skill.display_label(),
+                        skill.presentation_description(),
+                        skill.directory.display(),
+                        if skill.is_manual_only() {
+                            " · manual-only"
+                        } else {
+                            ""
+                        }
+                    )),
+                    extra: None,
+                    span: reedline::Span { start: 0, end: 0 },
+                    append_whitespace: true,
+                    style: None,
+                });
             }
         }
+    }
 
-        // Complete bash mode commands (starting with !)
-        if line.starts_with('!') {
-            // Common shell commands
-            let bash_commands = [
-                "git", "ls", "cat", "find", "grep", "npm", "cargo", "make", "docker", "curl",
-            ];
-            let _prefix = line.trim_start_matches('!');
-            for cmd in bash_commands {
-                let full = format!("!{}", cmd);
-                if full.starts_with(line) {
-                    suggestions.push(Suggestion {
-                        value: full,
-                        description: Some("Shell command".to_string()),
-                        extra: None,
-                        span: reedline::Span { start: 0, end: 0 },
-                        append_whitespace: true,
-                        style: None,
-                    });
-                }
-            }
-        }
+    suggestions
+}
 
-        // Load skills for completion
-        if let Ok(skills) = SkillCatalog::discover(
+impl Completer for ReplCompleter {
+    fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
+        ReplCompleter::complete(self, line, pos)
+    }
+}
+
+impl Completer for Repl {
+    fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
+        complete_repl_input(
+            line,
+            pos,
             self.runtime.workspace_root(),
             &self.runtime.config().harness.skill_directories,
-        ) {
-            for skill in skills {
-                let skill_cmd = format!("/{}", skill.command);
-                if skill_cmd.starts_with(line) {
-                    suggestions.push(Suggestion {
-                        value: skill_cmd,
-                        description: Some(format!(
-                            "{} — {} [{}]{}",
-                            skill.display_label(),
-                            skill.presentation_description(),
-                            skill.directory.display(),
-                            if skill.is_manual_only() {
-                                " · manual-only"
-                            } else {
-                                ""
-                            }
-                        )),
-                        extra: None,
-                        span: reedline::Span { start: 0, end: 0 },
-                        append_whitespace: true,
-                        style: None,
-                    });
-                }
-            }
-        }
-
-        suggestions
+        )
     }
 }
 
@@ -3553,6 +3650,158 @@ mod tests {
         (format!("http://{address}"), body_rx)
     }
 
+    fn spawn_scripted_skill_provider(
+        responses: Vec<(u16, String)>,
+    ) -> (String, std_mpsc::Receiver<String>) {
+        let server = Server::http("127.0.0.1:0").expect("skill provider fixture");
+        let address = match server.server_addr() {
+            tiny_http::ListenAddr::IP(address) => address,
+            other => panic!("unsupported provider address: {other:?}"),
+        };
+        let (body_tx, body_rx) = std_mpsc::channel();
+        std::thread::spawn(move || {
+            for (status, response) in responses {
+                let mut request = server.recv().expect("skill provider request");
+                let mut body = String::new();
+                request
+                    .as_reader()
+                    .read_to_string(&mut body)
+                    .expect("read skill provider body");
+                body_tx.send(body).expect("capture skill provider body");
+                request
+                    .respond(
+                        Response::from_string(response)
+                            .with_status_code(StatusCode(status))
+                            .with_header(
+                                Header::from_bytes("content-type", "text/event-stream")
+                                    .expect("skill provider content type"),
+                            ),
+                    )
+                    .expect("respond to skill provider request");
+            }
+        });
+        (format!("http://{address}"), body_rx)
+    }
+
+    fn write_interactive_skill(
+        workspace: &std::path::Path,
+        command: &str,
+        body: &str,
+        metadata: &str,
+    ) {
+        let directory = workspace.join(".agents/skills").join(command);
+        std::fs::create_dir_all(&directory).expect("create interactive skill directory");
+        std::fs::write(
+            directory.join("SKILL.md"),
+            format!("---\nname: {command}\ncommand: {command}\n{metadata}---\n{body}"),
+        )
+        .expect("write interactive skill");
+    }
+
+    async fn skill_repl(
+        responses: Vec<(u16, String)>,
+        compatibility: ProviderCompatibility,
+    ) -> (Repl, tempfile::TempDir, std_mpsc::Receiver<String>) {
+        let workspace = tempfile::tempdir().expect("interactive skill workspace");
+        let (base_url, request_bodies) = spawn_scripted_skill_provider(responses);
+        let mut config = NcaConfig::default();
+        config.session.history_dir = workspace.path().join("sessions");
+        config.session.last_session_file = workspace.path().join("last-session");
+        config.memory.file_path = workspace.path().join("memory.json");
+        config.provider.default = ProviderKind::Custom;
+        config.provider.custom.base_url = base_url;
+        config.provider.custom.api_key = Some("skill-reference-test-key".into());
+        config.provider.custom.model = "skill-reference-test-model".into();
+        config.provider.custom.compatibility = compatibility;
+        config.model.default_model = "skill-reference-test-model".into();
+        config.memory.context.auto_detect_context_window = false;
+        config.memory.context.enable_auto_summarize = false;
+        config.memory.context.context_window_target = 200_000;
+        config.memory.context.query_provider_models_api = false;
+        config.harness.skill_directories = vec![PathBuf::from(".agents/skills")];
+        let runtime = build_session_runtime(
+            config,
+            workspace.path(),
+            false,
+            false,
+            false,
+            Some(format!(
+                "skill-reference-repl-test-{}-{}",
+                std::process::id(),
+                NEXT_TEST_RUNTIME_ID.fetch_add(1, Ordering::Relaxed)
+            )),
+            None,
+            None,
+        )
+        .await
+        .expect("interactive skill runtime");
+        (Repl::new(runtime, false, false), workspace, request_bodies)
+    }
+
+    async fn submit_interactive_prompt(repl: &mut Repl, input: &str) -> Result<String, String> {
+        let (prepared, prompt) = repl.prepare_interactive_prompt(input)?;
+        let context_epoch = repl.runtime.context_compaction_epoch();
+        let result = repl
+            .runtime
+            .run_turn(&prompt)
+            .await
+            .map_err(|error| error.to_string());
+        repl.finish_skill_prompt_turn(prepared, context_epoch, result.is_ok());
+        result
+    }
+
+    fn provider_user_prompt(body: &str, compatibility: ProviderCompatibility) -> String {
+        let payload: serde_json::Value = serde_json::from_str(body).expect("provider JSON");
+        match compatibility {
+            ProviderCompatibility::OpenAi => payload["messages"]
+                .as_array()
+                .and_then(|messages| {
+                    messages
+                        .iter()
+                        .rev()
+                        .find(|message| message["role"] == "user")
+                })
+                .and_then(|message| message["content"].as_str())
+                .expect("Chat Completions user prompt")
+                .to_string(),
+            ProviderCompatibility::OpenAiResponses => payload["input"]
+                .as_array()
+                .and_then(|messages| {
+                    messages
+                        .iter()
+                        .rev()
+                        .find(|message| message["role"] == "user")
+                })
+                .and_then(|message| message["content"].as_str())
+                .expect("Responses user prompt")
+                .to_string(),
+            ProviderCompatibility::Anthropic => panic!("test helper only supports OpenAI paths"),
+        }
+    }
+
+    fn responses_text_response(text: &str) -> String {
+        format!(
+            "event: response.output_text.delta\ndata: {}\n\nevent: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{}}}}\n\n",
+            serde_json::json!({
+                "type": "response.output_text.delta",
+                "delta": text,
+            })
+        )
+    }
+
+    fn collect_skill_requests(
+        request_bodies: &std_mpsc::Receiver<String>,
+        count: usize,
+    ) -> Vec<String> {
+        (0..count)
+            .map(|_| {
+                request_bodies
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .expect("scripted skill provider request")
+            })
+            .collect()
+    }
+
     async fn goal_repl(
         responses: Vec<String>,
     ) -> (
@@ -3648,6 +3897,308 @@ mod tests {
             PathBuf::from(workspace.path()),
         )));
         (Repl::new(runtime, false, false), state, workspace)
+    }
+
+    #[tokio::test]
+    async fn interactive_application_flow_records_canonical_prepared_prompt() {
+        let (mut repl, workspace, request_bodies) = skill_repl(
+            vec![(200, goal_text_response("interactive reference complete"))],
+            ProviderCompatibility::OpenAi,
+        )
+        .await;
+        write_interactive_skill(
+            workspace.path(),
+            "research",
+            "Research guidance. It mentions $manual and @missing-support.md.",
+            "",
+        );
+        write_interactive_skill(
+            workspace.path(),
+            "manual",
+            "Manual guidance must remain explicit.",
+            "disable-model-invocation: true\nmodel: special-model\npermission-mode: plan\ncontext: fork\n",
+        );
+        std::fs::write(
+            workspace.path().join("input.txt"),
+            "$manual from the file must remain ordinary file content",
+        )
+        .expect("write interactive input file");
+
+        let model_before = repl.runtime.model().to_string();
+        let permission_before = repl.runtime.permission_mode();
+        let output = submit_interactive_prompt(
+            &mut repl,
+            "Use $research and $manual twice: $research\nCode: `$research` $HOME $1 $unknown $research/bar \\$research $research.\nRead @input.txt",
+        )
+        .await
+        .expect("scripted interactive turn");
+        assert_eq!(output, "interactive reference complete");
+
+        let request = request_bodies
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("prepared prompt request");
+        let prompt = provider_user_prompt(&request, ProviderCompatibility::OpenAi);
+        let user_message = repl
+            .runtime
+            .messages()
+            .iter()
+            .rev()
+            .find(|message| message.role == nca_common::message::Role::User)
+            .expect("canonical user message");
+        assert_eq!(user_message.content.to_summary_text(), prompt);
+        assert_eq!(prompt.matches("Skill `research`:").count(), 1);
+        assert_eq!(prompt.matches("Skill `manual`:").count(), 1);
+        assert!(prompt.contains("Research guidance."));
+        assert!(prompt.contains("Manual guidance must remain explicit."));
+        assert!(prompt.contains("untrusted task guidance"));
+        assert!(prompt.contains("$HOME"));
+        assert!(prompt.contains("$1"));
+        assert!(prompt.contains("$unknown"));
+        assert!(prompt.contains("$research/bar"));
+        assert!(prompt.contains("$research."));
+        assert!(prompt.contains("$manual from the file must remain ordinary file content"));
+        assert!(!prompt.contains("special-model"));
+        assert_eq!(repl.runtime.model(), model_before);
+        assert_eq!(repl.runtime.permission_mode(), permission_before);
+        assert!(repl.runtime.last_turn_tool_error().is_none());
+
+        let session_file = workspace
+            .path()
+            .join("sessions")
+            .join(format!("{}.json", repl.runtime.session_id()));
+        let persisted: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(session_file).expect("canonical prompt session file"),
+        )
+        .expect("persisted session JSON");
+        assert!(persisted["messages"].as_array().is_some_and(|messages| {
+            messages
+                .iter()
+                .any(|message| message["role"] == "user" && message["content"] == prompt)
+        }));
+    }
+
+    #[tokio::test]
+    async fn interactive_application_flow_does_not_reparse_files_or_skill_bodies() {
+        let (mut repl, workspace, request_bodies) = skill_repl(
+            vec![(200, goal_text_response("non recursive"))],
+            ProviderCompatibility::OpenAi,
+        )
+        .await;
+        write_interactive_skill(
+            workspace.path(),
+            "research",
+            "Research body includes $manual and @missing-support.md.",
+            "",
+        );
+        std::fs::write(
+            workspace.path().join("payload.txt"),
+            "$manual from @file must not select the manual skill",
+        )
+        .expect("write recursive parsing payload");
+
+        let output = submit_interactive_prompt(&mut repl, "$research\nRead @payload.txt")
+            .await
+            .expect("non-recursive interactive turn");
+        assert_eq!(output, "non recursive");
+        let request = request_bodies
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("non-recursive provider request");
+        let prompt = provider_user_prompt(&request, ProviderCompatibility::OpenAi);
+        assert_eq!(prompt.matches("Skill `research`:").count(), 1);
+        assert_eq!(prompt.matches("Skill `manual`:").count(), 0);
+        assert!(prompt.contains("Research body includes $manual"));
+        assert!(prompt.contains("$manual from @file must not select the manual skill"));
+    }
+
+    #[tokio::test]
+    async fn interactive_application_flow_covers_truncation_and_ordered_aggregate_bounds() {
+        let (mut repl, workspace, request_bodies) = skill_repl(
+            vec![(200, goal_text_response("bounded"))],
+            ProviderCompatibility::OpenAi,
+        )
+        .await;
+        for command in ["a", "b", "c", "d"] {
+            write_interactive_skill(workspace.path(), command, &"é".repeat(40_000), "");
+        }
+
+        submit_interactive_prompt(&mut repl, "$a $b $c $d bounded")
+            .await
+            .expect("bounded interactive turn");
+        let request = request_bodies
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("bounded provider request");
+        let prompt = provider_user_prompt(&request, ProviderCompatibility::OpenAi);
+        assert!(prompt.find("Skill `a`:").unwrap() < prompt.find("Skill `b`:").unwrap());
+        assert!(prompt.find("Skill `b`:").unwrap() < prompt.find("Skill `c`:").unwrap());
+        assert!(prompt.find("Skill `c`:").unwrap() < prompt.find("Skill `d`:").unwrap());
+        assert!(prompt.contains("[skill context truncated]"));
+        assert!(prompt.contains("[skill context omitted: aggregate limit reached]"));
+        assert!(prompt.contains("User request:\nbounded"));
+    }
+
+    #[tokio::test]
+    async fn interactive_application_flow_recovers_after_failure_body_change_and_compaction() {
+        let (mut repl, workspace, request_bodies) = skill_repl(
+            vec![
+                (200, goal_text_response("first")),
+                (200, goal_text_response("marker")),
+                (500, "temporary provider failure".into()),
+                (200, goal_text_response("retry")),
+                (200, goal_text_response("changed")),
+                (200, goal_text_response("compacted")),
+            ],
+            ProviderCompatibility::OpenAi,
+        )
+        .await;
+        write_interactive_skill(workspace.path(), "research", "version one", "");
+        write_interactive_skill(workspace.path(), "retryable", "retry guidance", "");
+
+        submit_interactive_prompt(&mut repl, "$research first")
+            .await
+            .expect("first lifecycle turn");
+        submit_interactive_prompt(&mut repl, "$research second")
+            .await
+            .expect("already-loaded lifecycle turn");
+        assert!(
+            submit_interactive_prompt(&mut repl, "$retryable failing")
+                .await
+                .is_err()
+        );
+        submit_interactive_prompt(&mut repl, "$retryable retry")
+            .await
+            .expect("retry lifecycle turn");
+
+        write_interactive_skill(workspace.path(), "research", "version two", "");
+        submit_interactive_prompt(&mut repl, "$research changed")
+            .await
+            .expect("changed-body lifecycle turn");
+
+        let state = Arc::new(Mutex::new(TuiSessionState::new(
+            repl.runtime.session_id().to_string(),
+            repl.runtime.model().to_string(),
+            "@build".into(),
+            "default".into(),
+            workspace.path().to_path_buf(),
+        )));
+        repl.handle_command("/compact", ReplOutput::Tui(&state))
+            .await
+            .expect("manual compaction command");
+        submit_interactive_prompt(&mut repl, "$research after compaction")
+            .await
+            .expect("post-compaction lifecycle turn");
+
+        let requests = collect_skill_requests(&request_bodies, 6);
+        let prompts: Vec<_> = requests
+            .iter()
+            .map(|request| provider_user_prompt(request, ProviderCompatibility::OpenAi))
+            .collect();
+        assert!(prompts[0].contains("version one"));
+        assert!(prompts[1].contains("already loaded"));
+        assert!(prompts[1].contains("User request:\nsecond"));
+        assert!(prompts[2].contains("retry guidance"));
+        assert!(prompts[3].contains("retry guidance"));
+        assert!(prompts[4].contains("version two"));
+        assert!(!prompts[4].contains("version one"));
+        assert!(prompts[5].contains("version two"));
+        assert!(!prompts[5].contains("already loaded"));
+    }
+
+    #[tokio::test]
+    async fn interactive_preparation_failures_leave_session_unchanged() {
+        let (repl, _state, workspace) = test_repl(false).await;
+        write_interactive_skill(workspace.path(), "empty", "", "");
+        let before = repl.runtime.messages().to_vec();
+        let empty_error = repl
+            .prepare_interactive_prompt("$empty should fail locally")
+            .expect_err("empty selected body must reject");
+        assert!(empty_error.contains("empty expanded body"));
+        assert_eq!(repl.runtime.messages(), before.as_slice());
+
+        std::fs::remove_dir_all(workspace.path().join(".agents/skills"))
+            .expect("remove skills directory for catalog failure");
+        std::fs::create_dir_all(workspace.path().join(".agents")).expect("create catalog parent");
+        std::fs::write(workspace.path().join(".agents/skills"), "not a directory")
+            .expect("make catalog discovery fail");
+        let catalog_error = repl
+            .prepare_interactive_prompt("$catalog should fail locally")
+            .expect_err("catalog failure must reject before runtime");
+        assert!(catalog_error.contains("failed to read skills dir"));
+        assert_eq!(repl.runtime.messages(), before.as_slice());
+    }
+
+    #[tokio::test]
+    async fn prepared_prompt_is_provider_neutral_for_chat_and_responses() {
+        let mut prompts = Vec::new();
+        for compatibility in [
+            ProviderCompatibility::OpenAi,
+            ProviderCompatibility::OpenAiResponses,
+        ] {
+            let response = match compatibility {
+                ProviderCompatibility::OpenAi => goal_text_response("provider-neutral"),
+                ProviderCompatibility::OpenAiResponses => {
+                    responses_text_response("provider-neutral")
+                }
+                ProviderCompatibility::Anthropic => unreachable!(),
+            };
+            let (mut repl, workspace, request_bodies) =
+                skill_repl(vec![(200, response)], compatibility).await;
+            write_interactive_skill(workspace.path(), "provider-neutral", "shared guidance", "");
+            submit_interactive_prompt(&mut repl, "$provider-neutral compare paths")
+                .await
+                .expect("provider-neutral turn");
+            let request = request_bodies
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("provider-neutral request");
+            prompts.push(provider_user_prompt(&request, compatibility));
+        }
+        assert_eq!(prompts[0], prompts[1]);
+        assert!(prompts[0].contains("shared guidance"));
+        assert!(prompts[0].contains("User request:\ncompare paths"));
+    }
+
+    #[test]
+    fn line_and_tui_completion_dispatch_preserves_prose_and_manual_only_skills() {
+        let workspace = tempfile::tempdir().expect("completion workspace");
+        write_interactive_skill(
+            workspace.path(),
+            "manual-review",
+            "manual review guidance",
+            "disable-model-invocation: true\n",
+        );
+        write_interactive_skill(workspace.path(), "research", "research guidance", "");
+        let dirs = [PathBuf::from(".agents/skills")];
+        let line = "before $man after";
+        let cursor = line.find("$man").unwrap() + "$man".len();
+        let line_suggestions = complete_repl_input(line, cursor, workspace.path(), &dirs);
+        assert_eq!(line_suggestions[0].value, "$manual-review");
+        assert!(!line_suggestions[0].append_whitespace);
+        assert_eq!(line_suggestions[0].span.start, line.find('$').unwrap());
+        let commands: Vec<_> = SkillCatalog::discover(workspace.path(), &dirs)
+            .expect("completion catalog")
+            .into_iter()
+            .map(|skill| skill.command)
+            .collect();
+        let tui_matches =
+            crate::skill_references::matching_skill_reference_commands(line, cursor, &commands);
+        assert_eq!(tui_matches, vec!["$manual-review"]);
+        let (replaced, new_cursor) =
+            crate::skill_references::apply_skill_reference_completion_with_space(
+                line,
+                cursor,
+                &tui_matches[0],
+            )
+            .expect("TUI completion replacement");
+        assert_eq!(replaced, "before $manual-review after");
+        assert_eq!(new_cursor, "before $manual-review".chars().count());
+
+        let end_line = "$res";
+        let end_suggestions =
+            complete_repl_input(end_line, end_line.len(), workspace.path(), &dirs);
+        assert!(
+            end_suggestions
+                .iter()
+                .any(|suggestion| suggestion.value == "$research" && suggestion.append_whitespace)
+        );
     }
 
     fn app_key(code: KeyCode) -> KeyEvent {
@@ -4611,6 +5162,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_financial_skill_command_loads_instructions_and_enables_tools() {
+        let workspace = tempfile::tempdir().expect("financial skill workspace");
+        let (base_url, request_bodies) = spawn_goal_provider_with_delay(
+            vec![goal_text_response("financial skill loaded")],
+            std::time::Duration::ZERO,
+        );
+        let mut config = NcaConfig::default();
+        config.provider.default = ProviderKind::Custom;
+        config.provider.custom.base_url = base_url;
+        config.provider.custom.api_key = Some("financial-skill-test-key".into());
+        config.provider.custom.model = "financial-skill-test-model".into();
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAi;
+        config.model.default_model = "financial-skill-test-model".into();
+        config.session.history_dir = workspace.path().join("sessions");
+        config.session.last_session_file = workspace.path().join("last-session");
+        config.memory.file_path = workspace.path().join("memory.json");
+        config.memory.context.auto_detect_context_window = false;
+        config.memory.context.query_provider_models_api = false;
+
+        let runtime = build_session_runtime(
+            config,
+            workspace.path(),
+            false,
+            false,
+            false,
+            Some(format!(
+                "financial-skill-repl-test-{}-{}",
+                std::process::id(),
+                NEXT_TEST_RUNTIME_ID.fetch_add(1, Ordering::Relaxed)
+            )),
+            None,
+            None,
+        )
+        .await
+        .expect("financial skill runtime");
+        let state = Arc::new(Mutex::new(TuiSessionState::new(
+            runtime.session_id().to_string(),
+            runtime.model().to_string(),
+            "@build".into(),
+            "default".into(),
+            PathBuf::from(workspace.path()),
+        )));
+        let mut repl = Repl::new(runtime, false, false);
+
+        repl.handle_command(
+            "/financial-research research Microsoft's latest reported results",
+            ReplOutput::Tui(&state),
+        )
+        .await
+        .expect("explicit financial skill command");
+
+        let request = request_bodies
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("financial skill provider request");
+        assert!(request.contains("Use this skill only when the user explicitly requests"));
+        assert!(request.contains("resolve_latest_financial_report"));
+        assert!(request.contains("write_validated_financial_report"));
+    }
+
+    #[tokio::test]
     async fn skill_completion_uses_catalog_presentation_and_source_metadata() {
         let (mut repl, _state, workspace) = test_repl(false).await;
         let skill_dir = workspace.path().join(".agents/skills/catalog-presentation");
@@ -4636,6 +5247,48 @@ mod tests {
         assert!(description.contains("Inspect a diff"));
         assert!(description.contains(".agents/skills/catalog-presentation"));
         assert!(description.contains("manual-only"));
+
+        let line = "Use $catalog and keep this suffix";
+        let cursor = line.find("$catalog").unwrap() + "$catalog".len();
+        let dollar_suggestions = repl.complete(line, cursor);
+        let dollar_suggestion = dollar_suggestions
+            .iter()
+            .find(|suggestion| suggestion.value == "$catalog-presentation")
+            .expect("dollar skill completion");
+        assert_eq!(dollar_suggestion.span.start, line.find('$').unwrap());
+        assert_eq!(dollar_suggestion.span.end, cursor);
+        assert!(!dollar_suggestion.append_whitespace);
+        assert_eq!(&line[cursor..], " and keep this suffix");
+
+        let mut line_completer = ReplCompleter {
+            workspace_root: workspace.path().to_path_buf(),
+            skill_directories: vec![PathBuf::from(".agents/skills")],
+        };
+        let dispatched = <ReplCompleter as Completer>::complete(&mut line_completer, line, cursor);
+        assert_eq!(
+            dispatched
+                .iter()
+                .find(|suggestion| suggestion.value == "$catalog-presentation")
+                .map(|suggestion| suggestion.append_whitespace),
+            Some(false)
+        );
+
+        let end_line = "Use $catalog";
+        let end_suggestions =
+            <ReplCompleter as Completer>::complete(&mut line_completer, end_line, end_line.len());
+        assert_eq!(
+            end_suggestions
+                .iter()
+                .find(|suggestion| suggestion.value == "$catalog-presentation")
+                .map(|suggestion| suggestion.append_whitespace),
+            Some(true)
+        );
+
+        let escaped = r"Use \$catalog";
+        assert!(
+            <ReplCompleter as Completer>::complete(&mut line_completer, escaped, escaped.len())
+                .is_empty()
+        );
     }
 
     #[test]

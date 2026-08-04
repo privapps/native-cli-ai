@@ -4,7 +4,7 @@
 **Status:** Complete
 **Date:** 2026-08-02
 **Related:** Archived feature specifications under `.archive/`
-**Last verified:** 2026-08-02 (13-bundle archive audit; docs, reference, spec, and diff checks)
+**Last verified:** 2026-08-03 (14-bundle archive audit; docs, reference, spec, and diff checks)
 
 ## Goal
 
@@ -61,6 +61,7 @@ an earlier specification.
   | `custom-responses-function-call-identity` | [`user/providers.md`](../../user/providers.md), [`reference/architecture.md`](../../reference/architecture.md) |
   | `duckduckgo-search-throttling` | [`user/tools.md`](../../user/tools.md), [`user/configuration.md`](../../user/configuration.md) |
   | `financial-research-and-provider-hardening` | [`user/tools.md`](../../user/tools.md), [`user/configuration.md`](../../user/configuration.md), [`reference/architecture.md`](../../reference/architecture.md) |
+  | `financial-research-boundary` | [`user/tools.md`](../../user/tools.md), [`user/skills.md`](../../user/skills.md), [`reference/architecture.md`](../../reference/architecture.md) |
   | `goal-command` | [`user/interactive-mode.md`](../../user/interactive-mode.md), [`user/configuration.md`](../../user/configuration.md), [`reference/architecture.md`](../../reference/architecture.md) |
   | `latest-financial-report-freshness` | [`user/tools.md`](../../user/tools.md), [`reference/architecture.md`](../../reference/architecture.md) |
   | `reasoning-effort` | [`user/providers.md`](../../user/providers.md), [`user/configuration.md`](../../user/configuration.md), [`user/interactive-mode.md`](../../user/interactive-mode.md) |
@@ -80,6 +81,7 @@ an earlier specification.
 - `.archive/reasoning-effort/spec.md`
 - `.archive/tui-newline-shortcuts/spec.md`
 - `.archive/financial-research-and-provider-hardening/spec.md`
+- `.archive/financial-research-boundary/spec.md`
 - `crates/common/src/config.rs`
 - `crates/core/src/research.rs`
 - `crates/tui/src/tui/transcript.rs`

@@ -28,6 +28,15 @@ The built-in roots are:
 | Workspace agent skills | `<workspace>/.agents/skills/` | Always-discovered workspace-compatible skills |
 | Workspace manifest | `<workspace>/AGENTS.md` | Root instructions plus `##` skill projections |
 
+The product also ships selected manual-only skills inside the `nca` binary.
+These embedded skills are the final discovery fallback, so a clean installation
+does not depend on the ignored repository `skills/` directory or a manually
+copied product directory. Repository and user skills with the same command
+continue to take precedence. The shipped `financial-research` skill is
+available through explicit `/financial-research` selection, but is excluded
+from the model's implicit skill catalog and enables its specialized financial
+tools only after that explicit selection.
+
 `AGENTS.md` is parsed before filesystem skills, so its command wins over a
 duplicate filesystem command. Filesystem roots keep their configured order;
 the workspace `.agents/skills` fallback is still checked when a custom list
@@ -122,6 +131,29 @@ descriptions. Use Up/Down (or `j`/`k`) to select a row. Enter inserts
 `/<skill> ` into the composer without executing it; add a task and submit the
 draft normally. Escape or `q` closes the picker without changing the draft.
 Rows include the source directory and mark manual-only skills.
+
+### Dollar Reference
+
+In an interactive prompt, type `$` to complete a discovered skill reference:
+
+```text
+$research compare these designs
+Use both $research and $graphify to analyze this repository.
+```
+
+`$skill` adds bounded `SKILL.md` guidance to that turn; it does not execute a
+skill or grant permissions. References can appear inline, are resolved only
+for exact discovered names, and can be repeated without duplicating the
+context. Unknown `$tokens`, environment-style forms such as `$HOME`, escaped
+references (`\$skill`), and path-like forms remain ordinary text. The skill
+body is treated as untrusted task guidance and cannot override system
+ instructions, tool permissions, or safety policy.
+
+Each selected body is limited to 32,000 Unicode characters, and newly injected
+bodies in one turn share a 96,000-character aggregate limit. Oversized content
+shows a truncation marker; later bodies omitted by the aggregate limit show an
+explicit omission marker. Use `/skill` or the existing `invoke_skill` path for
+the established execution/loading behavior and its normal authorization.
 
 ## Writing Skills
 

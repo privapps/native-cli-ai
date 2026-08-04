@@ -13,6 +13,7 @@ pub mod ipc_pending;
 pub mod prompt;
 pub mod repl;
 pub mod runner;
+pub mod skill_references;
 pub mod slash_commands;
 pub mod tui;
 

@@ -139,11 +139,10 @@ Search the public web and return titles, URLs, snippets, and provenance metadata
 **Parameters:**
 - `query` (string, required) — Search query
 - `limit` (int, optional) — Number of results (1–10, default from config)
-- `domains` (array of strings, optional) — Domains to add as search hints, such as an issuer investor-relations site or `sec.gov`
-- `issuer` (string, optional) — Issuer name to bind inferred report metadata to the requested company
+- `domains` (array of strings, optional) — Domains to add as search hints, such as an investor-relations site or `sec.gov`; domain hints do not change the neutral evidence contract
 - `as_of` is supplied by the runtime turn context and is not a caller-controlled field
 
-**Behavior:** Searches Bing RSS first, then falls back to DuckDuckGo HTML when Bing is empty, blocked, malformed, or unavailable. Bing uses a GET RSS request with `q`, English locale, and RSS-format query parameters. DuckDuckGo uses the Capelin-compatible POST form profile and resolves its redirect URLs to destination URLs. Transport failures and retryable HTTP statuses are retried inside the provider operation. DuckDuckGo additionally uses one process-wide serialized limiter shared by runtime sessions, with request-start spacing and bounded challenge cooldown; Bing does not use that limiter. Results are returned as JSON with the query, date-only UTC turn `as_of`, retrieval timestamp, URL, source authority, available publication metadata, and an `eligible_as_of` flag. Unknown metadata remains `null`; the upstream search response is not assumed to support an exact date filter. If both providers fail, the tool returns one provider-aware failure and the agent does not repeat the exhausted search operation automatically.
+**Behavior:** Searches Bing RSS first, then falls back to DuckDuckGo HTML when Bing is empty, blocked, malformed, or unavailable. Bing uses a GET RSS request with `q`, English locale, and RSS-format query parameters. DuckDuckGo uses the Capelin-compatible POST form profile and resolves its redirect URLs to destination URLs. Transport failures and retryable HTTP statuses are retried inside the provider operation. DuckDuckGo additionally uses one process-wide serialized limiter shared by runtime sessions, with request-start spacing and bounded challenge cooldown; Bing does not use that limiter. Results are returned as neutral evidence in JSON with the query, date-only UTC turn `as_of`, retrieval timestamp, URL, source authority, available publication metadata, and an `eligible_as_of` flag. Unknown metadata remains `null`; the upstream search response is not assumed to support an exact date filter. The tool does not accept an issuer or infer financial report meaning; financial policy interprets the recorded evidence when a financial workflow uses it. If both providers fail, the tool returns one provider-aware failure and the agent does not repeat the exhausted search operation automatically.
 
 #### Search failure classification and recovery
 
@@ -172,9 +171,8 @@ Fetch and normalize the text content of a URL while preserving provenance.
 
 **Parameters:**
 - `url` (string, required) — The URL to fetch
-- `issuer` (string, optional) — Issuer name to require in the fetched evidence for financial-report resolution
 
-**Behavior:** Makes an HTTP GET request, records the final URL, response status, retrieval timestamp, HTTP `Date` header when present, source authority, and common publication/report metadata, then strips HTML to text content and truncates to `max_fetch_chars` (default 25,000 characters). The result is JSON containing `source` metadata and normalized `content`; `source.as_of` is the immutable date-only UTC boundary for the current turn, and `source.eligible_as_of` is `true` only when the observed publication date is on or before that date. Missing metadata remains `null`. When `issuer` is supplied, metadata is recorded only if the normalized page visibly names that issuer.
+**Behavior:** Makes an HTTP GET request, records the final URL, response status, retrieval timestamp, HTTP `Date` header when present, source authority, and common publication/report metadata, then strips HTML to text content and truncates to `max_fetch_chars` (default 25,000 characters). The result is JSON containing neutral evidence in `source` metadata and normalized `content`; `source.as_of` is the immutable date-only UTC boundary for the current turn, and `source.eligible_as_of` is `true` only when the observed publication date is on or before that date. Missing metadata remains `null`. The tool does not interpret issuer identity or financial-report eligibility; financial policy evaluates those properties from the recorded evidence.
 
 ---
 
@@ -188,7 +186,7 @@ Use the returned verified record when composing a financial report. Include the 
 
 Resolves the newest eligible result already observed by `web_search` or `fetch_url`. The required `issuer` identifies the report being requested and `cadence` is `latest`, `annual`, or `quarterly`. Results are ranked by completed period end, then publication time, then source authority; a year token or search-result order is not used.
 
-An `annual` request uses the newest eligible annual result when one exists. If a newer observed annual period is future, unpublished, or otherwise ineligible, an older annual is returned as a `fallback` with a limitation. If no eligible annual result is available but a verified quarter is available, the tool returns `status: "fallback"`, the quarterly record, and a limitation explaining that it must not be treated as annual. A `latest` request selects the newest eligible result regardless of cadence and still reports its actual type. An unavailable result is returned explicitly with `status: "unavailable"` and a limitation rather than fabricating a report. Conflicting official evidence is retained in `conflicts` and the selected source is deterministic.
+An `annual` request uses the newest eligible annual result when one exists. If a newer observed annual period is future, unpublished, or otherwise ineligible, an older annual is returned as a `fallback` with a limitation. If no eligible annual result is available but a verified quarter is available, the tool returns `status: "fallback"`, the quarterly record, and a limitation explaining that it must not be treated as annual. A `latest` request selects the newest eligible result regardless of cadence and still reports its actual type. An unavailable result is returned explicitly with `status: "unavailable"` and a limitation rather than fabricating a report. Conflicting official evidence is retained in `conflicts`, returns `status: "conflict"` with no selected report, and remains visible for reconciliation.
 
 When a financial-looking final response cannot satisfy the verification metadata requirements, nca annotates structured JSON with `verification_status: "unverified"` and a `verification_warning`; it does not silently promote the response to verified. The fallback or unavailable limitation remains part of the structured resolution.
 
@@ -387,6 +385,12 @@ Ask the user a structured question with predefined options.
 ### `invoke_skill`
 
 Load a skill's full instructions by name.
+
+`invoke_skill` is separate from the interactive `$skill` reference syntax.
+Typing `$skill` supplies bounded, labeled guidance only; it does not execute
+this tool or grant its permission. Use the existing `/skill` command or this
+tool's normal authorization path when skill execution/loading is explicitly
+requested.
 
 **Parameters:**
 - `skill_name` (string, required) — Name of the skill to invoke
