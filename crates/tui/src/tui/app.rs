@@ -43,6 +43,7 @@ use nca_common::event::{BusyState, QuestionSelection};
 use nca_core::approval::suggest_allow_pattern;
 use nca_core::skills::SkillCatalog;
 use ratatui::{
+    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
@@ -53,6 +54,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Debug)]
 pub enum TuiCmd {
@@ -129,6 +131,384 @@ pub enum TuiCmd {
 
 const MOUSE_SCROLL_LINES: usize = 3;
 
+/// Maximum width of the question overlay. Unlike the other picker overlays,
+/// questions size themselves from their content up to this limit and then
+/// clamp to the terminal.
+pub(crate) const QUESTION_POPUP_MAX_WIDTH: u16 = 72;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QuestionPopupLayout {
+    pub(crate) popup_area: Rect,
+    pub(crate) inner_width: u16,
+    pub(crate) prompt_lines: Vec<String>,
+    pub(crate) option_start: usize,
+    pub(crate) option_end: usize,
+    pub(crate) option_line_counts: Vec<usize>,
+    pub(crate) option_row_budget: usize,
+    pub(crate) indicator_lines: Vec<String>,
+    pub(crate) footer_lines: Vec<String>,
+    pub(crate) spacer_rows: usize,
+}
+
+/// Wrap a question-owned string before giving it to `Paragraph`.
+///
+/// Paragraph wrapping is display-only, which made it impossible for the old
+/// fixed-height formula to know how many rows a prompt or option consumed.
+/// Keeping the wrapping here means sizing and rendering use the same logical
+/// rows, including hard-wrapped words and wide unicode characters.
+fn wrap_question_text(text: &str, width: u16) -> Vec<String> {
+    let width = usize::from(width.max(1));
+    let mut result = Vec::new();
+
+    for paragraph in text.split('\n') {
+        if paragraph.trim().is_empty() {
+            result.push(String::new());
+            continue;
+        }
+
+        let mut current = String::new();
+        for word in paragraph.split_whitespace() {
+            let word_width = UnicodeWidthStr::width(word);
+            if word_width > width {
+                if !current.is_empty() {
+                    result.push(std::mem::take(&mut current));
+                }
+                for ch in word.chars() {
+                    let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if !current.is_empty()
+                        && UnicodeWidthStr::width(current.as_str()) + ch_width > width
+                    {
+                        result.push(std::mem::take(&mut current));
+                    }
+                    current.push(ch);
+                }
+            } else if current.is_empty() {
+                current.push_str(word);
+            } else if UnicodeWidthStr::width(current.as_str()) + 1 + word_width <= width {
+                current.push(' ');
+                current.push_str(word);
+            } else {
+                result.push(std::mem::take(&mut current));
+                current.push_str(word);
+            }
+        }
+        if !current.is_empty() {
+            result.push(current);
+        }
+    }
+
+    if result.is_empty() {
+        result.push(String::new());
+    }
+    result
+}
+
+fn question_popup_item_count(q: &nca_common::event::InteractiveQuestionPayload) -> usize {
+    1 + q.options.len() + usize::from(q.allow_custom)
+}
+
+fn question_popup_item_text(
+    q: &nca_common::event::InteractiveQuestionPayload,
+    index: usize,
+    selected: bool,
+) -> String {
+    let marker = if selected { " ► " } else { "   " };
+    if index == 0 {
+        format!("{marker}Suggested: {}", q.suggested_answer)
+    } else if index <= q.options.len() {
+        format!("{marker}{}", q.options[index - 1].label)
+    } else {
+        format!("{marker}Chat about this")
+    }
+}
+
+fn question_popup_indicator_lines(above: bool, below: bool, width: u16) -> Vec<String> {
+    if !above && !below {
+        return Vec::new();
+    }
+    let text = match (above, below) {
+        (true, true) => " ▲ More above · ▼ More below",
+        (true, false) => " ▲ More above (Up)",
+        (false, true) => " ▼ More below (Down)",
+        (false, false) => unreachable!(),
+    };
+    wrap_question_text(text, width)
+}
+
+fn question_popup_width(area: Rect, q: &nca_common::event::InteractiveQuestionPayload) -> u16 {
+    let mut widest = UnicodeWidthStr::width(q.prompt.as_str());
+    widest = widest.max(UnicodeWidthStr::width(
+        format!("Suggested: {}", q.suggested_answer).as_str(),
+    ));
+    for option in &q.options {
+        widest = widest.max(UnicodeWidthStr::width(option.label.as_str()));
+    }
+    if q.allow_custom {
+        widest = widest.max(UnicodeWidthStr::width("Chat about this"));
+    }
+    widest = widest.max(UnicodeWidthStr::width(
+        " ↑↓ select · Enter confirm · Esc chat ",
+    ));
+    let desired = widest
+        .saturating_add(6)
+        .max(44)
+        .min(usize::from(QUESTION_POPUP_MAX_WIDTH));
+    let available = area.width.saturating_sub(2);
+    if available == 0 {
+        area.width.min(desired as u16)
+    } else {
+        desired.min(usize::from(available)) as u16
+    }
+}
+
+fn question_popup_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let popup_w = width
+        .min(area.width.saturating_sub(2).max(20))
+        .min(area.width);
+    let popup_h = height.min(area.height);
+    Rect::new(
+        area.x + area.width.saturating_sub(popup_w) / 2,
+        area.y + area.height.saturating_sub(popup_h) / 2,
+        popup_w,
+        popup_h,
+    )
+}
+
+///
+/// `requested_scroll` is the existing `QuestionModal` scroll offset. The
+/// selected item is always brought into the returned logical range; the draw
+/// path writes `option_start` back to that same overlay state. Option labels
+/// are sized in wrapped display rows, while scrolling itself remains by
+/// logical option, preserving the answer contract.
+pub(crate) fn question_popup_layout(
+    area: Rect,
+    q: &nca_common::event::InteractiveQuestionPayload,
+    selected: usize,
+    requested_scroll: usize,
+) -> QuestionPopupLayout {
+    let popup_width = question_popup_width(area, q);
+    let inner_width = popup_width.saturating_sub(2).max(1);
+    let item_count = question_popup_item_count(q);
+    let selected = selected.min(item_count.saturating_sub(1));
+
+    let raw_prompt_lines = wrap_question_text(&format!(" {} ", q.prompt), inner_width);
+    let footer_text = if q.allow_custom {
+        " ↑↓ select · Enter confirm · Esc chat "
+    } else {
+        " ↑↓ select · Enter confirm "
+    };
+    let footer_lines = wrap_question_text(footer_text, inner_width);
+
+    // Keep the footer and at least one logical option available in a short
+    // terminal. Tall terminals retain the complete wrapped prompt.
+    let prompt_cap = usize::from(area.height)
+        .saturating_sub(4 + footer_lines.len())
+        .max(1);
+    let prompt_lines = raw_prompt_lines
+        .into_iter()
+        .take(prompt_cap)
+        .collect::<Vec<_>>();
+
+    let option_line_counts = (0..item_count)
+        .map(|index| {
+            wrap_question_text(
+                &question_popup_item_text(q, index, index == selected),
+                inner_width,
+            )
+            .len()
+        })
+        .collect::<Vec<_>>();
+    let compact_chrome = 2 + prompt_lines.len() + footer_lines.len();
+    let full_compact_height = compact_chrome + option_line_counts.iter().sum::<usize>();
+    let border_rows = 2;
+    let spacer_rows = 0;
+    let chrome_rows = compact_chrome + spacer_rows;
+
+    if full_compact_height
+        .saturating_add(spacer_rows)
+        .saturating_add(border_rows)
+        <= usize::from(area.height)
+    {
+        let popup_height = border_rows + full_compact_height + spacer_rows;
+        let option_rows = option_line_counts.iter().sum();
+        return QuestionPopupLayout {
+            popup_area: question_popup_rect(area, popup_width, popup_height as u16),
+            inner_width,
+            prompt_lines,
+            option_start: 0,
+            option_end: item_count,
+            option_line_counts,
+            option_row_budget: option_rows,
+            indicator_lines: Vec::new(),
+            footer_lines,
+            spacer_rows,
+        };
+    }
+
+    let worst_indicator_rows = question_popup_indicator_lines(true, true, inner_width).len();
+    let option_row_budget = usize::from(area.height)
+        .saturating_sub(border_rows)
+        .saturating_sub(chrome_rows + worst_indicator_rows)
+        .max(1);
+    let max_start = item_count.saturating_sub(1);
+    let mut option_start = requested_scroll.min(max_start);
+    let fit_end = |start: usize| {
+        let mut rows = 0;
+        let mut end = start;
+        while end < item_count {
+            let next_rows = rows + option_line_counts[end];
+            if end > start && next_rows > option_row_budget {
+                break;
+            }
+            rows = next_rows;
+            end += 1;
+            if rows >= option_row_budget {
+                break;
+            }
+        }
+        end.max((start + 1).min(item_count))
+    };
+    let mut option_end = fit_end(option_start);
+    if selected < option_start {
+        option_start = selected;
+        option_end = fit_end(option_start);
+    } else if selected >= option_end {
+        // When moving down, retain as much context as fits before the selected
+        // item instead of showing the selected row alone at the top.
+        option_start = selected;
+        let mut rows = option_line_counts[selected];
+        while option_start > 0 && rows + option_line_counts[option_start - 1] <= option_row_budget {
+            option_start -= 1;
+            rows += option_line_counts[option_start];
+        }
+        option_end = fit_end(option_start);
+    }
+
+    let above = option_start > 0;
+    let below = option_end < item_count;
+    let indicator_lines = question_popup_indicator_lines(above, below, inner_width);
+    let visible_option_rows = option_line_counts[option_start..option_end]
+        .iter()
+        .sum::<usize>()
+        .min(option_row_budget);
+    let popup_height = border_rows + chrome_rows + visible_option_rows + indicator_lines.len();
+
+    QuestionPopupLayout {
+        popup_area: question_popup_rect(area, popup_width, popup_height as u16),
+        inner_width,
+        prompt_lines,
+        option_start,
+        option_end,
+        option_line_counts,
+        option_row_budget,
+        indicator_lines,
+        footer_lines,
+        spacer_rows,
+    }
+}
+
+/// Render the production question modal popup into a ratatui frame.
+///
+/// The helper owns both layout calculation and line emission so in-memory
+/// render tests exercise the same path as the interactive TUI. It returns the
+/// layout used for the draw, or `None` when the question modal is not active.
+pub(crate) fn render_question_popup(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &mut TuiSessionState,
+) -> Option<QuestionPopupLayout> {
+    if !state.question_modal_open() {
+        return None;
+    }
+    let q = state.active_question.clone()?;
+    let layout = question_popup_layout(
+        area,
+        &q,
+        state.question_modal_index(),
+        state.question_modal_scroll(),
+    );
+    if layout.option_start != state.question_modal_scroll()
+        && let Some(scroll) = state.question_modal_scroll_mut()
+    {
+        *scroll = layout.option_start;
+    }
+
+    let mut lines: Vec<Line> = layout
+        .prompt_lines
+        .iter()
+        .map(|line| {
+            Line::from(Span::styled(
+                line.clone(),
+                Style::default()
+                    .fg(theme::ASSISTANT)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        })
+        .collect();
+    lines.push(Line::default());
+    for line in &layout.indicator_lines {
+        lines.push(Line::from(Span::styled(
+            line.clone(),
+            Style::default().fg(theme::MUTED),
+        )));
+    }
+
+    // A wrapped option can be taller than a very short terminal's remaining
+    // option budget. Stop at the rows reserved by the layout so the footer is
+    // never pushed outside the popup by rendering overflow.
+    let selected = state.question_modal_index();
+    let mut remaining_option_rows = layout.option_row_budget;
+    for index in layout.option_start..layout.option_end {
+        if remaining_option_rows == 0 {
+            break;
+        }
+        let selected_item = index == selected;
+        let style = if selected_item {
+            Style::default()
+                .fg(Color::Black)
+                .bg(theme::USER)
+                .add_modifier(Modifier::BOLD)
+        } else if q.allow_custom && index == 1 + q.options.len() {
+            Style::default()
+                .fg(theme::MUTED)
+                .add_modifier(Modifier::ITALIC)
+        } else {
+            Style::default().fg(theme::TEXT)
+        };
+        let option_lines = wrap_question_text(
+            &question_popup_item_text(&q, index, selected_item),
+            layout.inner_width,
+        );
+        let rendered_rows = option_lines.len().min(remaining_option_rows);
+        for option_line in option_lines.into_iter().take(rendered_rows) {
+            lines.push(Line::from(Span::styled(option_line, style)));
+        }
+        remaining_option_rows -= rendered_rows;
+    }
+    lines.push(Line::default());
+    for _ in 0..layout.spacer_rows {
+        lines.push(Line::default());
+    }
+    for line in &layout.footer_lines {
+        lines.push(Line::from(Span::styled(
+            line.clone(),
+            Style::default().fg(theme::MUTED),
+        )));
+    }
+
+    frame.render_widget(ClearWidget, layout.popup_area);
+    let popup = Paragraph::new(Text::from(lines))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::BORDER))
+                .title(Span::styled(" question ", Style::default().fg(theme::WARN))),
+        )
+        .style(Style::default().bg(theme::SURFACE));
+    frame.render_widget(popup, layout.popup_area);
+    Some(layout)
+}
+
 fn newline_key_inserts_newline(key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Enter => {
@@ -146,6 +526,7 @@ fn handle_newline_key(state: &mut TuiSessionState, key: KeyEvent) -> bool {
         return false;
     }
 
+    state.detach_prompt_history();
     let (buffer, cursor) = insert_text_at_cursor(&state.input_buffer, state.cursor_char_idx, "\n");
     state.input_buffer = buffer;
     state.cursor_char_idx = cursor;
@@ -373,12 +754,96 @@ fn dispatch_paste(state: &mut TuiSessionState, text: &str) -> bool {
         return true;
     }
 
+    state.detach_prompt_history();
     let (buffer, cursor) =
         insert_text_at_cursor(&state.input_buffer, state.cursor_char_idx, &multiline);
     state.input_buffer = buffer;
     state.cursor_char_idx = cursor;
     state.slash_menu_index = 0;
     true
+}
+
+fn transcript_scroll_metrics(
+    state: &mut TuiSessionState,
+    area: Rect,
+    slash_entries: &[crate::tui::composer::SlashEntry],
+    workspace_files: &[String],
+    dollar_skill_commands: &[String],
+) -> (usize, usize) {
+    let (main_area, _) = layout_with_sidebar(area);
+    let history_navigating = state.prompt_history_is_navigating();
+    let dollar_matches = if history_navigating {
+        Vec::new()
+    } else {
+        matching_skill_reference_commands(
+            &state.input_buffer,
+            cursor_byte_index(&state.input_buffer, state.cursor_char_idx),
+            dollar_skill_commands,
+        )
+    };
+    let chrome_height = if history_navigating {
+        0
+    } else {
+        composer_chrome_height(
+            slash_entries,
+            workspace_files,
+            &state.input_buffer,
+            state.cursor_char_idx,
+        )
+        .max(at_panel_height(dollar_matches.len()))
+    };
+    let input_height = composer_input_height_with_width(
+        &state.input_buffer,
+        usize::from(!state.staged_image_attachments.is_empty()) + 1,
+        main_area.width as usize,
+    );
+    let (transcript_area, _, _, _) = layout_chunks(main_area, chrome_height, input_height);
+    let inner_width = transcript_area.width.saturating_sub(2);
+    let total = ensure_transcript_cache(state, inner_width).lines.len();
+    let viewport = transcript_area.height.saturating_sub(2) as usize;
+    (total.saturating_sub(viewport), viewport.max(1))
+}
+
+/// Application-level seam for the history-owned arrow-key cases.
+///
+/// Returning `true` means the caller must not offer the same key to completion,
+/// multiline cursor movement, or transcript scrolling.
+pub(crate) fn handle_prompt_history_key(state: &mut TuiSessionState, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Up if state.prompt_history_is_navigating() || state.input_buffer.is_empty() => {
+            if let Some((buffer, cursor)) = state.prompt_history_previous() {
+                state.input_buffer = buffer;
+                state.cursor_char_idx = cursor;
+            }
+            true
+        }
+        KeyCode::Down if state.prompt_history_is_navigating() || state.input_buffer.is_empty() => {
+            if let Some((buffer, cursor)) = state.prompt_history_next() {
+                state.input_buffer = buffer;
+                state.cursor_char_idx = cursor;
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn apply_transcript_page_scroll(
+    state: &mut TuiSessionState,
+    max_scroll: usize,
+    page: usize,
+    down: bool,
+) {
+    let page = page.max(1);
+    if down {
+        state.scroll_lines = (state.scroll_lines + page).min(max_scroll);
+        if state.scroll_lines >= max_scroll {
+            state.transcript_follow_tail = true;
+        }
+    } else {
+        state.transcript_follow_tail = false;
+        state.scroll_lines = state.scroll_lines.saturating_sub(page).min(max_scroll);
+    }
 }
 
 /// `question_answer_tx`: when `Some`, answers are sent there so they unblock `ask_question` while
@@ -476,21 +941,37 @@ pub fn run_blocking(
                 // Nothing to redraw. Drop the lock and go straight to polling.
                 drop(g);
             } else {
-                let slash_filtered = filter_slash_entries(&slash_entries, &g.input_buffer);
-                let at_matches =
-                    at_completion_matches(&workspace_files, &g.input_buffer, g.cursor_char_idx);
-                let dollar_matches = matching_skill_reference_commands(
-                    &g.input_buffer,
-                    cursor_byte_index(&g.input_buffer, g.cursor_char_idx),
-                    &dollar_skill_commands,
-                );
-                let chrome_h = composer_chrome_height(
-                    &slash_entries,
-                    &workspace_files,
-                    &g.input_buffer,
-                    g.cursor_char_idx,
-                )
-                .max(at_panel_height(dollar_matches.len()));
+                let history_navigating = g.prompt_history_is_navigating();
+                let slash_filtered = if history_navigating {
+                    Vec::new()
+                } else {
+                    filter_slash_entries(&slash_entries, &g.input_buffer)
+                };
+                let at_matches = if history_navigating {
+                    Vec::new()
+                } else {
+                    at_completion_matches(&workspace_files, &g.input_buffer, g.cursor_char_idx)
+                };
+                let dollar_matches = if history_navigating {
+                    Vec::new()
+                } else {
+                    matching_skill_reference_commands(
+                        &g.input_buffer,
+                        cursor_byte_index(&g.input_buffer, g.cursor_char_idx),
+                        &dollar_skill_commands,
+                    )
+                };
+                let chrome_h = if history_navigating {
+                    0
+                } else {
+                    composer_chrome_height(
+                        &slash_entries,
+                        &workspace_files,
+                        &g.input_buffer,
+                        g.cursor_char_idx,
+                    )
+                    .max(at_panel_height(dollar_matches.len()))
+                };
                 let auxiliary_rows = usize::from(!g.staged_image_attachments.is_empty()) + 1;
                 let preview_area = Rect::new(0, 0, cur_size.0, cur_size.1);
                 let (preview_main_area, _) = layout_with_sidebar(preview_area);
@@ -923,7 +1404,10 @@ pub fn run_blocking(
                 }
 
                 if let Some(sr) = slash_opt {
-                    if slash_panel_visible(&g.input_buffer) && !slash_filtered.is_empty() {
+                    if !history_navigating
+                        && slash_panel_visible(&g.input_buffer)
+                        && !slash_filtered.is_empty()
+                    {
                         let n_show = slash_filtered.len().min(SLASH_PANEL_MAX_ROWS);
                         let max_scroll = slash_filtered.len().saturating_sub(n_show);
                         let list_scroll = g
@@ -1074,6 +1558,11 @@ pub fn run_blocking(
                         "Enter / 0 = suggested · 1–n = option · click underlined line · /auto-answer · End = transcript bottom (empty input)",
                         Style::default().fg(theme::WARN),
                     ))
+                } else if history_navigating {
+                    Line::from(Span::styled(
+                        "History: ↑↓ navigate · Enter send · edit or move to detach · PageUp/PageDown transcript",
+                        Style::default().fg(theme::MUTED),
+                    ))
                 } else if slash_panel_visible(&g.input_buffer) {
                     let hint_msg = if slash_filtered.is_empty() {
                         "No matching /command — try /help or Ctrl+P (palette)"
@@ -1083,7 +1572,7 @@ pub fn run_blocking(
                     Line::from(Span::styled(hint_msg, Style::default().fg(theme::MUTED)))
                 } else if g.input_buffer.is_empty() {
                     Line::from(Span::styled(
-                        "Enter send · Shift+Enter/Alt+Enter/Ctrl+J newline · Tab agent · Ctrl+V image · Ctrl+P palette · Ctrl+X Q exit · Ctrl+L clear",
+                        "Enter send · ↑↓ history · PageUp/PageDown transcript · Shift+Enter/Alt+Enter/Ctrl+J newline · Tab agent · Ctrl+V image · Ctrl+P palette · Ctrl+X Q exit · Ctrl+L clear",
                         Style::default().fg(theme::MUTED),
                     ))
                 } else {
@@ -1468,110 +1957,8 @@ pub fn run_blocking(
                 }
 
                 // Question modal popup (arrow-key option picker).
-                if g.question_modal_open()
-                    && let Some(ref q) = g.active_question
-                {
-                        let has_chat_option = q.allow_custom;
-                        let total_items = 1 + q.options.len() + if has_chat_option { 1 } else { 0 };
-                        // +4 for: title line, blank, blank before footer, footer
-                        let rows = (total_items as u16).saturating_add(6).max(8);
-                        let popup_w = 60u16.min(area.width.saturating_sub(4));
-                        let popup_area = centered_rect(area, popup_w, rows);
-
-                        let mut lines: Vec<Line> = vec![
-                            Line::from(Span::styled(
-                                format!(" {} ", q.prompt),
-                                Style::default()
-                                    .fg(theme::ASSISTANT)
-                                    .add_modifier(Modifier::BOLD),
-                            )),
-                            Line::default(),
-                        ];
-
-                        // Suggested answer (index 0)
-                        let suggested_label = format!(" Suggested: {} ", q.suggested_answer);
-                        if g.question_modal_index() == 0 {
-                            lines.push(Line::from(Span::styled(
-                                format!(" ► {}", suggested_label.trim()),
-                                Style::default()
-                                    .fg(Color::Black)
-                                    .bg(theme::USER)
-                                    .add_modifier(Modifier::BOLD),
-                            )));
-                        } else {
-                            lines.push(Line::from(Span::styled(
-                                format!("   {}", suggested_label.trim()),
-                                Style::default().fg(theme::TEXT),
-                            )));
-                        }
-
-                        // Options (index 1..n)
-                        for (i, o) in q.options.iter().enumerate() {
-                            let item_idx = i + 1;
-                            let label = format!("{} ", o.label);
-                            if g.question_modal_index() == item_idx {
-                                lines.push(Line::from(Span::styled(
-                                    format!(" ► {}", label.trim()),
-                                    Style::default()
-                                        .fg(Color::Black)
-                                        .bg(theme::USER)
-                                        .add_modifier(Modifier::BOLD),
-                                )));
-                            } else {
-                                lines.push(Line::from(Span::styled(
-                                    format!("   {}", label.trim()),
-                                    Style::default().fg(theme::TEXT),
-                                )));
-                            }
-                        }
-
-                        // "Chat about this" (last item, only if allow_custom)
-                        if has_chat_option {
-                            let chat_idx = 1 + q.options.len();
-                            if g.question_modal_index() == chat_idx {
-                                lines.push(Line::from(Span::styled(
-                                    " ► Chat about this",
-                                    Style::default()
-                                        .fg(Color::Black)
-                                        .bg(theme::USER)
-                                        .add_modifier(Modifier::BOLD),
-                                )));
-                            } else {
-                                lines.push(Line::from(Span::styled(
-                                    "   Chat about this",
-                                    Style::default()
-                                        .fg(theme::MUTED)
-                                        .add_modifier(Modifier::ITALIC),
-                                )));
-                            }
-                        }
-
-                        // Footer
-                        lines.push(Line::default());
-                        let footer_text = if has_chat_option {
-                            " ↑↓ select · Enter confirm · Esc chat "
-                        } else {
-                            " ↑↓ select · Enter confirm "
-                        };
-                        lines.push(Line::from(Span::styled(
-                            footer_text,
-                            Style::default().fg(theme::MUTED),
-                        )));
-
-                        frame.render_widget(ClearWidget, popup_area);
-                        let popup = Paragraph::new(Text::from(lines))
-                            .block(
-                                Block::default()
-                                    .borders(Borders::ALL)
-                                    .border_style(Style::default().fg(theme::BORDER))
-                                    .title(Span::styled(
-                                        " question ",
-                                        Style::default().fg(theme::WARN),
-                                    )),
-                            )
-                            .style(Style::default().bg(theme::SURFACE))
-                            .wrap(Wrap { trim: false });
-                        frame.render_widget(popup, popup_area);
+                if g.question_modal_open() && g.active_question.is_some() {
+                    render_question_popup(frame, area, &mut g);
                 }
 
                 if g.session_picker_open() {
@@ -2165,21 +2552,37 @@ pub fn run_blocking(
                     let sz = terminal.size()?;
                     let area = Rect::new(0, 0, sz.width, sz.height);
                     let (main_area, _) = layout_with_sidebar(area);
-                    let slash_filtered = filter_slash_entries(&slash_entries, &g.input_buffer);
-                    let at_matches =
-                        at_completion_matches(&workspace_files, &g.input_buffer, g.cursor_char_idx);
-                    let dollar_matches = matching_skill_reference_commands(
-                        &g.input_buffer,
-                        cursor_byte_index(&g.input_buffer, g.cursor_char_idx),
-                        &dollar_skill_commands,
-                    );
-                    let sh = composer_chrome_height(
-                        &slash_entries,
-                        &workspace_files,
-                        &g.input_buffer,
-                        g.cursor_char_idx,
-                    )
-                    .max(at_panel_height(dollar_matches.len()));
+                    let history_navigating = g.prompt_history_is_navigating();
+                    let slash_filtered = if history_navigating {
+                        Vec::new()
+                    } else {
+                        filter_slash_entries(&slash_entries, &g.input_buffer)
+                    };
+                    let at_matches = if history_navigating {
+                        Vec::new()
+                    } else {
+                        at_completion_matches(&workspace_files, &g.input_buffer, g.cursor_char_idx)
+                    };
+                    let dollar_matches = if history_navigating {
+                        Vec::new()
+                    } else {
+                        matching_skill_reference_commands(
+                            &g.input_buffer,
+                            cursor_byte_index(&g.input_buffer, g.cursor_char_idx),
+                            &dollar_skill_commands,
+                        )
+                    };
+                    let sh = if history_navigating {
+                        0
+                    } else {
+                        composer_chrome_height(
+                            &slash_entries,
+                            &workspace_files,
+                            &g.input_buffer,
+                            g.cursor_char_idx,
+                        )
+                        .max(at_panel_height(dollar_matches.len()))
+                    };
                     let input_h = composer_input_height_with_width(
                         &g.input_buffer,
                         usize::from(!g.staged_image_attachments.is_empty()) + 1,
@@ -2917,6 +3320,10 @@ pub fn run_blocking(
                         continue;
                     }
 
+                    if handle_prompt_history_key(&mut g, key) {
+                        continue;
+                    }
+
                     match (key.code, key.modifiers) {
                         (KeyCode::Esc, _) if escape_cancels_active_turn(&g) => {
                             if let Some(ref flag) = cancel_flag {
@@ -2967,7 +3374,8 @@ pub fn run_blocking(
                             let _ = cmd_tx.try_send(TuiCmd::PasteClipboard);
                         }
                         (KeyCode::Tab, _) => {
-                            if !workspace_files_indexing
+                            if !g.prompt_history_is_navigating()
+                                && !workspace_files_indexing
                                 && let Some((buf, cidx)) = apply_selected_at_completion(
                                     &workspace_files,
                                     &g.input_buffer,
@@ -2976,10 +3384,13 @@ pub fn run_blocking(
                                     false,
                                 )
                             {
+                                g.detach_prompt_history();
                                 g.input_buffer = buf;
                                 g.cursor_char_idx = cidx;
-                            } else if let Some(choice) = dollar_matches
-                                .get(g.at_menu_index.min(dollar_matches.len().saturating_sub(1)))
+                            } else if !g.prompt_history_is_navigating()
+                                && let Some(choice) = dollar_matches.get(
+                                    g.at_menu_index.min(dollar_matches.len().saturating_sub(1)),
+                                )
                                 && let Some((buf, cidx)) =
                                     apply_skill_reference_completion_with_space(
                                         &g.input_buffer,
@@ -2987,6 +3398,7 @@ pub fn run_blocking(
                                         choice,
                                     )
                             {
+                                g.detach_prompt_history();
                                 g.input_buffer = buf;
                                 g.cursor_char_idx = cidx;
                             } else {
@@ -3064,7 +3476,8 @@ pub fn run_blocking(
                             }
                         }
                         (KeyCode::Enter, _) => {
-                            if !workspace_files_indexing
+                            if !g.prompt_history_is_navigating()
+                                && !workspace_files_indexing
                                 && let Some((buf, cidx)) = apply_selected_at_completion(
                                     &workspace_files,
                                     &g.input_buffer,
@@ -3073,12 +3486,15 @@ pub fn run_blocking(
                                     true,
                                 )
                             {
+                                g.detach_prompt_history();
                                 g.input_buffer = buf;
                                 g.cursor_char_idx = cidx;
                                 continue;
                             }
-                            if let Some(choice) = dollar_matches
-                                .get(g.at_menu_index.min(dollar_matches.len().saturating_sub(1)))
+                            if !g.prompt_history_is_navigating()
+                                && let Some(choice) = dollar_matches.get(
+                                    g.at_menu_index.min(dollar_matches.len().saturating_sub(1)),
+                                )
                                 && let Some((buf, cidx)) =
                                     apply_skill_reference_completion_with_space(
                                         &g.input_buffer,
@@ -3188,19 +3604,47 @@ pub fn run_blocking(
                             let _ = cmd_tx.try_send(TuiCmd::Submit(line));
                         }
                         (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
+                            g.detach_prompt_history();
                             g.cursor_char_idx = 0;
                         }
                         (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
+                            g.detach_prompt_history();
                             g.cursor_char_idx = g.input_buffer.chars().count();
                         }
                         (KeyCode::Home, _) => {
                             if !g.input_buffer.is_empty() {
+                                g.detach_prompt_history();
                                 g.cursor_char_idx =
                                     move_cursor_home(&g.input_buffer, g.cursor_char_idx);
                             }
                         }
+                        (KeyCode::PageUp, _) => {
+                            let size = terminal.size()?;
+                            let area = Rect::new(0, 0, size.width, size.height);
+                            let (max_scroll, page) = transcript_scroll_metrics(
+                                &mut g,
+                                area,
+                                &slash_entries,
+                                &workspace_files,
+                                &dollar_skill_commands,
+                            );
+                            apply_transcript_page_scroll(&mut g, max_scroll, page, false);
+                        }
+                        (KeyCode::PageDown, _) => {
+                            let size = terminal.size()?;
+                            let area = Rect::new(0, 0, size.width, size.height);
+                            let (max_scroll, page) = transcript_scroll_metrics(
+                                &mut g,
+                                area,
+                                &slash_entries,
+                                &workspace_files,
+                                &dollar_skill_commands,
+                            );
+                            apply_transcript_page_scroll(&mut g, max_scroll, page, true);
+                        }
                         (KeyCode::End, _) => {
                             if !g.input_buffer.is_empty() {
+                                g.detach_prompt_history();
                                 g.cursor_char_idx =
                                     move_cursor_end(&g.input_buffer, g.cursor_char_idx);
                             } else {
@@ -3230,13 +3674,26 @@ pub fn run_blocking(
                             }
                         }
                         (KeyCode::Left, _) => {
+                            g.detach_prompt_history();
                             g.cursor_char_idx = g.cursor_char_idx.saturating_sub(1);
                         }
                         (KeyCode::Right, _) => {
+                            g.detach_prompt_history();
                             let max = g.input_buffer.chars().count();
                             g.cursor_char_idx = (g.cursor_char_idx + 1).min(max);
                         }
                         (KeyCode::Up, _) => {
+                            // A recalled entry owns the arrow keys until the
+                            // user edits or moves the cursor. On an empty
+                            // composer, Up enters the newest history entry;
+                            // an empty history is a safe no-op.
+                            if g.prompt_history_is_navigating() || g.input_buffer.is_empty() {
+                                if let Some((buffer, cursor)) = g.prompt_history_previous() {
+                                    g.input_buffer = buffer;
+                                    g.cursor_char_idx = cursor;
+                                }
+                                continue;
+                            }
                             let at_matches = at_completion_matches(
                                 &workspace_files,
                                 &g.input_buffer,
@@ -3284,6 +3741,17 @@ pub fn run_blocking(
                             }
                         }
                         (KeyCode::Down, _) => {
+                            // While recalling, Down advances toward newer
+                            // entries and then restores the pre-history draft.
+                            // Empty non-history input no longer scrolls the
+                            // transcript; PageDown owns that action.
+                            if g.prompt_history_is_navigating() || g.input_buffer.is_empty() {
+                                if let Some((buffer, cursor)) = g.prompt_history_next() {
+                                    g.input_buffer = buffer;
+                                    g.cursor_char_idx = cursor;
+                                }
+                                continue;
+                            }
                             let at_matches = at_completion_matches(
                                 &workspace_files,
                                 &g.input_buffer,
@@ -3359,6 +3827,7 @@ pub fn run_blocking(
                         }
                         (KeyCode::Backspace, _) => {
                             if g.cursor_char_idx > 0 {
+                                g.detach_prompt_history();
                                 if let Some((buf, cidx)) =
                                     delete_completed_at_mention(&g.input_buffer, g.cursor_char_idx)
                                 {
@@ -3383,6 +3852,7 @@ pub fn run_blocking(
                             }
                         }
                         (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                            g.detach_prompt_history();
                             let idx = g.cursor_char_idx;
                             let mut cs: Vec<char> = g.input_buffer.chars().collect();
                             cs.insert(idx, c);
@@ -3413,11 +3883,14 @@ pub fn run_blocking(
 #[cfg(test)]
 mod approval_parse_tests {
     use super::{
-        ApprovalShortcutAction, PrimaryInputMode, TuiCmd, apply_selected_at_completion,
+        ApprovalShortcutAction, PrimaryInputMode, QUESTION_POPUP_MAX_WIDTH, QuestionPopupLayout,
+        TuiCmd, apply_selected_at_completion, apply_transcript_page_scroll,
         approval_shortcut_action, branch_picker_enter_command, delete_completed_at_mention,
         dispatch_custom_provider_key, dispatch_paste, escape_cancels_active_turn,
-        filter_slash_entries, filtered_branch_indices, handle_newline_key, load_slash_entries,
-        matching_skill_reference_commands, primary_input_mode,
+        filter_slash_entries, filtered_branch_indices, handle_newline_key,
+        handle_prompt_history_key, load_slash_entries, matching_skill_reference_commands,
+        primary_input_mode, question_popup_layout, render_question_popup,
+        transcript_scroll_metrics,
     };
     use crate::skill_references::apply_skill_reference_completion_with_space;
     use crate::tui::composer::cursor_byte_index;
@@ -3426,9 +3899,208 @@ mod approval_parse_tests {
     use crate::tui::transcript::parse_approval_verdict;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use nca_common::config::CustomProviderConfig;
-    use nca_common::event::{AgentEvent, BusyState};
+    use nca_common::event::{AgentEvent, BusyState, InteractiveQuestionPayload, QuestionOption};
+    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
     use std::path::PathBuf;
     use tokio::sync::mpsc;
+
+    fn question(prompt: &str, options: usize, allow_custom: bool) -> InteractiveQuestionPayload {
+        InteractiveQuestionPayload {
+            question_id: "q".into(),
+            call_id: "call".into(),
+            prompt: prompt.into(),
+            options: (0..options)
+                .map(|i| QuestionOption {
+                    id: format!("id-{i}"),
+                    label: format!("Option {i}"),
+                })
+                .collect(),
+            allow_custom,
+            suggested_answer: "Suggested answer".into(),
+        }
+    }
+
+    #[test]
+    fn question_popup_grows_to_all_options_and_caps_width() {
+        let q = question("Choose one", 5, true);
+        let layout = question_popup_layout(Rect::new(0, 0, 120, 40), &q, 0, 0);
+
+        assert_eq!(layout.option_start, 0);
+        assert_eq!(layout.option_end, 7);
+        assert!(layout.popup_area.width <= QUESTION_POPUP_MAX_WIDTH);
+        assert!(layout.popup_area.height < 40);
+        assert!(layout.indicator_lines.is_empty());
+    }
+
+    #[test]
+    fn question_popup_wraps_long_prompt_and_option_labels() {
+        let mut q = question(
+            "A prompt with enough words to wrap in a narrow question popup",
+            1,
+            false,
+        );
+        q.options[0].label = "A deliberately long option label that must wrap".into();
+        let layout = question_popup_layout(Rect::new(0, 0, 46, 24), &q, 0, 0);
+
+        assert!(layout.prompt_lines.len() > 1);
+        assert!(layout.option_line_counts[1] > 1);
+        assert!(
+            layout
+                .footer_lines
+                .iter()
+                .any(|line| line.contains("Enter"))
+        );
+    }
+
+    #[test]
+    fn question_popup_scroll_keeps_selected_item_visible_with_indicators() {
+        let q = question("Pick a value", 12, true);
+        let layout = question_popup_layout(Rect::new(0, 0, 50, 10), &q, 13, 0);
+
+        assert!(layout.option_start > 0);
+        assert!(layout.option_start <= 13);
+        assert!(layout.option_end > 13);
+        assert!(
+            layout
+                .indicator_lines
+                .iter()
+                .any(|line| line.contains("above"))
+        );
+        assert!(!layout.footer_lines.is_empty());
+    }
+
+    #[test]
+    fn question_popup_resize_recalculates_viewport() {
+        let q = question("Pick a value", 12, true);
+        let short = question_popup_layout(Rect::new(0, 0, 60, 10), &q, 0, 0);
+        let tall = question_popup_layout(Rect::new(0, 0, 60, 30), &q, 0, 0);
+
+        assert!(short.option_end < tall.option_end);
+        assert_eq!(tall.option_end, 14);
+        assert!(short.popup_area.height <= 10);
+    }
+
+    #[test]
+    fn question_popup_custom_contract_controls_logical_items() {
+        let without_chat = question("Pick", 3, false);
+        let without = question_popup_layout(Rect::new(0, 0, 60, 30), &without_chat, 3, 0);
+        assert_eq!(without.option_end, 4);
+        assert_eq!(without.option_line_counts.len(), 4);
+
+        let with_chat = question("Pick", 3, true);
+        let with = question_popup_layout(Rect::new(0, 0, 60, 30), &with_chat, 4, 0);
+        assert_eq!(with.option_end, 5);
+        assert_eq!(with.option_line_counts.len(), 5);
+    }
+
+    fn render_question_for_test(
+        width: u16,
+        height: u16,
+        q: InteractiveQuestionPayload,
+        selected: usize,
+    ) -> (Vec<String>, QuestionPopupLayout) {
+        let mut state = state();
+        state.active_question = Some(q);
+        state.open_question_modal();
+        *state.question_modal_index_mut().unwrap() = selected;
+
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut rendered_layout = None;
+        let completed = terminal
+            .draw(|frame| {
+                let area = frame.area();
+                rendered_layout = render_question_popup(frame, area, &mut state);
+            })
+            .unwrap();
+        let layout = rendered_layout.expect("question renderer should return a layout");
+        let lines = (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| {
+                        completed
+                            .buffer
+                            .cell((x, y))
+                            .expect("cell in test backend")
+                            .symbol()
+                            .to_string()
+                    })
+                    .collect::<String>()
+            })
+            .collect();
+        (lines, layout)
+    }
+
+    #[test]
+    fn production_question_renderer_draws_all_visible_options_and_footer() {
+        let q = question("Choose one", 3, true);
+        let (lines, layout) = render_question_for_test(80, 24, q, 0);
+
+        assert_eq!(layout.option_start, 0);
+        assert_eq!(layout.option_end, 5);
+        let rendered = lines.join("\\n");
+        assert!(rendered.contains("Suggested: Suggested answer"));
+        assert!(rendered.contains("Option 0"));
+        assert!(rendered.contains("Option 2"));
+        assert!(rendered.contains("Chat about this"));
+        assert!(rendered.contains("Enter"));
+    }
+
+    #[test]
+    fn production_question_renderer_keeps_scrolled_footer_inside_popup() {
+        let q = question("Pick a value", 12, true);
+        let (lines, layout) = render_question_for_test(52, 10, q, 13);
+
+        assert!(layout.option_start > 0);
+        assert!(layout.option_end > 13);
+        assert!(layout.popup_area.bottom() <= 10);
+        let popup_lines =
+            &lines[usize::from(layout.popup_area.y)..usize::from(layout.popup_area.bottom())];
+        let rendered = popup_lines.join("\\n");
+        assert!(rendered.contains("More above"));
+        assert!(rendered.contains("Chat about this"));
+        assert!(rendered.contains("Enter confirm"));
+    }
+
+    #[test]
+    fn production_question_renderer_bounds_long_wrapped_options_before_footer() {
+        let mut q = question("A long prompt that wraps", 1, false);
+        q.options[0].label =
+            "This is a deliberately long option label that wraps across many display rows".into();
+        let (lines, layout) = render_question_for_test(46, 8, q, 0);
+
+        assert!(layout.option_line_counts[1] > layout.option_row_budget);
+        assert!(layout.popup_area.bottom() <= 8);
+        let popup_lines =
+            &lines[usize::from(layout.popup_area.y)..usize::from(layout.popup_area.bottom())];
+        let rendered = popup_lines.join("\\n");
+        assert!(rendered.contains("Enter") || rendered.contains("confirm"));
+    }
+
+    #[test]
+    fn production_question_renderer_recalculates_on_resize() {
+        let q = question("Pick a value", 12, true);
+        let (short_lines, short) = render_question_for_test(60, 10, q.clone(), 0);
+        let (tall_lines, tall) = render_question_for_test(60, 30, q, 0);
+
+        assert!(short.option_end < tall.option_end);
+        assert!(short.popup_area.height < tall.popup_area.height);
+        assert!(short_lines.join("\\n").contains("Enter"));
+        assert!(tall_lines.join("\\n").contains("Chat about this"));
+    }
+
+    #[test]
+    fn question_popup_renderer_honors_custom_contract_and_escape() {
+        let without_chat = question("Pick", 1, false);
+        let (lines, layout) = render_question_for_test(60, 20, without_chat, 0);
+        let rendered = lines.join("\\n");
+        assert_eq!(layout.option_end, 2);
+        assert!(!rendered.contains("Chat about this"));
+
+        let with_chat = question("Pick", 1, true);
+        let (lines, layout) = render_question_for_test(60, 20, with_chat, 0);
+        assert_eq!(layout.option_end, 3);
+        assert!(lines.join("\\n").contains("Chat about this"));
+    }
 
     fn state() -> TuiSessionState {
         TuiSessionState::new(
@@ -3442,6 +4114,59 @@ mod approval_parse_tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn composer_history_application_seam_preserves_completion_and_scratch_ownership() {
+        let mut state = state();
+        state.set_prompt_history(vec!["older".into(), "newest\n終わり  ".into()]);
+        state.input_buffer.clear();
+        state.cursor_char_idx = 0;
+
+        assert!(handle_prompt_history_key(&mut state, key(KeyCode::Up)));
+        assert_eq!(state.input_buffer, "newest\n終わり  ");
+        assert_eq!(state.cursor_char_idx, state.input_buffer.chars().count());
+        assert!(state.prompt_history_is_navigating());
+        assert!(handle_prompt_history_key(&mut state, key(KeyCode::Up)));
+        assert_eq!(state.input_buffer, "older");
+        assert!(handle_prompt_history_key(&mut state, key(KeyCode::Down)));
+        assert_eq!(state.input_buffer, "newest\n終わり  ");
+        assert!(handle_prompt_history_key(&mut state, key(KeyCode::Down)));
+        assert!(state.input_buffer.is_empty());
+        assert_eq!(state.cursor_char_idx, 0);
+        assert!(!state.prompt_history_is_navigating());
+
+        state.input_buffer = "/he".into();
+        state.cursor_char_idx = 3;
+        state.slash_menu_index = 2;
+        assert!(!handle_prompt_history_key(&mut state, key(KeyCode::Up)));
+        assert_eq!(state.slash_menu_index, 2);
+    }
+
+    #[test]
+    fn empty_history_arrows_are_noops_and_page_scroll_is_viewport_sized() {
+        let mut state = state();
+        state.input_buffer = "".into();
+        state.scroll_lines = 7;
+        assert!(handle_prompt_history_key(&mut state, key(KeyCode::Up)));
+        assert_eq!(state.scroll_lines, 7);
+        assert!(handle_prompt_history_key(&mut state, key(KeyCode::Down)));
+        assert_eq!(state.scroll_lines, 7);
+
+        state
+            .blocks
+            .extend((0..40).map(|i| crate::tui::state::DisplayBlock::User(format!("line {i}"))));
+        let (max_scroll, page) =
+            transcript_scroll_metrics(&mut state, Rect::new(0, 0, 100, 20), &[], &[], &[]);
+        assert!(max_scroll > page);
+        apply_transcript_page_scroll(&mut state, max_scroll, page, false);
+        assert_eq!(state.scroll_lines, 0);
+        assert!(!state.transcript_follow_tail);
+        apply_transcript_page_scroll(&mut state, max_scroll, page, true);
+        assert_eq!(state.scroll_lines, page);
+        apply_transcript_page_scroll(&mut state, max_scroll, max_scroll, true);
+        assert_eq!(state.scroll_lines, max_scroll);
+        assert!(state.transcript_follow_tail);
     }
 
     fn type_text(state: &mut TuiSessionState, tx: &mpsc::Sender<TuiCmd>, text: &str) {

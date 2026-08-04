@@ -51,11 +51,43 @@ pub struct SessionMeta {
     pub execution: ExecutionContext,
 }
 
+pub const MAX_PROMPT_HISTORY_ENTRIES: usize = 100;
+
+/// Keep prompt history bounded while preserving literal text and duplicate entries.
+pub fn normalize_prompt_history(entries: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut history: Vec<String> = entries
+        .into_iter()
+        .filter(|entry| !entry.trim().is_empty())
+        .collect();
+    if history.len() > MAX_PROMPT_HISTORY_ENTRIES {
+        let first = history.len() - MAX_PROMPT_HISTORY_ENTRIES;
+        history.drain(..first);
+    }
+    history
+}
+
+/// Derive best-effort prompt history for sessions written before the dedicated
+/// history field existed. Existing user messages are already canonical (and
+/// may contain expanded file/skill context), so this is intentionally only a
+/// compatibility fallback.
+pub fn legacy_prompt_history(messages: &[Message]) -> Vec<String> {
+    normalize_prompt_history(
+        messages
+            .iter()
+            .filter(|message| message.role == crate::message::Role::User)
+            .map(|message| message.content.to_summary_text()),
+    )
+}
 /// Full session state, including conversation history and cost tracking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionState {
     pub meta: SessionMeta,
     pub messages: Vec<Message>,
+    /// Literal ordinary chat drafts, in submission order. Older session JSON
+    /// may omit this field; callers should use [`Self::prompt_history_or_legacy`]
+    /// when loading a session for interactive recall.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prompt_history: Vec<String>,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub estimated_cost_usd: f64,
@@ -122,6 +154,15 @@ pub struct OrchestrationContext {
 }
 
 impl SessionState {
+    /// Return persisted prompt history, or derive a capped compatibility
+    /// fallback from existing user messages when the field was absent/empty.
+    pub fn prompt_history_or_legacy(&self) -> Vec<String> {
+        if self.prompt_history.is_empty() {
+            legacy_prompt_history(&self.messages)
+        } else {
+            normalize_prompt_history(self.prompt_history.clone())
+        }
+    }
     pub fn snapshot(&self) -> SessionSnapshot {
         SessionSnapshot {
             id: self.meta.id.clone(),
@@ -208,11 +249,50 @@ pub enum SessionStatus {
 #[cfg(test)]
 mod tests {
     use super::OrchestrationContext;
-    use super::{SessionMeta, SessionState, SessionStatus};
+    use super::{
+        MAX_PROMPT_HISTORY_ENTRIES, SessionMeta, SessionState, SessionStatus,
+        legacy_prompt_history, normalize_prompt_history,
+    };
+    use crate::message::Message;
     use crate::todo::{AgentTodo, TodoStatus};
     use chrono::Utc;
     use std::env;
     use std::path::PathBuf;
+
+    #[test]
+    fn prompt_history_normalization_preserves_literal_duplicates_and_cap() {
+        let entries = (0..102)
+            .map(|index| {
+                if index == 1 {
+                    " \n".to_string()
+                } else {
+                    format!("entry-{index}\n  ")
+                }
+            })
+            .collect::<Vec<_>>();
+        let normalized = normalize_prompt_history(entries);
+
+        assert_eq!(normalized.len(), MAX_PROMPT_HISTORY_ENTRIES);
+        assert_eq!(normalized.first().map(String::as_str), Some("entry-2\n  "));
+        assert_eq!(normalized.last().map(String::as_str), Some("entry-101\n  "));
+        assert_eq!(
+            normalize_prompt_history(vec!["duplicate".into(), "duplicate".into()]),
+            vec!["duplicate", "duplicate"]
+        );
+    }
+
+    #[test]
+    fn legacy_prompt_history_uses_newest_user_messages_only() {
+        let messages = vec![
+            Message::user("old"),
+            Message::assistant("answer"),
+            Message::user("new\ntext"),
+        ];
+        assert_eq!(
+            legacy_prompt_history(&messages),
+            vec!["old".to_string(), "new\ntext".to_string()]
+        );
+    }
 
     #[test]
     fn orchestration_context_reads_env_contract() {
@@ -261,13 +341,18 @@ mod tests {
                 "model": "m",
                 "status": "running"
             },
-            "messages": [],
+            "messages": [
+                {"role": "user", "content": "legacy prompt"},
+                {"role": "assistant", "content": "answer"}
+            ],
             "total_input_tokens": 0,
             "total_output_tokens": 0,
             "estimated_cost_usd": 0.0
         }"#;
         let state: SessionState = serde_json::from_str(raw).expect("deserialize");
         assert!(state.todos.is_empty());
+        assert_eq!(state.prompt_history, Vec::<String>::new());
+        assert_eq!(state.prompt_history_or_legacy(), vec!["legacy prompt"]);
         assert!(state.snapshot().todos.is_empty());
         assert!(!state.meta.execution.yolo);
     }
@@ -297,6 +382,11 @@ mod tests {
                 execution: Default::default(),
             },
             messages: Vec::new(),
+            prompt_history: vec![
+                "  café\n\n終わり  \n".into(),
+                "duplicate".into(),
+                "duplicate".into(),
+            ],
             total_input_tokens: 0,
             total_output_tokens: 0,
             estimated_cost_usd: 0.0,
@@ -310,6 +400,7 @@ mod tests {
         let json = serde_json::to_string(&state).unwrap();
         let back: SessionState = serde_json::from_str(&json).unwrap();
         assert_eq!(back.todos.len(), 1);
+        assert_eq!(back.prompt_history, state.prompt_history);
         assert_eq!(back.snapshot().todos[0].content, "Ship it");
     }
 
@@ -338,6 +429,7 @@ mod tests {
                 execution: crate::execution::ExecutionContext::yolo(),
             },
             messages: Vec::new(),
+            prompt_history: Vec::new(),
             total_input_tokens: 0,
             total_output_tokens: 0,
             estimated_cost_usd: 0.0,

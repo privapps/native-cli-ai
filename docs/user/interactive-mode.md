@@ -133,9 +133,16 @@ Reload or recreate the tmux session after changing the configuration. Ctrl+J
 remains the reliable fallback when the terminal cannot report modified keys.
 
 The composer grows to eight visible rows and follows the cursor for longer
-drafts. Up/Down navigate a non-empty draft, while an empty draft keeps their
-transcript-scrolling behavior. Use **Ctrl+X E** for the external editor when
-the composition is very long.
+drafts. On an empty composer, **Up** recalls the newest ordinary chat prompt;
+repeat Up/Down to traverse prompt history, and Down past the newest entry
+restores the draft that existed before recall. Editing or moving the cursor
+detaches history navigation. For a non-history multiline draft, Up/Down keep
+their display-width-aware cursor movement. Use **PageUp/PageDown** for
+viewport-sized transcript scrolling and **End** to jump back to the bottom;
+mouse-wheel scrolling remains available. **Ctrl+L** clears visible transcript
+content without clearing prompt history, while `/new` starts with empty
+history. Use **Ctrl+X E** for the external editor when the composition is very
+long.
 
 Rendering is display-cell aware: long unbroken lines wrap to the terminal
 width, and wide or combining Unicode keeps the cursor aligned with the logical

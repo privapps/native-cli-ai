@@ -58,6 +58,7 @@ fn write_session(
             execution: Default::default(),
         },
         messages: vec![Message::user("hello")],
+        prompt_history: Vec::new(),
         total_input_tokens: 0,
         total_output_tokens: 0,
         estimated_cost_usd: 0.0,

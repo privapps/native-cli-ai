@@ -5,6 +5,7 @@ use super::custom_provider_flow::{
     CustomProviderSetupTransition,
 };
 use super::overlay::{UiOverlay, UiOverlayKind};
+use super::prompt_history::PromptHistory;
 use nca_common::config::ProviderKind;
 use nca_common::event::{AgentEvent, BusyState, InteractiveQuestionPayload, QuestionSelection};
 use nca_common::message::ImageAttachment;
@@ -127,6 +128,8 @@ pub struct TuiSessionState {
     pub workspace_display: String,
     /// Images to send on the next user message (TUI only).
     pub staged_image_attachments: Vec<ImageAttachment>,
+    /// Literal ordinary chat drafts recalled by the composer.
+    pub prompt_history: PromptHistory,
     /// Live view of spawned sub-agents (updated from child activity events).
     pub subagents: Vec<SubagentRow>,
     /// Session todo list (last `TodosUpdated` wins).
@@ -237,6 +240,7 @@ impl TuiSessionState {
             workspace_root,
             workspace_display: String::new(),
             staged_image_attachments: Vec::new(),
+            prompt_history: PromptHistory::default(),
             subagents: Vec::new(),
             todos: Vec::new(),
             context_report: None,
@@ -1175,6 +1179,45 @@ impl TuiSessionState {
         if self.question_modal_open() {
             self.close_overlay();
         }
+    }
+
+    pub fn set_prompt_history(&mut self, entries: Vec<String>) {
+        self.prompt_history.replace(entries);
+        self.mark_dirty();
+    }
+
+    pub fn prompt_history_entries(&self) -> &[String] {
+        self.prompt_history.entries()
+    }
+
+    pub fn prompt_history_is_navigating(&self) -> bool {
+        self.prompt_history.is_navigating()
+    }
+
+    pub fn prompt_history_previous(&mut self) -> Option<(String, usize)> {
+        self.prompt_history
+            .previous(&self.input_buffer, self.cursor_char_idx)
+    }
+
+    pub fn prompt_history_next(&mut self) -> Option<(String, usize)> {
+        self.prompt_history.next_prompt()
+    }
+
+    pub fn record_prompt_history(&mut self, entry: &str) -> bool {
+        let recorded = self.prompt_history.record(entry);
+        if recorded {
+            self.mark_dirty();
+        }
+        recorded
+    }
+
+    pub fn detach_prompt_history(&mut self) {
+        self.prompt_history.detach();
+    }
+
+    pub fn clear_prompt_history(&mut self) {
+        self.prompt_history.clear();
+        self.mark_dirty();
     }
 
     pub fn open_session_picker(&mut self, entries: Vec<String>, current: &str) {

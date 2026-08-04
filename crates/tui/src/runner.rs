@@ -72,6 +72,17 @@ impl SessionRuntime {
         self.supervisor.run_turn(prompt).await
     }
 
+    /// Record an ordinary interactive draft literally, before preparation expands
+    /// file mentions or injects skill context. Persistence is best effort for the
+    /// turn; callers can surface the returned warning without blocking submission.
+    pub async fn record_prompt_history(&mut self, draft: &str) -> Result<(), String> {
+        self.supervisor.record_prompt_history(draft).await
+    }
+
+    pub fn prompt_history(&self) -> &[String] {
+        self.supervisor.prompt_history()
+    }
+
     pub async fn run_direct_bash(&self, command: &str) -> Result<String, String> {
         self.supervisor.run_direct_bash(command).await
     }

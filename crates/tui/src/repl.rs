@@ -454,6 +454,9 @@ impl Repl {
                         continue;
                     }
 
+                    if let Err(error) = self.runtime.record_prompt_history(&input).await {
+                        eprintln!("[history] session prompt history save failed: {error}");
+                    }
                     let (prepared, prompt) = match self.prepare_interactive_prompt(&input) {
                         Ok(prompt) => prompt,
                         Err(error) => {
@@ -2310,6 +2313,7 @@ impl Repl {
                     g.scroll_lines = 0;
                     g.transcript_follow_tail = true;
                     g.session_id = new_id.clone();
+                    g.clear_prompt_history();
                     g.model = self.runtime.model().to_string();
                     g.input_tokens = 0;
                     g.output_tokens = 0;
@@ -2511,6 +2515,7 @@ impl Repl {
                 provider,
                 self.runtime.config().provider.base_url_for(provider),
             );
+            g.set_prompt_history(self.runtime.prompt_history().to_vec());
         }
 
         // Seed from the authoritative session snapshot before replaying events so
@@ -3237,6 +3242,16 @@ impl Repl {
                         }
                         continue;
                     }
+                    if let Err(error) = self.runtime.record_prompt_history(&line).await
+                        && let Ok(mut g) = tui_state.lock()
+                    {
+                        g.push_error(format!(
+                            "[history] session prompt history save failed: {error}"
+                        ));
+                    }
+                    if let Ok(mut g) = tui_state.lock() {
+                        g.record_prompt_history(&line);
+                    }
                     let (prepared, prompt) = match self.prepare_interactive_prompt(&line) {
                         Ok(prompt) => prompt,
                         Err(error) => {
@@ -3739,6 +3754,7 @@ mod tests {
     }
 
     async fn submit_interactive_prompt(repl: &mut Repl, input: &str) -> Result<String, String> {
+        let _ = repl.runtime.record_prompt_history(input).await;
         let (prepared, prompt) = repl.prepare_interactive_prompt(input)?;
         let context_epoch = repl.runtime.context_compaction_epoch();
         let result = repl

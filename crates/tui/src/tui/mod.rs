@@ -11,6 +11,7 @@ pub mod input;
 pub mod layout;
 pub mod onboarding;
 pub mod overlay;
+pub mod prompt_history;
 pub mod replay;
 pub mod shared;
 pub mod state;

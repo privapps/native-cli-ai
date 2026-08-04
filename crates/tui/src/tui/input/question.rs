@@ -25,8 +25,12 @@ pub fn handle_question_modal_key(
     let total = 1 + q.options.len() + usize::from(has_chat);
     match (key.code, key.modifiers) {
         (KeyCode::Esc, _) => {
-            state.close_question_modal();
-            QuestionModalKeyResult::ChatAboutThis
+            if q.allow_custom {
+                state.close_question_modal();
+                QuestionModalKeyResult::ChatAboutThis
+            } else {
+                QuestionModalKeyResult::Handled
+            }
         }
         (KeyCode::Up, _) => {
             if let Some(idx) = state.question_modal_index_mut() {
@@ -64,6 +68,58 @@ mod tests {
     use super::*;
     use nca_common::event::{InteractiveQuestionPayload, QuestionOption};
     use std::path::PathBuf;
+
+    #[test]
+    fn esc_without_custom_is_noop() {
+        let mut st = TuiSessionState::new(
+            "s".into(),
+            "m".into(),
+            "a".into(),
+            "default".into(),
+            PathBuf::from("/tmp"),
+        );
+        st.active_question = Some(InteractiveQuestionPayload {
+            question_id: "q".into(),
+            call_id: "c".into(),
+            prompt: "Pick".into(),
+            options: vec![],
+            allow_custom: false,
+            suggested_answer: "A".into(),
+        });
+        st.open_question_modal();
+
+        assert_eq!(
+            handle_question_modal_key(&mut st, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            QuestionModalKeyResult::Handled
+        );
+        assert!(st.question_modal_open());
+    }
+
+    #[test]
+    fn esc_with_custom_returns_chat_about_this() {
+        let mut st = TuiSessionState::new(
+            "s".into(),
+            "m".into(),
+            "a".into(),
+            "default".into(),
+            PathBuf::from("/tmp"),
+        );
+        st.active_question = Some(InteractiveQuestionPayload {
+            question_id: "q".into(),
+            call_id: "c".into(),
+            prompt: "Pick".into(),
+            options: vec![],
+            allow_custom: true,
+            suggested_answer: "A".into(),
+        });
+        st.open_question_modal();
+
+        assert_eq!(
+            handle_question_modal_key(&mut st, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            QuestionModalKeyResult::ChatAboutThis
+        );
+        assert!(!st.question_modal_open());
+    }
 
     #[test]
     fn enter_on_suggested_returns_selection() {

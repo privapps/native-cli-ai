@@ -70,6 +70,8 @@ pub struct Supervisor {
     orchestration: Option<OrchestrationContext>,
     /// Authoritative session todo list (shared with `update_todos` tool).
     todos: Arc<Mutex<Vec<AgentTodo>>>,
+    /// Literal ordinary chat drafts in submission order, capped at 100 entries.
+    prompt_history: Vec<String>,
     config: NcaConfig,
     execution: ExecutionContext,
     safe_mode: bool,
@@ -304,6 +306,7 @@ impl Supervisor {
             session_summary: None,
             orchestration: cfg.orchestration_context,
             todos,
+            prompt_history: Vec::new(),
             config,
             execution: cfg.execution,
             safe_mode: cfg.safe_mode,
@@ -314,6 +317,7 @@ impl Supervisor {
         };
 
         if let Some(loaded) = restored {
+            let prompt_history = loaded.prompt_history_or_legacy();
             sup.session_id = loaded.meta.id;
             sup.workspace_root = loaded.meta.workspace;
             sup.model = loaded.meta.model;
@@ -322,6 +326,7 @@ impl Supervisor {
             sup.status = loaded.meta.status;
             sup.pid = Some(std::process::id());
             sup.agent.messages = loaded.messages;
+            sup.prompt_history = prompt_history;
             sup.worktree_path = loaded.meta.worktree_path;
             sup.branch = loaded.meta.branch;
             sup.base_branch = loaded.meta.base_branch;
@@ -544,10 +549,21 @@ impl Supervisor {
         self.check_and_summarize_context().await;
 
         self.refresh_session_summary();
-        self.save().await.map_err(ProviderError::Other)?;
-        self.update_last_session()
-            .await
-            .map_err(ProviderError::Other)?;
+        // Provider completion has already succeeded. Session-state persistence
+        // is best effort so a disk failure cannot block the submitted turn.
+        if let Err(error) = self.save().await {
+            tracing::warn!("failed to persist session state after turn: {error}");
+            if let Some(tx) = self.agent.event_sender() {
+                let _ = tx
+                    .send(AgentEvent::ContextWarning {
+                        message: format!("session state save failed: {error}"),
+                    })
+                    .await;
+            }
+        }
+        if let Err(error) = self.update_last_session().await {
+            tracing::warn!("failed to update last session pointer: {error}");
+        }
         Ok(output)
     }
 
@@ -779,6 +795,26 @@ impl Supervisor {
         let _ = self.update_last_session().await;
     }
 
+    /// Record a literal ordinary chat draft before any file or skill expansion.
+    /// The in-memory entry is retained even when best-effort persistence fails.
+    pub async fn record_prompt_history(&mut self, draft: &str) -> Result<(), String> {
+        if draft.trim().is_empty() {
+            return Ok(());
+        }
+        self.prompt_history.push(draft.to_string());
+        if self.prompt_history.len() > nca_common::session::MAX_PROMPT_HISTORY_ENTRIES {
+            let excess =
+                self.prompt_history.len() - nca_common::session::MAX_PROMPT_HISTORY_ENTRIES;
+            self.prompt_history.drain(..excess);
+        }
+        self.save().await
+    }
+
+    /// Current literal prompt history, including legacy fallback loaded at resume.
+    pub fn prompt_history(&self) -> &[String] {
+        &self.prompt_history
+    }
+
     pub async fn save(&self) -> Result<(), String> {
         let session = self.current_session_state(Utc::now());
         self.session_store
@@ -823,6 +859,7 @@ impl Supervisor {
                 execution: self.execution,
             },
             messages: self.agent.messages.clone(),
+            prompt_history: self.prompt_history.clone(),
             total_input_tokens: self.agent.cost_tracker.input_tokens,
             total_output_tokens: self.agent.cost_tracker.output_tokens,
             estimated_cost_usd: self.agent.cost_tracker.estimated_cost_usd(),
@@ -904,6 +941,7 @@ impl Supervisor {
     pub fn reset_for_new_session(&mut self) {
         self.session_id = generate_session_id();
         self.agent.messages.clear();
+        self.prompt_history.clear();
         self.child_session_ids.clear();
         self.parent_session_id = None;
         self.inherited_summary = None;
@@ -2026,6 +2064,7 @@ mod tests {
                 execution: Default::default(),
             },
             messages: vec![Message::user("hello")],
+            prompt_history: Vec::new(),
             total_input_tokens: 0,
             total_output_tokens: 0,
             estimated_cost_usd: 0.0,
@@ -2183,6 +2222,49 @@ mod tests {
         assert!(saved.todos.is_empty());
 
         supervisor.finish(EndReason::Completed).await;
+    }
+
+    #[tokio::test]
+    async fn prompt_history_survives_a_save_failure_in_memory() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut config = nca_common::config::NcaConfig::default();
+        config.session.history_dir = workspace.path().join("sessions");
+        config.session.last_session_file = workspace.path().join("last-session");
+        config.memory.file_path = workspace.path().join("memory.json");
+        config.provider.default = ProviderKind::Custom;
+        config.provider.custom.base_url = "http://127.0.0.1:1".into();
+        config.provider.custom.api_key = Some("test-key".into());
+        config.provider.custom.model = "test-model".into();
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAi;
+        config.model.default_model = "test-model".into();
+        config.memory.context.auto_detect_context_window = false;
+        config.memory.context.query_provider_models_api = false;
+
+        let mut supervisor = Supervisor::create(SupervisorConfig {
+            config,
+            workspace_root: workspace.path().to_path_buf(),
+            safe_mode: true,
+            interactive_approvals: false,
+            session_id: Some("prompt-history-save-failure".into()),
+            approval_handler: None,
+            orchestration_context: None,
+            execution: ExecutionContext::normal(),
+            explicitly_requested_skills: Vec::new(),
+        })
+        .await
+        .expect("create supervisor");
+
+        let blocked_path = workspace.path().join("not-a-directory");
+        std::fs::write(&blocked_path, "file").expect("create blocking file");
+        supervisor.session_store = SessionStore::new(&blocked_path);
+
+        let draft = "  literal\n終わり  \n";
+        let error = supervisor
+            .record_prompt_history(draft)
+            .await
+            .expect_err("save should fail against a file path");
+        assert!(!error.is_empty());
+        assert_eq!(supervisor.prompt_history(), &[draft.to_string()]);
     }
 
     #[tokio::test]
