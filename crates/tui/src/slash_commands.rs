@@ -334,6 +334,21 @@ pub fn visible_commands() -> impl Iterator<Item = &'static CommandSpec> {
     COMMAND_SPECS.iter().filter(|spec| !spec.hidden)
 }
 
+/// Return every user-facing built-in command spelling once per registry entry.
+///
+/// Canonical names and supported aliases share the same command metadata. This
+/// keeps line and fullscreen completion aligned without changing command
+/// resolution or the registry's canonical identity.
+pub fn command_surface_entries() -> impl Iterator<Item = (&'static CommandSpec, &'static str)> {
+    COMMAND_SPECS
+        .iter()
+        .filter(|spec| !spec.hidden)
+        .flat_map(|spec| {
+            std::iter::once((spec, spec.name))
+                .chain(spec.aliases.iter().copied().map(move |alias| (spec, alias)))
+        })
+}
+
 pub fn resolve_command(name: &str) -> Option<&'static CommandSpec> {
     COMMAND_SPECS
         .iter()

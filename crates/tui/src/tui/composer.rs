@@ -6,10 +6,9 @@
 //! knowledge, which keeps these helpers trivially unit-testable.
 
 use crate::file_mentions;
-use crate::slash_commands::{CommandCategory, visible_commands};
+use crate::slash_commands::{CommandCategory, command_surface_entries, visible_commands};
 use crate::tui::app::TuiCmd;
 use crate::tui::theme;
-use nca_core::skills::{SkillCatalog, SkillSource};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::path::{Path, PathBuf};
@@ -567,96 +566,45 @@ pub fn composer_input_height_with_width(
 // Slash-command entries
 // ---------------------------------------------------------------------------
 
-/// Entry for the slash panel: either a hardcoded command or a discovered skill.
-#[derive(Clone)]
+/// Entry for the slash panel: one canonical built-in command spelling or
+/// one of its supported aliases.
+#[derive(Clone, Copy)]
 pub enum SlashEntry {
     Command(&'static str),
-    Skill {
-        command: String,
-        display_name: String,
-        description: String,
-        source: SkillSource,
-        directory: PathBuf,
-        manual_only: bool,
-    },
 }
 
 impl SlashEntry {
     pub fn command_str(&self) -> String {
         match self {
-            SlashEntry::Command(s) => s.to_string(),
-            SlashEntry::Skill { command, .. } => format!("/{command}"),
+            SlashEntry::Command(spelling) => spelling.to_string(),
         }
     }
 
     pub fn display_text(&self) -> String {
-        match self {
-            SlashEntry::Command(s) => s.to_string(),
-            SlashEntry::Skill {
-                command,
-                display_name,
-                description,
-                source,
-                directory,
-                manual_only,
-            } => {
-                let tag = match source {
-                    SkillSource::AgentsMd => " (AGENTS.md)",
-                    SkillSource::FileSystem => " (skill dir)",
-                    SkillSource::BuiltIn => " (built-in)",
-                };
-                let manual = if *manual_only { " · manual-only" } else { "" };
-                format!(
-                    "/{command:<20} — {display_name}: {description}{tag} · {}{}",
-                    directory.display(),
-                    manual
-                )
-            }
-        }
+        self.command_str()
     }
 }
 
-/// Collect skills from `SkillCatalog` for slash panel display.
-fn collect_skill_entries(workspace_root: &Path, skill_dirs: &[PathBuf]) -> Vec<SlashEntry> {
-    match SkillCatalog::discover(workspace_root, skill_dirs) {
-        Ok(skills) => skills
-            .into_iter()
-            .map(|s| {
-                let display_name = s.display_label().to_string();
-                let description = s.presentation_description().to_string();
-                let manual_only = s.is_manual_only();
-                SlashEntry::Skill {
-                    command: s.command,
-                    display_name,
-                    description,
-                    source: s.source,
-                    directory: s.directory,
-                    manual_only,
-                }
-            })
-            .collect(),
-        Err(_) => Vec::new(),
-    }
-}
-
-/// Load all slash-commands: hardcoded commands + discovered skills.
-pub fn load_slash_entries(workspace_root: &Path, skill_dirs: &[PathBuf]) -> Vec<SlashEntry> {
-    let mut entries: Vec<SlashEntry> = visible_commands()
-        .map(|spec| SlashEntry::Command(spec.name))
+/// Load the built-in slash-command surface.
+///
+/// Skill commands intentionally do not belong here: `$<command>` completion
+/// and `/skills` are the dedicated skill surfaces. The arguments remain part
+/// of this seam so callers can continue to pass the runtime discovery context
+/// without creating a second command-loading path.
+pub fn load_slash_entries(_workspace_root: &Path, _skill_dirs: &[PathBuf]) -> Vec<SlashEntry> {
+    let mut entries: Vec<SlashEntry> = command_surface_entries()
+        .map(|(_, spelling)| SlashEntry::Command(spelling))
         .collect();
 
-    entries.extend(collect_skill_entries(workspace_root, skill_dirs));
-
-    entries.sort_by(|a, b| {
-        a.command_str()
-            .to_lowercase()
-            .cmp(&b.command_str().to_lowercase())
+    entries.sort_by_key(|entry| entry.command_str().to_ascii_lowercase());
+    entries.dedup_by(|left, right| {
+        left.command_str()
+            .eq_ignore_ascii_case(&right.command_str())
     });
-    entries.dedup_by(|a, b| a.command_str().eq_ignore_ascii_case(&b.command_str()));
     entries
 }
 
-/// Filter slash entries by buffer prefix.
+/// Filter built-in slash entries by buffer prefix.
 pub fn filter_slash_entries<'a>(entries: &'a [SlashEntry], buffer: &str) -> Vec<&'a SlashEntry> {
     if !slash_panel_visible(buffer) {
         return Vec::new();
@@ -978,7 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_agents_skill_is_in_inline_completion_and_builtins_stay_distinct() {
+    fn generic_slash_surface_contains_builtins_and_aliases_but_no_skills() {
         let dir = tempfile::tempdir().unwrap();
         let skill_dir = dir.path().join(".agents/skills/review");
         std::fs::create_dir_all(&skill_dir).unwrap();
@@ -989,21 +937,36 @@ mod tests {
         .unwrap();
 
         let entries = load_slash_entries(dir.path(), &[PathBuf::from(".agents/skills")]);
-        let skill = entries
-            .iter()
-            .find(|entry| entry.command_str() == "/agents-review")
-            .unwrap();
-        assert!(skill.display_text().contains("Inspect a diff"));
-        assert!(skill.display_text().contains(".agents/skills/review"));
+        assert!(entries.iter().any(|entry| entry.command_str() == "/exit"));
+        assert!(entries.iter().any(|entry| entry.command_str() == "/quit"));
+        assert!(!entries.iter().any(|entry| entry.command_str() == "/q"));
+        assert!(entries.iter().any(|entry| entry.command_str() == "/skills"));
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.command_str() == "/agents-review")
+        );
         assert!(
             entries
                 .iter()
-                .any(|entry| { matches!(entry, SlashEntry::Command("/help")) })
+                .any(|entry| matches!(entry, SlashEntry::Command("/help")))
         );
     }
 
     #[test]
-    fn inline_completion_uses_a_custom_configured_skill_root() {
+    fn generic_slash_surface_aliases_filter_and_insert_as_their_own_spelling() {
+        let entries = load_slash_entries(Path::new("/tmp"), &[]);
+        let quit = filter_slash_entries(&entries, "/qui");
+        assert_eq!(quit.len(), 1);
+        assert_eq!(quit[0].command_str(), "/quit");
+        assert_eq!(quit[0].display_text(), "/quit");
+
+        let q = filter_slash_entries(&entries, "/q");
+        assert!(q.iter().all(|entry| entry.command_str() != "/q"));
+    }
+
+    #[test]
+    fn configured_skill_is_not_in_generic_slash_surface() {
         let dir = tempfile::tempdir().unwrap();
         let skill_dir = dir.path().join("configured-skills/custom-review");
         std::fs::create_dir_all(&skill_dir).unwrap();
@@ -1013,16 +976,13 @@ mod tests {
         )
         .unwrap();
 
+        // The configured skill remains available through `$` completion; the
+        // generic slash surface intentionally does not load it.
         let entries = load_slash_entries(dir.path(), &[PathBuf::from("configured-skills")]);
-        let skill = entries
-            .iter()
-            .find(|entry| entry.command_str() == "/custom-review")
-            .unwrap();
-        assert!(skill.display_text().contains("Inspect configured roots"));
         assert!(
-            skill
-                .display_text()
-                .contains("configured-skills/custom-review")
+            !entries
+                .iter()
+                .any(|entry| entry.command_str() == "/custom-review")
         );
     }
 }

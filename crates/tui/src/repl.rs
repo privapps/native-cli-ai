@@ -8,7 +8,7 @@ use crate::skill_references::{
     LoadedSkillContext, PreparedSkillPrompt, complete_skill_references,
     prepare_skill_references_with_context,
 };
-use crate::slash_commands::{help_lines as registry_help_lines, visible_commands};
+use crate::slash_commands::{command_surface_entries, help_lines as registry_help_lines};
 use crate::tui::custom_provider_flow::{CustomProviderProbeOutcome, CustomProviderSetupTransition};
 use crate::tui::{
     ApprovalAnswer, CustomProviderProbeAction, CustomProviderSetupSubmission, DisplayBlock,
@@ -3476,12 +3476,14 @@ fn complete_repl_input(
         }
     }
 
-    // Complete REPL commands starting with /
+    // Complete built-in commands and their supported aliases. Discovered
+    // skills intentionally stay on the `$` reference and `/skills` picker
+    // surfaces rather than appearing in generic slash completion.
     if line.starts_with('/') {
-        for spec in visible_commands() {
-            if spec.name.starts_with(line) {
+        for (spec, spelling) in command_surface_entries() {
+            if spelling.starts_with(line) {
                 suggestions.push(Suggestion {
-                    value: spec.name.to_string(),
+                    value: spelling.to_string(),
                     display_override: None,
                     description: Some(spec.description.to_string()),
                     extra: None,
@@ -3507,36 +3509,6 @@ fn complete_repl_input(
                     value: full,
                     display_override: None,
                     description: Some("Shell command".to_string()),
-                    extra: None,
-                    span: reedline::Span { start: 0, end: 0 },
-                    append_whitespace: true,
-                    style: None,
-                    match_indices: None,
-                });
-            }
-        }
-    }
-
-    // Keep slash-style skill commands available alongside the built-in
-    // commands. Dollar references are completed by the helper above.
-    if let Ok(skills) = SkillCatalog::discover(workspace_root, skill_directories) {
-        for skill in skills {
-            let skill_cmd = format!("/{}", skill.command);
-            if skill_cmd.starts_with(line) {
-                suggestions.push(Suggestion {
-                    value: skill_cmd,
-                    display_override: None,
-                    description: Some(format!(
-                        "{} — {} [{}]{}",
-                        skill.display_label(),
-                        skill.presentation_description(),
-                        skill.directory.display(),
-                        if skill.is_manual_only() {
-                            " · manual-only"
-                        } else {
-                            ""
-                        }
-                    )),
                     extra: None,
                     span: reedline::Span { start: 0, end: 0 },
                     append_whitespace: true,
@@ -4123,6 +4095,77 @@ mod tests {
         }));
     }
 
+    #[tokio::test]
+    async fn interactive_skill_picker_reference_reaches_provider_only_after_submission() {
+        let (mut repl, workspace, request_bodies) = skill_repl(
+            vec![(200, goal_text_response("picker reference complete"))],
+            ProviderCompatibility::OpenAi,
+        )
+        .await;
+        write_interactive_skill(
+            workspace.path(),
+            "picker-reference",
+            "Picker-selected guidance.",
+            "disable-model-invocation: true\nmodel: picker-only-model\npermission-mode: plan\ncontext: fork\n",
+        );
+        let state = Arc::new(Mutex::new(TuiSessionState::new(
+            repl.runtime.session_id().to_string(),
+            repl.runtime.model().to_string(),
+            "@build".into(),
+            format!("{:?}", repl.runtime.permission_mode()),
+            workspace.path().to_path_buf(),
+        )));
+        let model_before = repl.runtime.model().to_string();
+        let permission_before = repl.runtime.permission_mode();
+        let messages_before = repl.runtime.messages().len();
+
+        repl.handle_command("/skills picker-reference", ReplOutput::Tui(&state))
+            .await
+            .expect("open picker from the application command path");
+        {
+            let state = state.lock().expect("picker state lock");
+            assert!(state.skill_picker_open());
+            assert_eq!(state.skill_picker_query(), "picker-reference");
+            assert_eq!(repl.runtime.messages().len(), messages_before);
+        }
+
+        crate::tui::input::handle_skill_picker_key(
+            &mut state.lock().expect("picker state lock"),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        let draft = {
+            let state = state.lock().expect("picker state lock");
+            assert!(!state.skill_picker_open());
+            assert_eq!(state.input_buffer, "$picker-reference ");
+            state.input_buffer.clone()
+        };
+        assert_eq!(repl.runtime.messages().len(), messages_before);
+
+        let output = submit_interactive_prompt(&mut repl, &format!("{draft}review this change"))
+            .await
+            .expect("submit picker-selected reference");
+        assert_eq!(output, "picker reference complete");
+        assert_eq!(repl.runtime.model(), model_before);
+        assert_eq!(repl.runtime.permission_mode(), permission_before);
+
+        let request = request_bodies
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("picker reference provider request");
+        let prompt = provider_user_prompt(&request, ProviderCompatibility::OpenAi);
+        assert!(prompt.contains("Skill `picker-reference`:"));
+        assert!(prompt.contains("Picker-selected guidance."));
+        assert!(prompt.contains("untrusted task guidance"));
+        assert!(prompt.contains("User request:\nreview this change"));
+        assert!(!prompt.contains("picker-only-model"));
+        let user_message = repl
+            .runtime
+            .messages()
+            .iter()
+            .rev()
+            .find(|message| message.role == nca_common::message::Role::User)
+            .expect("picker reference canonical user message");
+        assert_eq!(user_message.content.to_summary_text(), prompt);
+    }
     #[tokio::test]
     async fn interactive_application_flow_does_not_reparse_files_or_skill_bodies() {
         let (mut repl, workspace, request_bodies) = skill_repl(
@@ -5572,7 +5615,7 @@ mod tests {
             assert!(state.lock().expect("state lock").should_exit);
         }
 
-        let (mut repl, state, _) = test_repl(false).await;
+        let (mut repl, state, workspace) = test_repl(false).await;
         assert!(
             repl.dispatch_tui_slash_command("/q", &state)
                 .await
@@ -5583,12 +5626,33 @@ mod tests {
         assert!(state.blocks.iter().any(|block| {
             matches!(block, DisplayBlock::System(line) if line == "[!] unknown command: /q")
         }));
+        drop(state);
 
+        let quit_suggestions = repl.complete("/qui", 4);
+        assert!(
+            quit_suggestions
+                .iter()
+                .any(|suggestion| suggestion.value == "/quit")
+        );
         let suggestions = repl.complete("/q", 2);
         assert!(
             suggestions
                 .iter()
                 .all(|suggestion| suggestion.value != "/q")
+        );
+
+        let skill_dir = workspace.path().join(".agents/skills/agents-review");
+        std::fs::create_dir_all(&skill_dir).expect("skill directory");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: Agents Review\ncommand: agents-review\ndescription: Inspect a diff\n---\nReview.\n",
+        )
+        .expect("skill file");
+        repl.runtime.config_mut().harness.skill_directories = vec![PathBuf::from(".agents/skills")];
+        assert!(
+            repl.complete("/agents", 7)
+                .iter()
+                .all(|suggestion| suggestion.value != "/agents-review")
         );
         assert!(
             repl.complete("/sk", 3)
@@ -5653,7 +5717,7 @@ mod tests {
 
         let state = state.lock().expect("state lock");
         assert!(!state.skill_picker_open());
-        assert_eq!(state.input_buffer, "/nca-acceptance-picker ");
+        assert_eq!(state.input_buffer, "$nca-acceptance-picker ");
         assert!(state.blocks.is_empty());
     }
 
@@ -5734,15 +5798,11 @@ mod tests {
         .expect("metadata file");
 
         let suggestions = repl.complete("/catalog", 7);
-        let suggestion = suggestions
-            .iter()
-            .find(|suggestion| suggestion.value == "/catalog-presentation")
-            .expect("skill completion");
-        let description = suggestion.description.as_deref().unwrap_or_default();
-        assert!(description.contains("Review Changes"));
-        assert!(description.contains("Inspect a diff"));
-        assert!(description.contains(".agents/skills/catalog-presentation"));
-        assert!(description.contains("manual-only"));
+        assert!(
+            suggestions
+                .iter()
+                .all(|suggestion| suggestion.value != "/catalog-presentation")
+        );
 
         let line = "Use $catalog and keep this suffix";
         let cursor = line.find("$catalog").unwrap() + "$catalog".len();
@@ -5751,6 +5811,10 @@ mod tests {
             .iter()
             .find(|suggestion| suggestion.value == "$catalog-presentation")
             .expect("dollar skill completion");
+        let dollar_description = dollar_suggestion.description.as_deref().unwrap_or_default();
+        assert!(dollar_description.contains("Review Changes"));
+        assert!(dollar_description.contains("Inspect a diff"));
+        assert!(dollar_description.contains("manual-only"));
         assert_eq!(dollar_suggestion.span.start, line.find('$').unwrap());
         assert_eq!(dollar_suggestion.span.end, cursor);
         assert!(!dollar_suggestion.append_whitespace);

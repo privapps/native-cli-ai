@@ -17,10 +17,10 @@ use crate::tui::connect_modal::{
     ConnectRow, build_connect_rows, clamp_selection, row_index_for_selection,
 };
 use crate::tui::input::{
-    ApprovalAnswer, ConnectModalKeyResult, CustomProviderSetupKeyResult, SKILL_PICKER_MAX_ROWS,
-    empty_skill_picker_message, filtered_skill_indices, handle_approval_key,
-    handle_connect_modal_key, handle_custom_provider_setup_key, handle_skill_picker_key,
-    parse_tui_question_answer, render_branch_picker, render_command_palette,
+    ApprovalAnswer, ConnectModalKeyResult, CustomProviderSetupKeyResult, filtered_skill_indices,
+    handle_approval_key, handle_connect_modal_key, handle_custom_provider_setup_key,
+    handle_skill_picker_key, handle_skill_picker_mouse, parse_tui_question_answer,
+    render_branch_picker, render_command_palette, render_skill_picker, skill_picker_popup_height,
 };
 use crate::tui::layout::{
     WORKSPACE_DISPLAY_WIDTH, centered_rect, layout_chunks, layout_with_sidebar, rect_contains,
@@ -958,7 +958,7 @@ pub fn run_blocking(
     let mut terminal = setup_terminal()?;
     let mut terminal_restore_guard = TerminalRestoreGuard::new();
 
-    // Load slash entries once: hardcoded commands + discovered skills
+    // Load the built-in slash surface once: canonical commands + aliases.
     let workspace_root = {
         let g = state.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         g.workspace_root.clone()
@@ -2252,92 +2252,12 @@ pub fn run_blocking(
 
                 if g.skill_picker_open() {
                     let filtered = filtered_skill_indices(&g);
-                    let pick = g
-                        .skill_picker_index()
-                        .min(filtered.len().saturating_sub(1));
-                    let viewport = filtered.len().min(SKILL_PICKER_MAX_ROWS);
-                    let max_scroll = filtered.len().saturating_sub(viewport);
-                    *g.skill_picker_scroll_mut().unwrap() = g
-                        .skill_picker_scroll()
-                        .min(max_scroll)
-                        .min(pick);
-                    let start = g.skill_picker_scroll();
-                    let end = (start + viewport).min(filtered.len());
-                    let popup_h = (viewport as u16).saturating_add(7).max(9);
-                    let popup_area = centered_rect(area, 92, popup_h);
-                    let query = if g.skill_picker_query().is_empty() {
-                        "type to filter".to_string()
-                    } else {
-                        g.skill_picker_query().to_string()
-                    };
-                    let mut lines = vec![
-                        Line::from(vec![
-                            Span::styled(
-                                " Search ",
-                                Style::default()
-                                    .fg(theme::MUTED)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(query, Style::default().fg(theme::TEXT)),
-                        ]),
-                        Line::default(),
-                    ];
-                    if filtered.is_empty() {
-                        let message = empty_skill_picker_message(&g).unwrap();
-                        lines.push(Line::from(Span::styled(
-                            message,
-                            Style::default().fg(theme::MUTED),
-                        )));
-                    } else {
-                        for (visible, entry_index) in filtered[start..end].iter().enumerate() {
-                            let entry = &g.skill_picker_entries()[*entry_index];
-                            let selected = start + visible == pick;
-                            let style = if selected {
-                                Style::default()
-                                    .fg(Color::Black)
-                                    .bg(theme::USER)
-                                    .add_modifier(Modifier::BOLD)
-                            } else {
-                                Style::default().fg(theme::TEXT)
-                            };
-                            let manual = if entry.manual_only {
-                                " · manual-only"
-                            } else {
-                                ""
-                            };
-                            lines.push(Line::from(Span::styled(
-                                format!(
-                                    " /{} — {}: {} · {} [{}]{}",
-                                    entry.command,
-                                    entry.display_name,
-                                    entry.description,
-                                    entry.directory,
-                                    entry.source,
-                                    manual
-                                ),
-                                style,
-                            )));
-                        }
-                    }
-                    lines.push(Line::default());
-                    lines.push(Line::from(Span::styled(
-                        " ↑↓/jk select · Enter insert · Esc/q close ",
-                        Style::default().fg(theme::MUTED),
-                    )));
-                    frame.render_widget(ClearWidget, popup_area);
-                    let popup = Paragraph::new(Text::from(lines))
-                        .block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .border_style(Style::default().fg(theme::BORDER))
-                                .title(Span::styled(
-                                    " skills ",
-                                    Style::default().fg(theme::MUTED),
-                                )),
-                        )
-                        .style(Style::default().bg(theme::SURFACE))
-                        .wrap(Wrap { trim: false });
-                    frame.render_widget(popup, popup_area);
+                    let popup_area = centered_rect(
+                        area,
+                        92,
+                        skill_picker_popup_height(filtered.len()),
+                    );
+                    render_skill_picker(frame, popup_area, &mut g);
                 }
 
                 // Model picker popup.
@@ -2626,7 +2546,19 @@ pub fn run_blocking(
                 Event::Mouse(_) if g.permission_picker_open() => continue,
                 Event::Mouse(_) if g.agent_picker_open() => continue,
                 Event::Mouse(_) if g.session_picker_open() => continue,
-                Event::Mouse(_) if g.skill_picker_open() => continue,
+                Event::Mouse(m) if g.skill_picker_open() => {
+                    if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        let sz = terminal.size()?;
+                        let area = Rect::new(0, 0, sz.width, sz.height);
+                        let filtered = filtered_skill_indices(&g);
+                        let popup_area =
+                            centered_rect(area, 92, skill_picker_popup_height(filtered.len()));
+                        if rect_contains(popup_area, m.column, m.row) {
+                            handle_skill_picker_mouse(&mut g, popup_area, m.row);
+                        }
+                    }
+                    continue;
+                }
                 Event::Mouse(_) if g.question_modal_open() => continue,
                 Event::Paste(text) => {
                     dispatch_paste(&mut g, &text);
@@ -4537,14 +4469,34 @@ mod approval_parse_tests {
     }
 
     #[test]
-    fn slash_panel_hides_merged_custom_alias() {
+    fn slash_panel_includes_supported_aliases_without_skill_entries() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let entries = load_slash_entries(dir.path(), &[]);
-        let filtered = filter_slash_entries(&entries, "/cus");
-        assert!(filtered.is_empty());
-        let connect = filter_slash_entries(&entries, "/con");
+        let skill_dir = dir.path().join(".agents/skills/custom-review");
+        std::fs::create_dir_all(&skill_dir).expect("skill directory");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: Custom Review\ncommand: custom-review\ndescription: Review\n---\nReview.\n",
+        )
+        .expect("skill file");
+
+        let entries = load_slash_entries(dir.path(), &[PathBuf::from(".agents/skills")]);
+        let quit = filter_slash_entries(&entries, "/qui");
+        assert_eq!(quit.len(), 1);
+        assert_eq!(quit[0].command_str(), "/quit");
         assert!(
-            connect
+            filter_slash_entries(&entries, "/q")
+                .iter()
+                .all(|entry| entry.command_str() != "/q")
+        );
+        let custom = filter_slash_entries(&entries, "/cus");
+        assert!(custom.iter().any(|entry| entry.command_str() == "/custom"));
+        assert!(
+            custom
+                .iter()
+                .all(|entry| entry.command_str() != "/custom-review")
+        );
+        assert!(
+            filter_slash_entries(&entries, "/con")
                 .iter()
                 .any(|entry| entry.command_str() == "/connect")
         );

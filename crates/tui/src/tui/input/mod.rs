@@ -27,7 +27,8 @@ pub use custom_provider::{
 pub use question::{QuestionModalKeyResult, handle_question_modal_key};
 pub use skill_picker::{
     SKILL_PICKER_MAX_ROWS, empty_skill_picker_message, filtered_skill_indices,
-    handle_skill_picker_key,
+    handle_skill_picker_key, handle_skill_picker_mouse, render_skill_picker,
+    skill_picker_popup_height, skill_picker_row, skill_picker_visible_rows, truncate_display_cells,
 };
 pub use slash_panel::{handle_slash_panel_key, render_slash_panel};
 

@@ -100,6 +100,27 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn tab_selects_the_supported_alias_spelling() {
+        let mut state = TuiSessionState::new(
+            "s".into(),
+            "m".into(),
+            "a".into(),
+            "default".into(),
+            PathBuf::from("/tmp"),
+        );
+        state.input_buffer = "/qui".into();
+        let entries =
+            crate::tui::composer::load_slash_entries(PathBuf::from("/tmp").as_path(), &[]);
+
+        assert!(handle_slash_panel_key(
+            &mut state,
+            &entries,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        ));
+        assert_eq!(state.input_buffer, "/quit");
+    }
+
+    #[test]
     fn down_advances_selection() {
         let mut st = TuiSessionState::new(
             "s".into(),

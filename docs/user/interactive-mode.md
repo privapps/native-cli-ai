@@ -189,7 +189,7 @@ session persistence, replay, and clipboard output remain unchanged.
 
 ### Slash Commands (`/`)
 
-Type `/` to access slash commands. In the TUI, this opens an inline autocomplete menu.
+Type `/` to access built-in slash commands and supported aliases. In the TUI, this opens an inline autocomplete menu. Discovered skills are intentionally not listed on this generic slash surface; use the dedicated `/skills` picker or `$` completion for skills.
 
 ---
 
@@ -310,7 +310,7 @@ for a gateway that implements that API; use `openai` for Chat Completions.
 
 | Command | Description |
 |---------|-------------|
-| `/skills [query]` | Open the searchable skill picker; Enter inserts a skill command without running it |
+| `/skills [query]` | Open the searchable skill picker; Enter inserts a `$skill` guidance reference without running it |
 | `/memory [text]` | Show memory notes, or add a note |
 | `/mcp` | List MCP servers |
 | `/permissions [mode]` | Show or set permission mode |

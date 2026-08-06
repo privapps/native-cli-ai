@@ -1,10 +1,11 @@
 # Ticket 04 — `$` Skill Reference Documentation and Acceptance Tests
 
 **Type:** Implementation plan  
-**Status:** Completed  
+**Status:** Completed
+**Implementation status:** completed
 **Date:** 2026-08-03  
 **Related:** [dollar-prefixed skill references](2026-08-03-dollar-prefixed-skill-references.md)  
-**Last verified:** 2026-08-03 (interactive acceptance tests, workspace tests, and documentation checks)
+**Last verified:** 2026-08-06 (focused TUI tests, TUI integration tests, workspace tests, Clippy, docs/spec validation, formatting, and scoped diff checks)
 
 ## Scope
 

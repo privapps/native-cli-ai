@@ -128,11 +128,16 @@ When delegating work to a child session with `spawn_subagent`, the parent can al
 
 In the full-screen TUI, search matches commands, display names, and
 descriptions. Use Up/Down (or `j`/`k`) to select a row. Enter inserts
-`/<skill> ` into the composer without executing it; add a task and submit the
-draft normally. Escape or `q` closes the picker without changing the draft.
-Rows include the source directory and mark manual-only skills.
+`$<skill> ` into the composer as a bounded guidance reference without
+executing the skill; add a task and submit the draft normally. Escape or `q`
+closes the picker without changing the draft. Rows include the source
+directory and mark manual-only skills.
 
 ### Dollar Reference
+
+`$skill` references add bounded, untrusted `SKILL.md` guidance to the draft;
+they do not execute a skill or change runtime policy. The existing `/skill`
+command and `invoke_skill` tool remain the explicit execution/loading paths.
 
 In an interactive prompt, type `$` to complete a discovered skill reference:
 

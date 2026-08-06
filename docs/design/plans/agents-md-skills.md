@@ -39,7 +39,7 @@ Treat the repo root `AGENTS.md` as both:
 - Harness/system prompt layering
 - `nca skills` and `nca skills --json`
 - Harness skill summary in the system prompt
-- TUI slash palette and REPL slash execution
+- TUI built-in slash panel, dedicated `/skills` picker, `$` reference completion, and REPL slash execution
 
 ## Documentation updates
 
@@ -51,5 +51,5 @@ Treat the repo root `AGENTS.md` as both:
 ## Current status
 
 - `crates/core/src/skills.rs` parses `AGENTS.md` sections into `Skill` entries.
-- `crates/cli/src/tui/app.rs` includes discovered skills in the slash palette.
+- The generic TUI slash surface exposes built-in commands and aliases only; discovered skills remain available through the dedicated `/skills` picker, `$` reference completion, and explicit slash execution.
 - Prompt layering, workspace-root scope, refresh behavior, child-session propagation, and focused regression coverage are complete. The local feature spec records the acceptance evidence for this implementation.
