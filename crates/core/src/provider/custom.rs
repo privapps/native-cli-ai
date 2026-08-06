@@ -1177,12 +1177,6 @@ impl CustomProvider {
         self
     }
 
-    #[cfg(test)]
-    fn with_debug_requests(mut self, enabled: bool) -> Self {
-        self.debug_requests = enabled;
-        self
-    }
-
     fn emit_debug_request(&self, request: &reqwest::Request, api_key: &str, protocol: &str) {
         let output = format_debug_request(request, api_key, protocol);
         let _ = std::io::stderr().write_all(output.as_bytes());
@@ -1611,6 +1605,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_openai_completion_is_reported_as_stream_error() {
+        let _debug_env = debug_request_env(Some("1"));
         let body = concat!(
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
             "data: [DONE]\n\n"
@@ -1625,8 +1620,7 @@ mod tests {
         let debug_path = debug_dir.path().join("debug.log");
         let provider = CustomProvider::from_config(&config)
             .expect("provider")
-            .with_debug_log_path(&debug_path)
-            .with_debug_requests(true);
+            .with_debug_log_path(&debug_path);
         let stream = provider
             .chat(&[Message::user("hello")], &[], "", Path::new("."))
             .await
@@ -1644,6 +1638,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_debug_log_failure_does_not_block_custom_request() {
+        let _debug_env = debug_request_env(Some("1"));
         let body = concat!(
             "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
             "data: [DONE]\n\n"
@@ -1657,8 +1652,7 @@ mod tests {
         let debug_path = debug_dir.path().join("missing").join("debug.log");
         let provider = CustomProvider::from_config(&config)
             .expect("provider")
-            .with_debug_log_path(&debug_path)
-            .with_debug_requests(true);
+            .with_debug_log_path(&debug_path);
 
         let stream = provider
             .chat(&[Message::user("hello")], &[], "", Path::new("."))
@@ -1765,6 +1759,39 @@ mod tests {
             x_api_key: header("x-api-key"),
             anthropic_version: header("anthropic-version"),
             body,
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_provider_debug_request_requires_exact_env_value_through_public_chat() {
+        for value in [None, Some(""), Some("0"), Some("true"), Some(" 1")] {
+            let _debug_env = debug_request_env(value);
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            let base_url = spawn_sse_server(body.to_string(), 200, |_| {});
+            let mut config = NcaConfig::default();
+            config.provider.custom.api_key = Some("custom-test-key".into());
+            config.provider.custom.base_url = base_url;
+            config.provider.custom.compatibility = ProviderCompatibility::OpenAi;
+
+            let debug_dir = tempfile::tempdir().expect("debug directory");
+            let debug_path = debug_dir.path().join("debug.log");
+            let provider = CustomProvider::from_config(&config)
+                .expect("provider")
+                .with_debug_log_path(&debug_path);
+            let stream = provider
+                .chat(&[Message::user("hello")], &[], "", Path::new("."))
+                .await
+                .expect("chat stream");
+            let chunks = collect_chunks(stream).await;
+
+            assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
+            assert!(
+                !debug_path.exists(),
+                "NCA_DEBUG_REQUEST={value:?} unexpectedly enabled diagnostics"
+            );
         }
     }
 
@@ -1905,6 +1932,7 @@ mod tests {
 
     #[tokio::test]
     async fn custom_openai_compatible_provider_streams() {
+        let _debug_env = debug_request_env(Some("1"));
         let body = concat!(
             "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \"},\"index\":0,\"finish_reason\":null}]}\n\n",
             "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n",
@@ -1929,8 +1957,7 @@ mod tests {
         let debug_path = debug_dir.path().join("debug.log");
         let provider = CustomProvider::from_config(&config)
             .expect("provider")
-            .with_debug_log_path(&debug_path)
-            .with_debug_requests(true);
+            .with_debug_log_path(&debug_path);
         let stream = provider
             .chat(
                 &[Message::user("hello")],
@@ -1984,6 +2011,7 @@ mod tests {
 
     #[tokio::test]
     async fn custom_openai_responses_provider_streams_text_with_native_request_settings() {
+        let _debug_env = debug_request_env(Some("1"));
         let body = concat!(
             "event: response.output_text.delta\n",
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n",
@@ -2008,8 +2036,7 @@ mod tests {
         let debug_path = debug_dir.path().join("debug.log");
         let provider = CustomProvider::from_config(&config)
             .expect("provider")
-            .with_debug_log_path(&debug_path)
-            .with_debug_requests(true);
+            .with_debug_log_path(&debug_path);
         let stream = provider
             .chat(
                 &[Message::system("be helpful"), Message::user("hello")],
@@ -2910,6 +2937,7 @@ data: {"type":"response.output_text.delta","delta":"partial"}
 
     #[tokio::test]
     async fn custom_anthropic_compatible_provider_streams_tools() {
+        let _debug_env = debug_request_env(Some("1"));
         let body = concat!(
             "event: content_block_start\n",
             "data: {\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"lookup\"}}\n\n",
@@ -2939,8 +2967,7 @@ data: {"type":"response.output_text.delta","delta":"partial"}
         let debug_path = debug_dir.path().join("debug.log");
         let provider = CustomProvider::from_config(&config)
             .expect("provider")
-            .with_debug_log_path(&debug_path)
-            .with_debug_requests(true);
+            .with_debug_log_path(&debug_path);
         let stream = provider
             .chat(
                 &[Message::user("hello")],

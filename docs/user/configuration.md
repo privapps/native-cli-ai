@@ -297,7 +297,7 @@ Environment variables override config file values.
 | `NCA_MEMORY_PATH` | Override memory file path |
 | `NCA_WEB_TIMEOUT_SECS` | Override web request timeout |
 | `NCA_WEB_MAX_FETCH_CHARS` | Override max characters for web fetches |
-| `NCA_DEBUG_REQUEST` | Set to `1` to print MiniMax request bodies to stderr or append custom OpenAI-compatible request method, URL, redacted headers, and body to `./debug.log`; response data is never logged |
+| `NCA_DEBUG_REQUEST` | Set to `1` to print MiniMax request bodies to stderr or emit and append custom OpenAI-compatible request method, URL, redacted headers, and body to stderr and `./debug.log`; response data is never logged |
 | `NCA_SKIP_CONTEXT_API` | Set to `1` to skip provider model API queries |
 | `NCA_CONTEXT_API_CACHE_TTL_SECS` | Cache TTL for model context API |
 | `XDG_RUNTIME_DIR` | IPC socket directory (fallback: `/tmp/nca/`) |
