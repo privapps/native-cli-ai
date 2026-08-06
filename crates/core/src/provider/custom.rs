@@ -528,7 +528,7 @@ fn responses_request_body(
     tools: &[ToolDefinition],
     model: &str,
     max_tokens: u32,
-    _temperature: f32,
+    temperature: f32,
     reasoning_effort: &str,
     workspace_root: &Path,
 ) -> Result<Value, ProviderError> {
@@ -577,6 +577,7 @@ fn responses_request_body(
         "stream": true,
         "store": false,
         "max_output_tokens": max_tokens,
+        "temperature": temperature,
     });
 
     if !responses_tools.is_empty() {

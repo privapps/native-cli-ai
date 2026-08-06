@@ -889,6 +889,13 @@ mod tests {
                 if settings.provider == ProviderKind::Custom
                     && protocol == CustomCapabilityAdapter::Anthropic
         ));
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
+        assert!(matches!(
+            ProviderCapabilityAdapter::from_config(&config),
+            ProviderCapabilityAdapter::Custom { settings, protocol }
+                if settings.provider == ProviderKind::Custom
+                    && protocol == CustomCapabilityAdapter::OpenAi
+        ));
     }
 
     #[tokio::test]

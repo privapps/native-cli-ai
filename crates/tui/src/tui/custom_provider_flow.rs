@@ -331,6 +331,35 @@ mod tests {
     }
 
     #[test]
+    fn responses_manual_model_can_be_saved_after_discovery_failure() {
+        let mut flow = CustomProviderSetupFlow::new(&config());
+        flow.choose_compatibility(ProviderCompatibility::OpenAiResponses);
+        flow.submit_base_url("https://responses-only.example/v1");
+        flow.submit_credentials("RESPONSES_API_KEY", "secret");
+        let CustomProviderSetupTransition::Probe(candidate) = flow.submit_model("manual-model")
+        else {
+            panic!("expected Responses probe");
+        };
+        assert_eq!(
+            candidate.compatibility,
+            ProviderCompatibility::OpenAiResponses
+        );
+
+        assert!(matches!(
+            flow.apply_probe_outcome(CustomProviderProbeOutcome::RetryableFailure(
+                "models discovery unavailable".into()
+            )),
+            CustomProviderSetupTransition::ContinueWithMessage(message)
+                if message == "models discovery unavailable"
+        ));
+        let CustomProviderSetupTransition::Completed(saved) = flow.save_anyway() else {
+            panic!("manual Responses model should be saveable");
+        };
+        assert_eq!(saved.model, "manual-model");
+        assert_eq!(saved.compatibility, ProviderCompatibility::OpenAiResponses);
+    }
+
+    #[test]
     fn blank_secret_preserves_existing_credential() {
         let mut flow = CustomProviderSetupFlow::new(&config());
         flow.choose_compatibility(ProviderCompatibility::OpenAi);
