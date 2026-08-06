@@ -53,6 +53,39 @@ pub struct SessionMeta {
 
 pub const MAX_PROMPT_HISTORY_ENTRIES: usize = 100;
 
+/// Evidence-backed claim that the current autonomous goal was verified.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalCompletionClaim {
+    pub summary: String,
+    pub evidence: String,
+    pub verification: String,
+}
+
+/// Validate and normalize a completion claim. Only an explicit `passed`
+/// verification result can create completion state.
+pub fn validate_goal_completion_claim(
+    summary: &str,
+    evidence: &str,
+    verification: &str,
+) -> Result<GoalCompletionClaim, String> {
+    let summary = summary.trim();
+    if summary.is_empty() {
+        return Err("summary must be non-empty".into());
+    }
+    let evidence = evidence.trim();
+    if evidence.is_empty() {
+        return Err("evidence must be non-empty".into());
+    }
+    if verification != "passed" {
+        return Err("verification must equal `passed`".into());
+    }
+    Ok(GoalCompletionClaim {
+        summary: summary.to_string(),
+        evidence: evidence.to_string(),
+        verification: verification.to_string(),
+    })
+}
+
 /// Keep prompt history bounded while preserving literal text and duplicate entries.
 pub fn normalize_prompt_history(entries: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut history: Vec<String> = entries
@@ -94,6 +127,9 @@ pub struct SessionState {
     /// Current session todo list (authoritative snapshot; also event-sourced).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub todos: Vec<crate::todo::AgentTodo>,
+    /// Accepted evidence-backed completion for the current checklist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_claim: Option<GoalCompletionClaim>,
 }
 
 /// Lightweight session summary for machine-readable orchestration surfaces.
@@ -127,11 +163,22 @@ pub struct SessionSnapshot {
     pub orchestration: Option<OrchestrationContext>,
     #[serde(default)]
     pub execution: ExecutionContext,
+    /// Canonical path to the persisted state file when the storage authority
+    /// can provide it. Older callers that build snapshots directly may leave
+    /// this absent; CLI session surfaces always populate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_path: Option<PathBuf>,
+    /// Canonical path to the persisted event log when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events_path: Option<PathBuf>,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub estimated_cost_usd: f64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub todos: Vec<crate::todo::AgentTodo>,
+    /// Accepted evidence-backed completion for the current checklist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_claim: Option<GoalCompletionClaim>,
 }
 
 /// Optional metadata injected by an external orchestrator for headless runs.
@@ -183,10 +230,13 @@ impl SessionState {
             session_summary: self.meta.session_summary.clone(),
             orchestration: self.meta.orchestration.clone(),
             execution: self.meta.execution,
+            state_path: None,
+            events_path: None,
             total_input_tokens: self.total_input_tokens,
             total_output_tokens: self.total_output_tokens,
             estimated_cost_usd: self.estimated_cost_usd,
             todos: self.todos.clone(),
+            completion_claim: self.completion_claim.clone(),
         }
     }
 }
@@ -250,14 +300,77 @@ pub enum SessionStatus {
 mod tests {
     use super::OrchestrationContext;
     use super::{
-        MAX_PROMPT_HISTORY_ENTRIES, SessionMeta, SessionState, SessionStatus,
-        legacy_prompt_history, normalize_prompt_history,
+        GoalCompletionClaim, MAX_PROMPT_HISTORY_ENTRIES, SessionMeta, SessionState, SessionStatus,
+        legacy_prompt_history, normalize_prompt_history, validate_goal_completion_claim,
     };
     use crate::message::Message;
     use crate::todo::{AgentTodo, TodoStatus};
     use chrono::Utc;
     use std::env;
     use std::path::PathBuf;
+
+    #[test]
+    fn completion_claim_requires_passed_verification_and_normalizes_text() {
+        let claim = validate_goal_completion_claim("  shipped  ", "  test: cargo test  ", "passed")
+            .expect("valid claim");
+        assert_eq!(claim.summary, "shipped");
+        assert_eq!(claim.evidence, "test: cargo test");
+        assert_eq!(claim.verification, "passed");
+        assert!(validate_goal_completion_claim("summary", "evidence", "inconclusive").is_err());
+        assert!(validate_goal_completion_claim(" ", "evidence", "passed").is_err());
+        assert!(validate_goal_completion_claim("summary", " ", "passed").is_err());
+    }
+
+    #[test]
+    fn completion_claim_roundtrips_and_legacy_state_defaults_to_none() {
+        let now = Utc::now();
+        let mut state = SessionState {
+            meta: SessionMeta {
+                id: "claim".into(),
+                created_at: now,
+                updated_at: now,
+                workspace: PathBuf::from("/tmp"),
+                model: "m".into(),
+                status: SessionStatus::Completed,
+                pid: None,
+                socket_path: None,
+                worktree_path: None,
+                branch: None,
+                base_branch: None,
+                parent_session_id: None,
+                child_session_ids: Vec::new(),
+                inherited_summary: None,
+                spawn_reason: None,
+                session_summary: None,
+                orchestration: None,
+                execution: Default::default(),
+            },
+            messages: Vec::new(),
+            prompt_history: Vec::new(),
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            estimated_cost_usd: 0.0,
+            todos: vec![AgentTodo {
+                id: "1".into(),
+                content: "Ship it".into(),
+                status: TodoStatus::Completed,
+                source: None,
+            }],
+            completion_claim: Some(GoalCompletionClaim {
+                summary: "shipped".into(),
+                evidence: "test passed".into(),
+                verification: "passed".into(),
+            }),
+        };
+        let encoded = serde_json::to_string(&state).expect("serialize");
+        let decoded: SessionState = serde_json::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded.completion_claim, state.completion_claim);
+        state.completion_claim = None;
+        let legacy = serde_json::to_value(state).expect("serialize legacy shape");
+        let legacy_json = serde_json::to_string(&legacy).expect("encode legacy shape");
+        let loaded: SessionState = serde_json::from_str(&legacy_json).expect("load legacy shape");
+        assert!(loaded.completion_claim.is_none());
+    }
 
     #[test]
     fn prompt_history_normalization_preserves_literal_duplicates_and_cap() {
@@ -396,6 +509,7 @@ mod tests {
                 status: TodoStatus::InProgress,
                 source: None,
             }],
+            completion_claim: None,
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: SessionState = serde_json::from_str(&json).unwrap();
@@ -434,6 +548,7 @@ mod tests {
             total_output_tokens: 0,
             estimated_cost_usd: 0.0,
             todos: Vec::new(),
+            completion_claim: None,
         };
         let encoded = serde_json::to_string(&state).expect("serialize");
         let decoded: SessionState = serde_json::from_str(&encoded).expect("deserialize");

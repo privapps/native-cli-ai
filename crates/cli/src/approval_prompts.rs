@@ -1,4 +1,4 @@
-//! Interactive CLI approval prompts using cli-prompts library.
+//! Interactive CLI approval prompts using the standard terminal streams.
 //!
 //! Provides enhanced approval dialogs with:
 //! - Rich tool descriptions
@@ -6,14 +6,11 @@
 //! - Confirmation prompts with help text
 //! - Multi-select for batch approvals
 
-use cli_prompts::{
-    DisplayPrompt,
-    prompts::{AbortReason, Confirmation},
-};
 use nca_common::tool::ToolCall;
 use nca_core::approval::{ApprovalHandler, ApprovalVerdict};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::io::{self, Write};
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -35,7 +32,7 @@ pub fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
-/// Interactive approval handler using cli-prompts library.
+/// Interactive approval handler using the native terminal confirmation path.
 /// Provides rich TUI prompts for tool approval.
 #[allow(dead_code)]
 pub struct InteractiveApprovalHandler {
@@ -75,15 +72,7 @@ impl InteractiveApprovalHandler {
             )
         };
 
-        let confirmed = Confirmation::new(&prompt_msg)
-            .default_positive(false)
-            .display();
-
-        match confirmed {
-            Ok(true) => Some(true),
-            Ok(false) => Some(false),
-            Err(AbortReason::Interrupt) | Err(AbortReason::Error(_)) => None,
-        }
+        confirm_on_stdin(&prompt_msg)
     }
 
     #[allow(dead_code)]
@@ -155,16 +144,20 @@ impl InteractiveIpcApprovalHandler {
             )
         };
 
-        let confirmed = Confirmation::new(&prompt_msg)
-            .default_positive(false)
-            .display();
-
-        match confirmed {
-            Ok(true) => Some(true),
-            Ok(false) => Some(false),
-            Err(AbortReason::Interrupt) | Err(AbortReason::Error(_)) => None,
-        }
+        confirm_on_stdin(&prompt_msg)
     }
+}
+
+fn confirm_on_stdin(prompt: &str) -> Option<bool> {
+    let mut stderr = io::stderr();
+    write!(stderr, "{prompt}\nApprove? [y/N]: ").ok()?;
+    stderr.flush().ok()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer).ok()?;
+    Some(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 impl Default for InteractiveIpcApprovalHandler {

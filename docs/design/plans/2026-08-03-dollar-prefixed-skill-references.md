@@ -3,7 +3,7 @@
 **Type:** Implementation plan
 **Status:** Completed locally
 **Date:** 2026-08-03
-**Related:** [skill reference proposal](../../../skill_p.md)
+**Related:** [dollar-prefixed skill references acceptance plan](2026-08-03-dollar-prefixed-skill-references-ticket-04.md)
 **Last verified:** 2026-08-03 (workspace tests, Clippy, formatting, and diff checks)
 
 ## Objective

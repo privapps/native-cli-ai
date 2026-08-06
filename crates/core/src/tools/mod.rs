@@ -3,6 +3,7 @@ pub mod ask_question;
 pub mod autoresearch;
 pub mod bash;
 pub mod code_intel_tool;
+pub mod complete_goal;
 pub mod copy_path;
 pub mod create_directory;
 pub mod delete_path;
@@ -30,10 +31,11 @@ pub mod write_validated_financial_report;
 
 pub use ask_question::AskQuestionTool;
 pub use autoresearch::AutoresearchTool;
+pub use complete_goal::CompleteGoalTool;
 pub use invoke_skill::InvokeSkillTool;
 pub use resolve_latest_financial_report::ResolveLatestFinancialReportTool;
 pub use skill_hints::RecentSkillHints;
-pub use update_todos::{TodoStore, UpdateTodosTool, validate_todos};
+pub use update_todos::{CompletionClaimStore, TodoStore, UpdateTodosTool, validate_todos};
 pub use validate_financial_report::ValidateFinancialReportTool;
 pub use write_validated_financial_report::WriteValidatedFinancialReportTool;
 

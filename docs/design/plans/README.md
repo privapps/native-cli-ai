@@ -29,6 +29,7 @@ for its spec, tickets, validation report, and move inventory.
 - [Dollar-prefixed skill references](2026-08-03-dollar-prefixed-skill-references.md)
 - [Dollar-prefixed skill references — ticket 04 acceptance](2026-08-03-dollar-prefixed-skill-references-ticket-04.md)
 - [CI failure fixes](2026-08-02-ci-failures.md)
+- [Custom Responses temperature compatibility](2026-08-05-custom-responses-temperature-compatibility.md)
 - [AGENTS.md-backed instructions and skills](agents-md-skills.md)
 - [Autoresearch](autoresearch.md)
 - [Branch chip](branch-chip.md)

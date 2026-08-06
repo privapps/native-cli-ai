@@ -23,7 +23,8 @@ use crate::tui::input::{
     parse_tui_question_answer, render_branch_picker, render_command_palette,
 };
 use crate::tui::layout::{
-    centered_rect, layout_chunks, layout_with_sidebar, rect_contains, sidebar_fit,
+    WORKSPACE_DISPLAY_WIDTH, centered_rect, layout_chunks, layout_with_sidebar, rect_contains,
+    sidebar_fit, workspace_sidebar_fit,
 };
 use crate::tui::state::{
     CustomProviderSetupStep, DisplayBlock, ModelPickerAction, ModelPickerEntry, TuiSessionState,
@@ -846,6 +847,99 @@ pub(crate) fn apply_transcript_page_scroll(
     }
 }
 
+fn model_identity_spans(
+    model: &str,
+    reasoning_effort: Option<&str>,
+    agent_profile: &str,
+) -> Vec<Span<'static>> {
+    let mut spans = vec![
+        Span::raw(" │ "),
+        Span::styled(model.to_string(), Style::default().fg(theme::USER)),
+    ];
+    if let Some(effort) = reasoning_effort {
+        spans.push(Span::raw(" │ "));
+        spans.push(Span::styled(
+            format!("reasoning: {effort}"),
+            Style::default().fg(theme::MUTED),
+        ));
+    }
+    spans.extend([
+        Span::raw(" │ "),
+        Span::styled(
+            agent_profile.to_string(),
+            Style::default().fg(theme::ASSISTANT),
+        ),
+    ]);
+    spans
+}
+
+fn workspace_sidebar_line(workspace_display: &str) -> String {
+    if workspace_display.is_empty() {
+        "—".to_string()
+    } else {
+        workspace_sidebar_fit(workspace_display, WORKSPACE_DISPLAY_WIDTH)
+    }
+}
+
+fn sidebar_footer_lines() -> Vec<Line<'static>> {
+    vec![
+        Line::default(),
+        Line::from(Span::styled(
+            "dev",
+            Style::default()
+                .fg(theme::MUTED)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "Ctrl+P commands",
+            Style::default().fg(theme::MUTED),
+        )),
+        Line::from(Span::styled(
+            "/skills browse skills",
+            Style::default().fg(theme::USER),
+        )),
+        Line::from(Span::styled(
+            "$skill inline guidance",
+            Style::default().fg(theme::MUTED),
+        )),
+    ]
+}
+
+fn dispatch_leader_key(state: &mut TuiSessionState, key: KeyEvent, cmd_tx: &Sender<TuiCmd>) {
+    state.leader_pending = false;
+    match key.code {
+        KeyCode::Char('m') | KeyCode::Char('M') => {
+            let _ = cmd_tx.try_send(TuiCmd::OpenModelPicker);
+        }
+        KeyCode::Char('e') | KeyCode::Char('E') => {
+            let _ = cmd_tx.try_send(TuiCmd::OpenEditor);
+        }
+        KeyCode::Char('l') | KeyCode::Char('L') => {
+            let _ = cmd_tx.try_send(TuiCmd::OpenSessions);
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            let _ = cmd_tx.try_send(TuiCmd::NewSession);
+        }
+        KeyCode::Char('c') | KeyCode::Char('C') => {
+            let _ = cmd_tx.try_send(TuiCmd::RunCompact);
+        }
+        KeyCode::Char('s') | KeyCode::Char('S') => {
+            let _ = cmd_tx.try_send(TuiCmd::OpenStatus);
+        }
+        KeyCode::Char('a') | KeyCode::Char('A') => {
+            let _ = cmd_tx.try_send(TuiCmd::OpenAgentPicker);
+        }
+        KeyCode::Char('h') | KeyCode::Char('H') => {
+            let _ = cmd_tx.try_send(TuiCmd::OpenHelp);
+        }
+        KeyCode::Char('q') | KeyCode::Char('Q') => {
+            state.should_exit = true;
+            let _ = cmd_tx.try_send(TuiCmd::Exit);
+        }
+        _ => {}
+    }
+}
+
 /// `question_answer_tx`: when `Some`, answers are sent there so they unblock `ask_question` while
 /// the async loop is stuck in `run_turn` (that task does not poll `cmd_rx` until the turn ends).
 #[allow(clippy::too_many_arguments)]
@@ -1039,11 +1133,7 @@ pub fn run_blocking(
                         ])
                         .split(sidebar);
 
-                    let ws_line = if g.workspace_display.is_empty() {
-                        "—".to_string()
-                    } else {
-                        sidebar_fit(&g.workspace_display, 26)
-                    };
+                    let ws_line = workspace_sidebar_line(&g.workspace_display);
                     let session_lines = vec![
                         Line::from(Span::styled(
                             "workspace",
@@ -1203,21 +1293,7 @@ pub fn run_blocking(
                             }
                         }
                     }
-                    todo_lines.push(Line::default());
-                    todo_lines.push(Line::from(Span::styled(
-                        "dev",
-                        Style::default()
-                            .fg(theme::MUTED)
-                            .add_modifier(Modifier::BOLD),
-                    )));
-                    todo_lines.push(Line::from(Span::styled(
-                        "~/.local/share/ncacli",
-                        Style::default().fg(theme::USER),
-                    )));
-                    todo_lines.push(Line::from(Span::styled(
-                        "Ctrl+P commands",
-                        Style::default().fg(theme::MUTED),
-                    )));
+                    todo_lines.extend(sidebar_footer_lines());
                     let todo_block = Paragraph::new(Text::from(todo_lines))
                         .block(
                             Block::default()
@@ -1310,7 +1386,16 @@ pub fn run_blocking(
                 };
 
                 // Compute the character-cell x-offset before any borrow of `g` escapes into `status_spans`.
-                let branch_char_offset = 4 + g.model.len() + 4 + g.agent_profile.len() + 4;
+                let reasoning_text = g
+                    .reasoning_effort
+                    .as_ref()
+                    .map(|effort| format!("reasoning: {effort}"));
+                let reasoning_width = reasoning_text
+                    .as_ref()
+                    .map(|text| text.len() + 4)
+                    .unwrap_or(0);
+                let branch_char_offset =
+                    4 + g.model.len() + reasoning_width + 4 + g.agent_profile.len() + 4;
                 let branch_text = if g.current_branch.is_empty() {
                     String::new()
                 } else {
@@ -1333,21 +1418,19 @@ pub fn run_blocking(
                     g.branch_chip_bounds = None;
                 }
 
-                let mut status_spans = vec![
-                    busy,
-                    activity_span,
-                    approval_hint,
-                    q_hint,
-                    Span::raw(" │ "),
-                    Span::styled(&g.model, Style::default().fg(theme::USER)),
-                    Span::raw(" │ "),
-                    Span::styled(&g.agent_profile, Style::default().fg(theme::ASSISTANT)),
+                let mut status_spans = vec![busy, activity_span, approval_hint, q_hint];
+                status_spans.extend(model_identity_spans(
+                    &g.model,
+                    g.reasoning_effort.as_deref(),
+                    &g.agent_profile,
+                ));
+                status_spans.extend([
                     Span::raw(" │ "),
                     // branch_text borrow ends before next mutable use of `g` below
                     Span::styled(branch_text, branch_span_style),
                     Span::raw(" │ "),
                     perm_span,
-                ];
+                ]);
                 // Sidebar is hidden on narrow terminals — put session/tokens/cost back on the bar.
                 if sidebar_opt.is_none() {
                     status_spans.push(Span::raw(" │ "));
@@ -3272,47 +3355,7 @@ pub fn run_blocking(
 
                     // Ctrl+X leader key dispatch.
                     if g.leader_pending {
-                        g.leader_pending = false;
-                        match key.code {
-                            KeyCode::Char('m') | KeyCode::Char('M') => {
-                                drop(g);
-                                let _ = cmd_tx.try_send(TuiCmd::OpenModelPicker);
-                            }
-                            KeyCode::Char('e') | KeyCode::Char('E') => {
-                                drop(g);
-                                let _ = cmd_tx.try_send(TuiCmd::OpenEditor);
-                            }
-                            KeyCode::Char('l') | KeyCode::Char('L') => {
-                                drop(g);
-                                let _ = cmd_tx.try_send(TuiCmd::OpenSessions);
-                            }
-                            KeyCode::Char('n') | KeyCode::Char('N') => {
-                                drop(g);
-                                let _ = cmd_tx.try_send(TuiCmd::NewSession);
-                            }
-                            KeyCode::Char('c') | KeyCode::Char('C') => {
-                                drop(g);
-                                let _ = cmd_tx.try_send(TuiCmd::RunCompact);
-                            }
-                            KeyCode::Char('s') | KeyCode::Char('S') => {
-                                drop(g);
-                                let _ = cmd_tx.try_send(TuiCmd::OpenStatus);
-                            }
-                            KeyCode::Char('a') | KeyCode::Char('A') => {
-                                drop(g);
-                                let _ = cmd_tx.try_send(TuiCmd::OpenAgentPicker);
-                            }
-                            KeyCode::Char('h') | KeyCode::Char('H') => {
-                                drop(g);
-                                let _ = cmd_tx.try_send(TuiCmd::OpenHelp);
-                            }
-                            KeyCode::Char('q') | KeyCode::Char('Q') => {
-                                g.should_exit = true;
-                                let _ = cmd_tx.try_send(TuiCmd::Exit);
-                                break;
-                            }
-                            _ => {}
-                        }
+                        dispatch_leader_key(&mut g, key, &cmd_tx);
                         continue;
                     }
 
@@ -3886,11 +3929,12 @@ mod approval_parse_tests {
         ApprovalShortcutAction, PrimaryInputMode, QUESTION_POPUP_MAX_WIDTH, QuestionPopupLayout,
         TuiCmd, apply_selected_at_completion, apply_transcript_page_scroll,
         approval_shortcut_action, branch_picker_enter_command, delete_completed_at_mention,
-        dispatch_custom_provider_key, dispatch_paste, escape_cancels_active_turn,
-        filter_slash_entries, filtered_branch_indices, handle_newline_key,
-        handle_prompt_history_key, load_slash_entries, matching_skill_reference_commands,
-        primary_input_mode, question_popup_layout, render_question_popup,
-        transcript_scroll_metrics,
+        dispatch_custom_provider_key, dispatch_leader_key, dispatch_paste,
+        escape_cancels_active_turn, filter_slash_entries, filtered_branch_indices,
+        handle_newline_key, handle_prompt_history_key, load_slash_entries,
+        matching_skill_reference_commands, model_identity_spans, primary_input_mode,
+        question_popup_layout, render_question_popup, sidebar_footer_lines,
+        transcript_scroll_metrics, workspace_sidebar_line,
     };
     use crate::skill_references::apply_skill_reference_completion_with_space;
     use crate::tui::composer::cursor_byte_index;
@@ -3900,7 +3944,13 @@ mod approval_parse_tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use nca_common::config::CustomProviderConfig;
     use nca_common::event::{AgentEvent, BusyState, InteractiveQuestionPayload, QuestionOption};
-    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+    use ratatui::{
+        Terminal,
+        backend::TestBackend,
+        layout::Rect,
+        text::{Line, Text},
+        widgets::Paragraph,
+    };
     use std::path::PathBuf;
     use tokio::sync::mpsc;
 
@@ -3918,6 +3968,71 @@ mod approval_parse_tests {
             allow_custom,
             suggested_answer: "Suggested answer".into(),
         }
+    }
+
+    #[test]
+    fn reasoning_status_segment_renders_only_when_present_at_wide_and_narrow_widths() {
+        for (width, effort, expected) in [(64, Some("medium"), true), (24, None, false)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 2)).unwrap();
+            let completed = terminal
+                .draw(|frame| {
+                    let line = Line::from(model_identity_spans("model", effort, "@build"));
+                    frame.render_widget(Paragraph::new(line), frame.area());
+                })
+                .unwrap();
+            let rendered = (0..width)
+                .map(|x| {
+                    completed
+                        .buffer
+                        .cell((x, 0))
+                        .expect("cell in test backend")
+                        .symbol()
+                        .to_string()
+                })
+                .collect::<String>();
+            assert_eq!(rendered.contains("reasoning: medium"), expected);
+        }
+    }
+
+    #[test]
+    fn workspace_sidebar_line_preserves_empty_fallback() {
+        assert_eq!(workspace_sidebar_line(""), "—");
+        let rendered = workspace_sidebar_line("/workspace/project/very-long-leaf");
+        assert!(rendered.contains('…'));
+        assert!(rendered.starts_with('/'));
+        assert!(rendered.ends_with("leaf"));
+    }
+
+    #[test]
+    fn sidebar_footer_renders_path_independent_navigation_hints() {
+        let mut terminal = Terminal::new(TestBackend::new(32, 8)).unwrap();
+        let completed = terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Paragraph::new(Text::from(sidebar_footer_lines())),
+                    frame.area(),
+                );
+            })
+            .unwrap();
+        let rendered = (0..8)
+            .map(|y| {
+                (0..32)
+                    .map(|x| {
+                        completed
+                            .buffer
+                            .cell((x, y))
+                            .expect("cell in test backend")
+                            .symbol()
+                            .to_string()
+                    })
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let rendered = rendered.join("\n");
+        assert!(rendered.contains("Ctrl+P commands"));
+        assert!(rendered.contains("/skills browse skills"));
+        assert!(rendered.contains("$skill inline guidance"));
+        assert!(!rendered.contains("~/.local/share/ncacli"));
     }
 
     #[test]
@@ -4530,6 +4645,23 @@ mod approval_parse_tests {
         ));
         assert_eq!(state.input_buffer, "draft");
         assert_eq!(state.cursor_char_idx, 5);
+    }
+
+    #[test]
+    fn ctrl_x_q_leader_requests_exit() {
+        let mut state = state();
+        state.leader_pending = true;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+
+        dispatch_leader_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::NONE),
+            &tx,
+        );
+
+        assert!(!state.leader_pending);
+        assert!(state.should_exit);
+        assert!(matches!(rx.try_recv(), Ok(TuiCmd::Exit)));
     }
 
     #[test]

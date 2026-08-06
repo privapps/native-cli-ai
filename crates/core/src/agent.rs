@@ -143,7 +143,8 @@ impl AgentLoop {
         const MAX_EMPTY_RETRIES: u32 = 2;
         // Consecutive failures of the same tool — stops infinite retry loops.
         let mut consecutive_tool_failures: u32 = 0;
-        let mut last_failed_tool: String = String::new();
+        let mut last_failed_tool_key: Option<String> = None;
+        let mut last_failed_tool_name: String = String::new();
         const MAX_CONSECUTIVE_TOOL_FAILURES: u32 = 3;
 
         let final_text = loop {
@@ -637,16 +638,19 @@ impl AgentLoop {
                 && final_results.iter().all(|r| !r.success)
                 && tool_calls.len() == 1;
             if all_failed_same_tool {
-                let tool_name = &tool_calls[0].name;
-                if *tool_name == last_failed_tool {
+                let call = &tool_calls[0];
+                let failure_key = tool_failure_key(call);
+                if last_failed_tool_key.as_deref() == Some(failure_key.as_str()) {
                     consecutive_tool_failures += 1;
                 } else {
-                    last_failed_tool = tool_name.clone();
+                    last_failed_tool_key = Some(failure_key);
+                    last_failed_tool_name = call.name.clone();
                     consecutive_tool_failures = 1;
                 }
             } else {
                 consecutive_tool_failures = 0;
-                last_failed_tool.clear();
+                last_failed_tool_key = None;
+                last_failed_tool_name.clear();
             }
 
             let failed_search = tool_calls.len() == 1
@@ -684,8 +688,8 @@ impl AgentLoop {
 
             if consecutive_tool_failures >= MAX_CONSECUTIVE_TOOL_FAILURES {
                 let msg = format!(
-                    "Tool `{}` failed {} times consecutively — stopping to avoid infinite loop.",
-                    last_failed_tool, consecutive_tool_failures
+                    "Tool `{}` failed {} times for the same input — stopping this turn to avoid an infinite loop.",
+                    last_failed_tool_name, consecutive_tool_failures
                 );
                 self.emit(AgentEvent::Error {
                     message: msg.clone(),
@@ -827,6 +831,41 @@ fn format_tool_result(result: &nca_common::tool::ToolResult) -> String {
     }
 }
 
+/// Canonicalize a JSON value without changing its type semantics. Object keys
+/// are sorted recursively, so equivalent tool inputs share one breaker key
+/// even when providers serialize those keys in different orders.
+fn canonical_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => serde_json::to_string(value).unwrap_or_default(),
+        serde_json::Value::Array(values) => {
+            let values = values.iter().map(canonical_json).collect::<Vec<_>>();
+            format!("[{}]", values.join(","))
+        }
+        serde_json::Value::Object(values) => {
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            let fields = keys
+                .into_iter()
+                .map(|key| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(key).unwrap_or_default(),
+                        canonical_json(&values[key])
+                    )
+                })
+                .collect::<Vec<_>>();
+            format!("{{{}}}", fields.join(","))
+        }
+    }
+}
+
+fn tool_failure_key(call: &ToolCall) -> String {
+    format!("{}\n{}", call.name, canonical_json(&call.input))
+}
+
 #[cfg(test)]
 mod interactive_tool_tests {
     use super::is_interactive_tool;
@@ -837,5 +876,39 @@ mod interactive_tool_tests {
         assert!(!is_interactive_tool("list_directory"));
         assert!(!is_interactive_tool("invoke_skill"));
         assert!(!is_interactive_tool("update_todos"));
+    }
+}
+
+#[cfg(test)]
+mod tool_failure_tests {
+    use super::{canonical_json, tool_failure_key};
+    use nca_common::tool::ToolCall;
+
+    #[test]
+    fn canonical_json_sorts_nested_object_keys() {
+        let left = serde_json::json!({"command": "cargo test", "options": {"b": 2, "a": 1}});
+        let right = serde_json::json!({"options": {"a": 1, "b": 2}, "command": "cargo test"});
+        assert_eq!(canonical_json(&left), canonical_json(&right));
+    }
+
+    #[test]
+    fn breaker_key_separates_tools_and_inputs() {
+        let first = ToolCall {
+            id: "1".into(),
+            name: "execute_bash".into(),
+            input: serde_json::json!({"command": "cargo test"}),
+        };
+        let equivalent = ToolCall {
+            id: "2".into(),
+            name: "execute_bash".into(),
+            input: serde_json::json!({"command": "cargo test"}),
+        };
+        let different = ToolCall {
+            id: "3".into(),
+            name: "execute_bash".into(),
+            input: serde_json::json!({"command": "cargo check"}),
+        };
+        assert_eq!(tool_failure_key(&first), tool_failure_key(&equivalent));
+        assert_ne!(tool_failure_key(&first), tool_failure_key(&different));
     }
 }

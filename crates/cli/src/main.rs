@@ -17,10 +17,11 @@ use nca_core::skills::SkillCatalog;
 use nca_runtime::memory_store::{MemoryNote, MemoryStore};
 use nca_tui::Repl;
 use nca_tui::{build_resumed_session_runtime, build_session_runtime};
+use std::env;
 use std::io::{IsTerminal, stdin, stdout};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use stream::{StreamMode, spawn_stream_task};
+use stream::{StreamMode, spawn_stream_task_with_idle_hook};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -102,6 +103,10 @@ struct Cli {
     /// Internal session identifier for spawned runs
     #[arg(long, hide = true)]
     session_id: Option<String>,
+
+    /// Workspace whose session/configuration store should be used.
+    #[arg(long, global = true, value_name = "PATH")]
+    workspace: Option<PathBuf>,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -473,7 +478,9 @@ async fn try_main() -> anyhow::Result<()> {
         .init();
 
     tracing::info!("nca starting");
-    let mut config = NcaConfig::load()?;
+    let current_workspace = env::current_dir()?;
+    let workspace_root = resolve_workspace_path(cli.workspace.as_deref(), &current_workspace)?;
+    let mut config = NcaConfig::load_for_workspace(&workspace_root)?;
     let orchestration_context = OrchestrationContext::from_env();
     let reasoning_effort_override = cli.reasoning_effort.clone();
 
@@ -495,7 +502,6 @@ async fn try_main() -> anyhow::Result<()> {
         config.session.max_turns_per_run = max_turns;
     }
 
-    let workspace_root = PathBuf::from(".");
     match cli.command {
         Some(Command::Run {
             prompt,
@@ -759,7 +765,7 @@ async fn try_main() -> anyhow::Result<()> {
                     if let Some(rx) = runtime.take_event_rx() {
                         let ipc_handle = runtime.take_ipc_handle();
                         let approval_pending = runtime.take_ipc_approval_pending();
-                        let _stream_task = spawn_stream_task(
+                        let _stream_task = spawn_stream_task_with_idle_hook(
                             rx,
                             cli.stream,
                             runtime.event_log_path(),
@@ -767,6 +773,7 @@ async fn try_main() -> anyhow::Result<()> {
                             approval_pending,
                             runtime.question_pending(),
                             None,
+                            runtime.take_idle_hook(),
                         );
                         let _ = runtime.run_turn(prompt).await;
                         let mut repl = Repl::new(runtime, cli.safe, true);
@@ -850,7 +857,7 @@ async fn try_main() -> anyhow::Result<()> {
                     if !use_tui && let Some(rx) = runtime.take_event_rx() {
                         let ipc_handle = runtime.take_ipc_handle();
                         let approval_pending = runtime.take_ipc_approval_pending();
-                        let _stream_task = spawn_stream_task(
+                        let _stream_task = spawn_stream_task_with_idle_hook(
                             rx,
                             cli.stream,
                             runtime.event_log_path(),
@@ -858,6 +865,7 @@ async fn try_main() -> anyhow::Result<()> {
                             approval_pending,
                             runtime.question_pending(),
                             None,
+                            runtime.take_idle_hook(),
                         );
                     }
                     let mut repl = Repl::new(runtime, cli.safe, cli.run);
@@ -924,7 +932,7 @@ async fn try_main() -> anyhow::Result<()> {
                         if !use_tui && let Some(rx) = runtime.take_event_rx() {
                             let ipc_handle = runtime.take_ipc_handle();
                             let approval_pending = runtime.take_ipc_approval_pending();
-                            let _stream_task = spawn_stream_task(
+                            let _stream_task = spawn_stream_task_with_idle_hook(
                                 rx,
                                 cli.stream,
                                 runtime.event_log_path(),
@@ -932,6 +940,7 @@ async fn try_main() -> anyhow::Result<()> {
                                 approval_pending,
                                 runtime.question_pending(),
                                 None,
+                                runtime.take_idle_hook(),
                             );
                         }
                         let mut repl = Repl::new(runtime, cli.safe, cli.run);
@@ -984,10 +993,16 @@ async fn run_one_shot(
     )
     .await
     .map_err(anyhow::Error::msg)?;
+    eprintln!(
+        "[session] {}\n  state: {}\n  events: {}",
+        runtime.session_id(),
+        runtime.state_path().display(),
+        runtime.event_log_path().display()
+    );
     if let Some(rx) = runtime.take_event_rx() {
         let ipc_handle = runtime.take_ipc_handle();
         let approval_pending = runtime.take_ipc_approval_pending();
-        let stream_task = spawn_stream_task(
+        let stream_task = spawn_stream_task_with_idle_hook(
             rx,
             stream,
             runtime.event_log_path(),
@@ -995,6 +1010,7 @@ async fn run_one_shot(
             approval_pending,
             runtime.question_pending(),
             None,
+            runtime.take_idle_hook(),
         );
 
         let spawn_task = runtime.take_spawn_rx().map(|spawn_rx| {
@@ -1238,8 +1254,15 @@ async fn list_sessions(
     let mut unreadable = Vec::new();
 
     for id in ids {
-        match store.load_snapshot(&id).await {
-            Ok(session) => sessions.push(session),
+        match store.load(&id).await {
+            Ok(session) => {
+                if search
+                    .as_deref()
+                    .is_none_or(|pattern| session_matches_search(&session, pattern))
+                {
+                    sessions.push(store.snapshot_with_paths(&id, &session));
+                }
+            }
             Err(_) => unreadable.push(id),
         }
     }
@@ -1261,18 +1284,6 @@ async fn list_sessions(
     }
 
     // Apply search filter
-    if let Some(pattern) = search {
-        let pattern_lower = pattern.to_lowercase();
-        sessions.retain(|s| {
-            s.id.to_lowercase().contains(&pattern_lower)
-                || s.session_summary
-                    .as_ref()
-                    .map(|sum| sum.to_lowercase().contains(&pattern_lower))
-                    .unwrap_or(false)
-                || s.model.to_lowercase().contains(&pattern_lower)
-        });
-    }
-
     sessions.sort_by(|left, right| {
         right
             .updated_at
@@ -1294,7 +1305,7 @@ async fn list_sessions(
         )?;
     } else {
         for session in sessions {
-            print_human_session(&session);
+            print_human_session(&session, config);
         }
         for id in unreadable {
             println!("{id}\tUnreadable");
@@ -1361,11 +1372,17 @@ async fn resume_session(
     )
     .await
     .map_err(anyhow::Error::msg)?;
+    eprintln!(
+        "[session] {}\n  state: {}\n  events: {}",
+        runtime.session_id(),
+        runtime.state_path().display(),
+        runtime.event_log_path().display()
+    );
     if let Some(prompt) = prompt {
         if let Some(rx) = runtime.take_event_rx() {
             let ipc_handle = runtime.take_ipc_handle();
             let approval_pending = runtime.take_ipc_approval_pending();
-            let _stream_task = spawn_stream_task(
+            let _stream_task = spawn_stream_task_with_idle_hook(
                 rx,
                 stream,
                 runtime.event_log_path(),
@@ -1373,6 +1390,7 @@ async fn resume_session(
                 approval_pending,
                 runtime.question_pending(),
                 None,
+                runtime.take_idle_hook(),
             );
         }
         let output = runtime
@@ -1386,7 +1404,7 @@ async fn resume_session(
     if !use_tui && let Some(rx) = runtime.take_event_rx() {
         let ipc_handle = runtime.take_ipc_handle();
         let approval_pending = runtime.take_ipc_approval_pending();
-        let _stream_task = spawn_stream_task(
+        let _stream_task = spawn_stream_task_with_idle_hook(
             rx,
             stream,
             runtime.event_log_path(),
@@ -1394,6 +1412,7 @@ async fn resume_session(
             approval_pending,
             runtime.question_pending(),
             None,
+            runtime.take_idle_hook(),
         );
     }
     let mut repl = Repl::new(runtime, safe, true);
@@ -1453,10 +1472,18 @@ async fn show_status(
         .load_snapshot(session_id)
         .await
         .map_err(anyhow::Error::msg)?;
+    let output = StatusOutput {
+        session: snapshot.clone(),
+        provider: config.provider.default.display_name().to_string(),
+        compatibility: config
+            .provider
+            .compatibility_for(config.provider.default)
+            .map(|compatibility| compatibility.display_name().to_string()),
+    };
     if json {
-        print_json(&snapshot, false)?;
+        print_json(&output, false)?;
     } else {
-        print_human_session(&snapshot);
+        print_human_session(&snapshot, config);
     }
     Ok(())
 }
@@ -1504,7 +1531,7 @@ async fn cancel_session(
     if json {
         print_json(
             &CancelCommandOutput {
-                session: session.snapshot(),
+                session: store.snapshot_with_paths(session_id, &session),
                 cancelled: true,
             },
             false,
@@ -1577,8 +1604,9 @@ async fn print_log_file(
     session_id: &str,
     json: bool,
 ) -> anyhow::Result<()> {
-    let log_path =
-        resolve_sessions_dir(config, workspace_root).join(format!("{session_id}.events.jsonl"));
+    let store =
+        nca_runtime::session_store::SessionStore::new(resolve_sessions_dir(config, workspace_root));
+    let log_path = store.events_path(session_id);
     let data = match tokio::fs::read_to_string(&log_path).await {
         Ok(data) => data,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -1594,7 +1622,7 @@ async fn print_log_file(
     Ok(())
 }
 
-fn print_human_session(session: &SessionSnapshot) {
+fn print_human_session(session: &SessionSnapshot, config: &NcaConfig) {
     println!(
         "{}  status={:?}  model={}  updated={}  children={}",
         session.id,
@@ -1603,8 +1631,18 @@ fn print_human_session(session: &SessionSnapshot) {
         session.updated_at.to_rfc3339(),
         session.child_session_ids.len()
     );
+    println!(
+        "  provider: {}",
+        config.provider.diagnostic_name_for(config.provider.default)
+    );
     if let Some(summary) = &session.session_summary {
         println!("  summary: {}", summary.replace('\n', " "));
+    }
+    if let Some(path) = &session.state_path {
+        println!("  state: {}", path.display());
+    }
+    if let Some(path) = &session.events_path {
+        println!("  events: {}", path.display());
     }
 }
 
@@ -1615,6 +1653,61 @@ fn print_event_envelope(envelope: &EventEnvelope, json: bool) -> anyhow::Result<
         stream::render_human_event(&envelope.event);
     }
     Ok(())
+}
+
+fn session_matches_search(session: &nca_common::session::SessionState, pattern: &str) -> bool {
+    let needle = pattern.to_lowercase();
+    if needle.is_empty() {
+        return true;
+    }
+
+    let mut evidence = String::new();
+    let mut add = |value: &str| {
+        if !value.trim().is_empty() {
+            evidence.push_str(value);
+            evidence.push('\n');
+        }
+    };
+
+    add(&session.meta.id);
+    add(&session.meta.model);
+    if let Some(summary) = &session.meta.session_summary {
+        add(summary);
+    }
+    for prompt in session.prompt_history_or_legacy() {
+        add(&prompt);
+    }
+    for todo in &session.todos {
+        add(&todo.content);
+        add(todo.status.as_str());
+    }
+    for message in &session.messages {
+        // Empty assistant placeholders are deliberately omitted. A message
+        // with tool calls still contributes its tool evidence below.
+        add(&message.content.to_summary_text());
+        if let Some(tool_calls) = &message.tool_calls {
+            for call in tool_calls {
+                add(&call.name);
+                add(&serde_json::to_string(&call.arguments).unwrap_or_default());
+            }
+        }
+    }
+
+    evidence.to_lowercase().contains(&needle)
+}
+
+fn resolve_workspace_path(explicit: Option<&Path>, current: &Path) -> anyhow::Result<PathBuf> {
+    let candidate = explicit.unwrap_or(current);
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|error| anyhow::anyhow!("invalid workspace `{}`: {error}", candidate.display()))?;
+    if !canonical.is_dir() {
+        anyhow::bail!(
+            "invalid workspace `{}`: path is not a directory",
+            canonical.display()
+        );
+    }
+    Ok(canonical)
 }
 
 fn list_skills(config: &NcaConfig, workspace_root: &Path, json: bool) -> anyhow::Result<()> {
@@ -1841,6 +1934,10 @@ fn show_models(config: &NcaConfig, json: bool) -> anyhow::Result<()> {
             .into_iter()
             .map(|provider| ProviderModelOutput {
                 provider: provider.display_name().to_string(),
+                compatibility: config
+                    .provider
+                    .compatibility_for(provider)
+                    .map(|compatibility| compatibility.display_name().to_string()),
                 model: config.provider.model_for(provider).to_string(),
                 base_url: config.provider.base_url_for(provider).to_string(),
                 selected: provider == config.provider.default,
@@ -1878,9 +1975,14 @@ fn show_models(config: &NcaConfig, json: bool) -> anyhow::Result<()> {
         println!("Provider models:");
         for provider in &output.provider_models {
             println!(
-                "  {}{} -> {} ({})",
+                "  {}{}{} -> {} ({})",
                 provider.provider,
                 if provider.selected { " [selected]" } else { "" },
+                provider
+                    .compatibility
+                    .as_deref()
+                    .map(|compatibility| format!(" ({compatibility})"))
+                    .unwrap_or_default(),
                 provider.model,
                 provider.base_url
             );
@@ -1898,11 +2000,19 @@ fn show_doctor(config: &NcaConfig, workspace_root: &Path, json: bool) -> anyhow:
         .unwrap_or(0);
     let output = DoctorOutput {
         provider: config.provider.default.display_name().to_string(),
+        compatibility: config
+            .provider
+            .compatibility_for(config.provider.default)
+            .map(|compatibility| compatibility.display_name().to_string()),
         default_model: config.model.default_model.clone(),
         providers: ProviderKind::ALL
             .into_iter()
             .map(|provider| ProviderDoctorStatus {
                 provider: provider.display_name().to_string(),
+                compatibility: config
+                    .provider
+                    .compatibility_for(provider)
+                    .map(|compatibility| compatibility.display_name().to_string()),
                 selected: provider == config.provider.default,
                 api_key_present: config.provider.api_key_present_for(provider),
                 api_key_env: config.provider.api_key_env_for(provider).to_string(),
@@ -1923,13 +2033,21 @@ fn show_doctor(config: &NcaConfig, workspace_root: &Path, json: bool) -> anyhow:
         print_json(&output, false)?;
     } else {
         println!("Provider: {}", output.provider);
+        if let Some(compatibility) = &output.compatibility {
+            println!("Compatibility: {compatibility}");
+        }
         println!("Default model: {}", output.default_model);
         println!("Provider readiness:");
         for provider in &output.providers {
             println!(
-                "  {}{}: api_key={} ({}) model={} base_url={}",
+                "  {}{}{}: api_key={} ({}) model={} base_url={}",
                 provider.provider,
                 if provider.selected { " [selected]" } else { "" },
+                provider
+                    .compatibility
+                    .as_deref()
+                    .map(|compatibility| format!(" ({compatibility})"))
+                    .unwrap_or_default(),
                 if provider.api_key_present {
                     "configured"
                 } else {
@@ -2140,7 +2258,10 @@ fn show_config(config: &NcaConfig, workspace_root: &Path, json: bool) -> anyhow:
             "Workspace config: {}",
             nca_common::config::workspace_config_path(workspace_root).display()
         );
-        println!("Default provider: {:?}", config.provider.default);
+        println!(
+            "Default provider: {}",
+            config.provider.diagnostic_name_for(config.provider.default)
+        );
         println!("Default model: {}", config.model.default_model);
         println!(
             "Reasoning effort: {} (OpenAI-compatible only; {})",
@@ -2156,7 +2277,7 @@ fn show_config(config: &NcaConfig, workspace_root: &Path, json: bool) -> anyhow:
         for provider in ProviderKind::ALL {
             println!(
                 "  {} -> model={} base_url={}",
-                provider.display_name(),
+                config.provider.diagnostic_name_for(provider),
                 config.provider.model_for(provider),
                 config.provider.base_url_for(provider)
             );
@@ -2250,6 +2371,14 @@ struct SkillOutput {
 }
 
 #[derive(serde::Serialize)]
+struct StatusOutput {
+    #[serde(flatten)]
+    session: SessionSnapshot,
+    provider: String,
+    compatibility: Option<String>,
+}
+
+#[derive(serde::Serialize)]
 struct ModelCatalogOutput {
     default_provider: String,
     default_model: String,
@@ -2274,6 +2403,7 @@ struct ConfigOutput<'a> {
 #[derive(serde::Serialize)]
 struct DoctorOutput {
     provider: String,
+    compatibility: Option<String>,
     default_model: String,
     providers: Vec<ProviderDoctorStatus>,
     mcp_server_count: usize,
@@ -2284,6 +2414,7 @@ struct DoctorOutput {
 #[derive(serde::Serialize)]
 struct ProviderModelOutput {
     provider: String,
+    compatibility: Option<String>,
     model: String,
     base_url: String,
     selected: bool,
@@ -2292,6 +2423,7 @@ struct ProviderModelOutput {
 #[derive(serde::Serialize)]
 struct ProviderDoctorStatus {
     provider: String,
+    compatibility: Option<String>,
     selected: bool,
     api_key_present: bool,
     api_key_env: String,

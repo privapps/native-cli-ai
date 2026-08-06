@@ -34,13 +34,19 @@ This document records every dependency choice, the rationale behind it, and the 
 |-------|---------|------|
 | `ratatui` | 0.30.x | Widget-based terminal UI framework |
 | `crossterm` | 0.29.x | Cross-platform terminal backend (events, raw mode, colors) |
-| `reedline` | 0.38.0 | Line editor with history, completions, and hints |
+| `reedline` | 0.49.x | Line editor with history, completions, and hints |
 | `arboard` | 3.x | Clipboard access for pasting bitmap images into the TUI composer |
 | `image` | 0.25.x | Encode clipboard RGBA payloads to PNG for session attachments |
 
 **Why ratatui + crossterm**: ratatui is the most actively maintained TUI framework in Rust (19M+ downloads). crossterm is its default backend and works on Windows, macOS, and Linux without external dependencies.
 
 **Why reedline**: Provides a nushell-quality line editor with multi-line input, syntax highlighting hooks, history search, and tab completion. Better UX than raw crossterm input handling.
+
+**Clipboard compatibility**: `arboard` remains a required default capability
+because the fullscreen TUI supports both copying assistant text and importing
+bitmap clipboard images. Its platform backends are retained intentionally;
+headless or unavailable backends return an actionable error and the user can
+use native terminal Shift+drag selection or `/image <path>` as fallbacks.
 
 **Rejected**: `tui-rs` (unmaintained, ratatui is its successor), `termion` (Linux-only), `cursive` (higher-level but less flexible for custom layouts).
 
@@ -68,15 +74,19 @@ much layout policy for the current output surfaces).
 
 | Crate | Version | Role |
 |-------|---------|------|
-| `genai` | 0.5.x | Multi-provider abstraction (Anthropic, OpenAI, Gemini, Ollama, etc.) |
-| `anthropic-async` | 0.4.x | Direct Anthropic client for advanced features (caching, thinking, beta APIs) |
-| `async-openai` | 0.33.x | Direct OpenAI client for Codex/GPT features |
+| `reqwest` | 0.12.x | Rustls-only HTTP transport used by the provider adapters |
 
-**Strategy**: MiniMax is the first-class provider and is implemented directly over `reqwest` so we control auth, base URL, model naming, and tool-call normalization without waiting on a generic wrapper. `genai` remains useful later for broad multi-provider support, while `anthropic-async` and `async-openai` stay as direct adapters for providers that need special handling.
+**Strategy**: MiniMax is the first-class provider and the supported provider
+adapters use the repository's direct Rust implementations over a shared,
+Rustls-only `reqwest` configuration. This keeps auth, base URLs, model naming,
+streaming, and tool-call normalization under nca's control without compiling an
+unused generic provider stack.
 
 **Current default**: `MiniMax-M2.5` via `provider.minimax` config and `MINIMAX_API_KEY`.
 
-**Rejected**: `llm` crate (focused on local models, not API providers), rolling our own HTTP client (unnecessary duplication).
+**Rejected**: `genai` and provider-specific client crates (they add unused
+transitive stacks and duplicate transport configuration), `llm` (focused on
+local models), and rolling our own HTTP client (unnecessary duplication).
 
 ---
 
@@ -94,7 +104,9 @@ transport support remains deferred.
 |-------|---------|------|
 | `reqwest` | 0.12.x | HTTP client for direct API calls and fallback |
 
-**Why reqwest**: Tokio-native, supports streaming responses, TLS, and connection pooling. Used by both `anthropic-async` and `async-openai` internally.
+**Why reqwest**: Tokio-native, supports streaming responses, TLS, and
+connection pooling. The workspace explicitly selects `rustls-tls` and disables
+default features so the production HTTP graph has no OpenSSL/native-TLS path.
 
 **Rejected**: a provider-specific HTTP client (would duplicate transport code)
 and `ureq` (synchronous, which does not fit the streaming agent loop).
@@ -245,10 +257,12 @@ and hand-maintained output comparisons (high maintenance for terminal layouts).
 
 ```
 crates/common   -> serde, serde_json, toml, toml_edit, url, thiserror, tracing
-crates/core     -> common, genai, anthropic-async, async-openai, reqwest,
-                   serde_json, thiserror, tracing, tokio, regex
-crates/cli      -> common, core, runtime, clap, ratatui, crossterm, reedline,
-                   syntect, pulldown-cmark, colored, anyhow, tracing, tokio
+crates/core     -> common, autoresearch, reqwest (Rustls-only), serde_json,
+                   thiserror, tracing, tokio, regex
+crates/tui      -> common, core, runtime, ratatui, crossterm, reedline,
+                   syntect, pulldown-cmark, arboard, image
+crates/cli      -> common, core, runtime, tui, clap, serde_json, anyhow,
+                   tracing, tokio
 crates/runtime  -> common, core, portable-pty, tokio, serde_json, tracing,
                    thiserror
 ```

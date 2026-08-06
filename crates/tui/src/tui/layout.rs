@@ -3,9 +3,11 @@
 //! Extracted from `tui/app.rs` in Phase 2.2.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub const SIDEBAR_WIDTH: u16 = 32;
 pub const SIDEBAR_MIN_TOTAL_WIDTH: u16 = 110;
+pub const WORKSPACE_DISPLAY_WIDTH: usize = 26;
 pub const COMMAND_PALETTE_WIDTH: u16 = 48;
 pub const COMMAND_PALETTE_MAX_ROWS: usize = 10;
 
@@ -56,6 +58,58 @@ pub fn sidebar_fit(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Fit a workspace path to a display-cell width while retaining both ends.
+///
+/// The ellipsis receives one cell. When the remaining width is odd, the prefix
+/// receives the extra cell so the project root remains slightly more visible.
+pub fn workspace_sidebar_fit(s: &str, max_width: usize) -> String {
+    let text = s.trim();
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    if max_width == 1 {
+        return "…".to_string();
+    }
+
+    let content_width = max_width - 1;
+    let prefix_width = content_width.div_ceil(2);
+    let suffix_width = content_width - prefix_width;
+    let prefix = take_display_prefix(text, prefix_width);
+    let suffix = take_display_suffix(text, suffix_width);
+    format!("{prefix}…{suffix}")
+}
+
+fn take_display_prefix(text: &str, max_width: usize) -> String {
+    let mut result = String::new();
+    let mut width = 0;
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width > max_width {
+            break;
+        }
+        result.push(ch);
+        width += ch_width;
+    }
+    result
+}
+
+fn take_display_suffix(text: &str, max_width: usize) -> String {
+    let mut result = String::new();
+    let mut width = 0;
+    for ch in text.chars().rev() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width > max_width {
+            break;
+        }
+        result.push(ch);
+        width += ch_width;
+    }
+    result.chars().rev().collect()
+}
+
 pub fn layout_with_sidebar(area: Rect) -> (Rect, Option<Rect>) {
     if area.width < SIDEBAR_MIN_TOTAL_WIDTH {
         return (area, None);
@@ -87,4 +141,41 @@ pub fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
         && col < r.x.saturating_add(r.width)
         && row >= r.y
         && row < r.y.saturating_add(r.height)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sidebar_fit, workspace_sidebar_fit};
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn workspace_paths_keep_short_and_exact_width_values() {
+        assert_eq!(workspace_sidebar_fit("src/project", 20), "src/project");
+        assert_eq!(workspace_sidebar_fit("src/project", 11), "src/project");
+    }
+
+    #[test]
+    fn workspace_paths_middle_truncate_with_prefix_extra_on_odd_content() {
+        let rendered = workspace_sidebar_fit("/workspace/project/leaf", 10);
+        assert_eq!(rendered, "/work…leaf");
+        assert_eq!(UnicodeWidthStr::width(rendered.as_str()), 10);
+    }
+
+    #[test]
+    fn workspace_paths_bound_tiny_widths_and_unicode() {
+        for width in 0..=3 {
+            let rendered = workspace_sidebar_fit("/東京/leaf", width);
+            assert!(UnicodeWidthStr::width(rendered.as_str()) <= width);
+        }
+        let rendered = workspace_sidebar_fit("/東京/プロジェクト/leaf", 12);
+        assert!(rendered.contains('…'));
+        assert!(rendered.starts_with("/東京"));
+        assert!(rendered.ends_with("leaf"));
+        assert!(UnicodeWidthStr::width(rendered.as_str()) <= 12);
+    }
+
+    #[test]
+    fn ordinary_sidebar_fit_remains_right_truncation() {
+        assert_eq!(sidebar_fit("ordinary-label", 8), "ordinar…");
+    }
 }

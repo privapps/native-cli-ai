@@ -1,4 +1,5 @@
 use crate::context_manager::{ContextManager, ContextManagerConfig, ContextStats};
+use crate::idle_hook::IdleHookRunner;
 use crate::ipc::{IpcHandle, IpcServer};
 use crate::last_session::LastSessionStore;
 use crate::memory_store::{MemoryNote, MemoryState, MemoryStore};
@@ -12,7 +13,8 @@ use nca_common::config::{
 use nca_common::event::{AgentCommand, AgentEvent, EndReason, EventEnvelope, QuestionSelection};
 use nca_common::execution::ExecutionContext;
 use nca_common::session::{
-    OrchestrationContext, SessionMeta, SessionSnapshot, SessionState, SessionStatus,
+    GoalCompletionClaim, OrchestrationContext, SessionMeta, SessionSnapshot, SessionState,
+    SessionStatus,
 };
 use nca_common::todo::AgentTodo;
 use nca_core::agent::AgentLoop;
@@ -23,6 +25,8 @@ use nca_core::provider::ProviderError;
 use nca_core::provider::factory::build_provider;
 use nca_core::skills::SkillCatalog;
 use nca_core::tools::AskQuestionTool;
+use nca_core::tools::CompleteGoalTool;
+use nca_core::tools::CompletionClaimStore;
 use nca_core::tools::InvokeSkillTool;
 use nca_core::tools::RecentSkillHints;
 use nca_core::tools::ToolRegistry;
@@ -56,6 +60,7 @@ pub struct Supervisor {
     session_store: SessionStore,
     ipc_handle: Option<IpcHandle>,
     event_rx: Option<mpsc::Receiver<AgentEvent>>,
+    idle_hook: Option<IdleHookRunner>,
     approval_pending: Option<ApprovalPendingMap>,
     question_pending: Option<QuestionPendingMap>,
     spawn_rx: Option<mpsc::Receiver<SpawnRequest>>,
@@ -70,6 +75,8 @@ pub struct Supervisor {
     orchestration: Option<OrchestrationContext>,
     /// Authoritative session todo list (shared with `update_todos` tool).
     todos: Arc<Mutex<Vec<AgentTodo>>>,
+    /// Evidence-backed completion for the current checklist.
+    completion_claim: CompletionClaimStore,
     /// Literal ordinary chat drafts in submission order, capped at 100 entries.
     prompt_history: Vec<String>,
     config: NcaConfig,
@@ -108,6 +115,7 @@ pub struct SupervisorHandle {
     pub socket_path: Option<PathBuf>,
     pub event_log_path: PathBuf,
     event_rx: Option<mpsc::Receiver<AgentEvent>>,
+    idle_hook: Option<IdleHookRunner>,
     ipc_handle: Option<IpcHandle>,
     approval_pending: Option<ApprovalPendingMap>,
     question_pending: Option<QuestionPendingMap>,
@@ -117,6 +125,10 @@ pub struct SupervisorHandle {
 impl SupervisorHandle {
     pub fn take_event_rx(&mut self) -> Option<mpsc::Receiver<AgentEvent>> {
         self.event_rx.take()
+    }
+
+    pub fn take_idle_hook(&mut self) -> Option<IdleHookRunner> {
+        self.idle_hook.take()
     }
 
     pub fn take_ipc_handle(&mut self) -> Option<IpcHandle> {
@@ -233,13 +245,19 @@ impl Supervisor {
         let (event_tx, event_rx) = mpsc::channel(256);
         let question_pending = Arc::new(Mutex::new(HashMap::new()));
         let todos: Arc<Mutex<Vec<AgentTodo>>> = Arc::new(Mutex::new(Vec::new()));
+        let completion_claim: CompletionClaimStore = Arc::new(Mutex::new(None));
         tools.register(Box::new(AskQuestionTool::new(
             event_tx.clone(),
             question_pending.clone(),
         )));
-        tools.register(Box::new(UpdateTodosTool::new(
+        tools.register(Box::new(UpdateTodosTool::new_with_completion_claim(
             event_tx.clone(),
             todos.clone(),
+            completion_claim.clone(),
+        )));
+        tools.register(Box::new(CompleteGoalTool::new(
+            todos.clone(),
+            completion_claim.clone(),
         )));
         tools.register(Box::new(
             InvokeSkillTool::new_with_financial_capability_and_explicit_skills(
@@ -265,6 +283,7 @@ impl Supervisor {
             let runner = HookRunner::new(config.hooks.clone());
             runner.has_any().then_some(runner)
         };
+        let idle_hook = IdleHookRunner::from_config(&config.hooks.idle_hook);
         let mut agent = AgentLoop::new(
             provider,
             tools,
@@ -293,6 +312,7 @@ impl Supervisor {
             session_store,
             ipc_handle: Some(ipc_handle),
             event_rx: Some(event_rx),
+            idle_hook,
             approval_pending,
             question_pending: Some(question_pending),
             spawn_rx: Some(spawn_rx),
@@ -306,6 +326,7 @@ impl Supervisor {
             session_summary: None,
             orchestration: cfg.orchestration_context,
             todos,
+            completion_claim,
             prompt_history: Vec::new(),
             config,
             execution: cfg.execution,
@@ -340,6 +361,9 @@ impl Supervisor {
             sup.agent.cost_tracker.output_tokens = loaded.total_output_tokens;
             if let Ok(mut guard) = sup.todos.lock() {
                 *guard = loaded.todos;
+            }
+            if let Ok(mut guard) = sup.completion_claim.lock() {
+                *guard = loaded.completion_claim;
             }
         }
 
@@ -419,6 +443,7 @@ impl Supervisor {
             socket_path: self.socket_path.clone(),
             event_log_path: self.event_log_path(),
             event_rx: self.event_rx.take(),
+            idle_hook: self.idle_hook.take(),
             ipc_handle: self.ipc_handle.take(),
             approval_pending: self.approval_pending.take(),
             question_pending: self.question_pending.take(),
@@ -427,9 +452,11 @@ impl Supervisor {
     }
 
     pub fn event_log_path(&self) -> PathBuf {
-        self.session_store
-            .sessions_dir()
-            .join(format!("{}.events.jsonl", self.session_id))
+        self.session_store.events_path(&self.session_id)
+    }
+
+    pub fn state_path(&self) -> PathBuf {
+        self.session_store.state_path(&self.session_id)
     }
 
     pub async fn run_turn(&mut self, prompt: &str) -> Result<String, ProviderError> {
@@ -802,11 +829,8 @@ impl Supervisor {
             return Ok(());
         }
         self.prompt_history.push(draft.to_string());
-        if self.prompt_history.len() > nca_common::session::MAX_PROMPT_HISTORY_ENTRIES {
-            let excess =
-                self.prompt_history.len() - nca_common::session::MAX_PROMPT_HISTORY_ENTRIES;
-            self.prompt_history.drain(..excess);
-        }
+        self.prompt_history =
+            nca_common::session::normalize_prompt_history(std::mem::take(&mut self.prompt_history));
         self.save().await
     }
 
@@ -864,16 +888,32 @@ impl Supervisor {
             total_output_tokens: self.agent.cost_tracker.output_tokens,
             estimated_cost_usd: self.agent.cost_tracker.estimated_cost_usd(),
             todos: self.todos.lock().map(|g| g.clone()).unwrap_or_default(),
+            completion_claim: self
+                .completion_claim
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_default(),
         }
     }
 
     pub fn snapshot(&self) -> SessionSnapshot {
-        self.current_session_state(Utc::now()).snapshot()
+        let mut snapshot = self.current_session_state(Utc::now()).snapshot();
+        snapshot.state_path = Some(self.state_path());
+        snapshot.events_path = Some(self.event_log_path());
+        snapshot
     }
 
     /// Current session todos (clone for UI seeding).
     pub fn todos(&self) -> Vec<AgentTodo> {
         self.todos.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// Current accepted completion claim, if the current checklist was verified.
+    pub fn completion_claim(&self) -> Option<GoalCompletionClaim> {
+        self.completion_claim
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
 
     pub fn last_turn_tool_error(&self) -> Option<String> {
@@ -892,6 +932,14 @@ impl Supervisor {
                 .lock()
                 .map_err(|_| "todo store lock poisoned".to_string())?;
             guard.clear();
+        }
+
+        {
+            let mut guard = self
+                .completion_claim
+                .lock()
+                .map_err(|_| "completion claim store lock poisoned".to_string())?;
+            *guard = None;
         }
 
         if let Some(tx) = self.agent.event_sender() {
@@ -1211,6 +1259,7 @@ pub fn spawn_event_fanout(
     ipc_handle: Option<IpcHandle>,
     on_event: Option<EventFanoutCallback>,
     parent_forward: Option<(String, mpsc::Sender<AgentEvent>)>,
+    idle_hook: Option<IdleHookRunner>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let (event_tx, _command_rx) = match ipc_handle {
@@ -1231,6 +1280,9 @@ pub fn spawn_event_fanout(
         let mut event_id: u64 = 0;
         while let Some(event) = event_rx.recv().await {
             event_id += 1;
+            if let Some(ref runner) = idle_hook {
+                runner.observe(&event);
+            }
             if let Some((ref child_id, ref ptx)) = parent_forward
                 && let Some(fwd) = map_child_event_for_parent_broadcast(child_id, &event)
             {
@@ -1847,9 +1899,11 @@ pub async fn spawn_child_session(
     let mut handle = sup.take_handle();
     let event_rx = handle.take_event_rx();
     let log_path = handle.event_log_path.clone();
+    let idle_hook = handle.take_idle_hook();
 
     let parent_forward = event_tx.map(|tx| (child_id.clone(), tx));
-    let fanout = event_rx.map(|rx| spawn_event_fanout(rx, log_path, None, None, parent_forward));
+    let fanout =
+        event_rx.map(|rx| spawn_event_fanout(rx, log_path, None, None, parent_forward, idle_hook));
 
     let result = sup.run_turn(&context_prompt).await;
 
@@ -2069,6 +2123,7 @@ mod tests {
             total_output_tokens: 0,
             estimated_cost_usd: 0.0,
             todos: Vec::new(),
+            completion_claim: None,
         };
 
         let json = serde_json::to_string_pretty(&session).expect("serialize session");
@@ -2740,6 +2795,642 @@ mod tests {
 
         assert!(!prompt.contains("## Recommended Skills"));
         assert!(!prompt.contains("invoke_skill before starting"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervised_lifecycle_runs_idle_hook_only_after_busy_to_idle_transition() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let output = workspace.path().join("idle-hook-output");
+        let script = workspace.path().join("idle-hook");
+        let output_literal = output.to_string_lossy().replace('\'', "'\\''");
+        fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{output_literal}'\n"),
+        )
+        .expect("write hook executable");
+        let mut permissions = fs::metadata(&script).expect("hook metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("make hook executable");
+
+        let mut config = nca_common::config::NcaConfig::default();
+        config.session.history_dir = workspace.path().join("sessions");
+        config.session.last_session_file = workspace.path().join("last-session");
+        config.memory.file_path = workspace.path().join("memory.json");
+        config.provider.default = ProviderKind::Custom;
+        config.provider.custom.base_url = "http://127.0.0.1:1".into();
+        config.provider.custom.api_key = Some("test-key".into());
+        config.provider.custom.model = "test-model".into();
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAi;
+        config.model.default_model = "test-model".into();
+        config.memory.context.auto_detect_context_window = false;
+        config.memory.context.query_provider_models_api = false;
+        let existing_hooks_output = workspace.path().join("existing-hooks-output");
+        let existing_hooks_literal = existing_hooks_output
+            .to_string_lossy()
+            .replace('\'', "'\\''");
+        config
+            .hooks
+            .session_start
+            .push(nca_common::config::HookCommand {
+                command: format!("printf 'session-start\\n' >> '{existing_hooks_literal}'"),
+                matcher: None,
+                blocking: false,
+            });
+        config
+            .hooks
+            .session_end
+            .push(nca_common::config::HookCommand {
+                command: format!("printf 'session-end\\n' >> '{existing_hooks_literal}'"),
+                matcher: None,
+                blocking: false,
+            });
+        config.hooks.idle_hook.command = Some(script.to_string_lossy().into_owned());
+        config.hooks.idle_hook.args =
+            vec!["first value".into(), "$not-expanded".into(), "last".into()];
+
+        let mut supervisor = Supervisor::create(SupervisorConfig {
+            config: config.clone(),
+            workspace_root: workspace.path().to_path_buf(),
+            safe_mode: true,
+            interactive_approvals: false,
+            session_id: Some("idle-hook-lifecycle".into()),
+            approval_handler: None,
+            orchestration_context: None,
+            execution: ExecutionContext::normal(),
+            explicitly_requested_skills: Vec::new(),
+        })
+        .await
+        .expect("create supervisor");
+        assert_eq!(
+            fs::read_to_string(&existing_hooks_output).expect("existing session hook output"),
+            "session-start\n"
+        );
+        let mut updated_config = config.clone();
+        updated_config.hooks.idle_hook.command = Some(
+            workspace
+                .path()
+                .join("must-not-run-after-startup")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        supervisor
+            .apply_nca_config(updated_config)
+            .expect("apply later source configuration");
+        let event_tx = supervisor.agent().event_sender().expect("event sender");
+        let mut handle = supervisor.take_handle();
+        let event_rx = handle.take_event_rx().expect("event receiver");
+        let fanout = spawn_event_fanout(
+            event_rx,
+            handle.event_log_path.clone(),
+            None,
+            None,
+            None,
+            handle.take_idle_hook(),
+        );
+
+        event_tx
+            .send(AgentEvent::BusyStateChanged {
+                state: nca_common::event::BusyState::Idle,
+            })
+            .await
+            .expect("startup idle event");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!output.exists(), "startup idle must not run the hook");
+
+        for state in [
+            nca_common::event::BusyState::Thinking,
+            nca_common::event::BusyState::Streaming,
+            nca_common::event::BusyState::Streaming,
+            nca_common::event::BusyState::Idle,
+        ] {
+            event_tx
+                .send(AgentEvent::BusyStateChanged { state })
+                .await
+                .expect("busy state event");
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if output.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("idle hook should run asynchronously");
+
+        let first_run = fs::read_to_string(&output).expect("hook output");
+        assert_eq!(
+            first_run.lines().collect::<Vec<_>>(),
+            vec!["first value", "$not-expanded", "last"]
+        );
+
+        event_tx
+            .send(AgentEvent::BusyStateChanged {
+                state: nca_common::event::BusyState::Idle,
+            })
+            .await
+            .expect("repeated idle event");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(fs::read_to_string(&output).expect("hook output"), first_run);
+
+        fanout.abort();
+        supervisor.finish(EndReason::Completed).await;
+        assert_eq!(
+            fs::read_to_string(&existing_hooks_output).expect("existing lifecycle hook output"),
+            "session-start\nsession-end\n"
+        );
+
+        let disabled_output = workspace.path().join("disabled-output");
+        let mut disabled_config = nca_common::config::NcaConfig::default();
+        disabled_config.session.history_dir = workspace.path().join("disabled-sessions");
+        disabled_config.session.last_session_file = workspace.path().join("disabled-last-session");
+        disabled_config.memory.file_path = workspace.path().join("disabled-memory.json");
+        disabled_config.provider.default = ProviderKind::Custom;
+        disabled_config.provider.custom.base_url = "http://127.0.0.1:1".into();
+        disabled_config.provider.custom.api_key = Some("test-key".into());
+        disabled_config.provider.custom.model = "test-model".into();
+        disabled_config.provider.custom.compatibility = ProviderCompatibility::OpenAi;
+        disabled_config.model.default_model = "test-model".into();
+        disabled_config.memory.context.auto_detect_context_window = false;
+        disabled_config.memory.context.query_provider_models_api = false;
+        let mut disabled_supervisor = Supervisor::create(SupervisorConfig {
+            config: disabled_config,
+            workspace_root: workspace.path().to_path_buf(),
+            safe_mode: true,
+            interactive_approvals: false,
+            session_id: Some("idle-hook-disabled".into()),
+            approval_handler: None,
+            orchestration_context: None,
+            execution: ExecutionContext::normal(),
+            explicitly_requested_skills: Vec::new(),
+        })
+        .await
+        .expect("create disabled supervisor");
+        let disabled_tx = disabled_supervisor
+            .agent()
+            .event_sender()
+            .expect("disabled event sender");
+        let mut disabled_handle = disabled_supervisor.take_handle();
+        let disabled_fanout = spawn_event_fanout(
+            disabled_handle
+                .take_event_rx()
+                .expect("disabled event receiver"),
+            disabled_handle.event_log_path.clone(),
+            None,
+            None,
+            None,
+            disabled_handle.take_idle_hook(),
+        );
+        for state in [
+            nca_common::event::BusyState::Thinking,
+            nca_common::event::BusyState::Idle,
+        ] {
+            disabled_tx
+                .send(AgentEvent::BusyStateChanged { state })
+                .await
+                .expect("disabled busy state event");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!disabled_output.exists(), "disabled hook must not run");
+        disabled_fanout.abort();
+        disabled_supervisor.finish(EndReason::Completed).await;
+    }
+
+    #[tokio::test]
+    async fn supervised_lifecycle_preserves_existing_hooks_without_idle_hook() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let output = workspace.path().join("existing-hooks-only-output");
+        let output_literal = output.to_string_lossy().replace('\'', "'\\''");
+        let mut config = nca_common::config::NcaConfig::default();
+        config.session.history_dir = workspace.path().join("sessions");
+        config.session.last_session_file = workspace.path().join("last-session");
+        config.memory.file_path = workspace.path().join("memory.json");
+        config.provider.default = ProviderKind::Custom;
+        config.provider.custom.base_url = "http://127.0.0.1:1".into();
+        config.provider.custom.api_key = Some("test-key".into());
+        config.provider.custom.model = "test-model".into();
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAi;
+        config.model.default_model = "test-model".into();
+        config.memory.context.auto_detect_context_window = false;
+        config.memory.context.query_provider_models_api = false;
+        config
+            .hooks
+            .session_start
+            .push(nca_common::config::HookCommand {
+                command: format!("printf 'session-start\\n' >> '{output_literal}'"),
+                matcher: None,
+                blocking: false,
+            });
+        config
+            .hooks
+            .session_end
+            .push(nca_common::config::HookCommand {
+                command: format!("printf 'session-end\\n' >> '{output_literal}'"),
+                matcher: None,
+                blocking: false,
+            });
+
+        let mut supervisor = Supervisor::create(SupervisorConfig {
+            config,
+            workspace_root: workspace.path().to_path_buf(),
+            safe_mode: true,
+            interactive_approvals: false,
+            session_id: Some("existing-hooks-without-idle".into()),
+            approval_handler: None,
+            orchestration_context: None,
+            execution: ExecutionContext::normal(),
+            explicitly_requested_skills: Vec::new(),
+        })
+        .await
+        .expect("create supervisor");
+        assert_eq!(
+            fs::read_to_string(&output).expect("session-start hook output"),
+            "session-start\n"
+        );
+
+        let event_tx = supervisor.agent().event_sender().expect("event sender");
+        let mut handle = supervisor.take_handle();
+        assert!(handle.take_idle_hook().is_none());
+        let fanout = spawn_event_fanout(
+            handle.take_event_rx().expect("event receiver"),
+            handle.event_log_path.clone(),
+            None,
+            None,
+            None,
+            None,
+        );
+        for state in [
+            nca_common::event::BusyState::Thinking,
+            nca_common::event::BusyState::Idle,
+        ] {
+            event_tx
+                .send(AgentEvent::BusyStateChanged { state })
+                .await
+                .expect("busy state event");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            fs::read_to_string(&output).expect("existing hook output"),
+            "session-start\n"
+        );
+
+        fanout.abort();
+        supervisor.finish(EndReason::Completed).await;
+        assert_eq!(
+            fs::read_to_string(&output).expect("session lifecycle hook output"),
+            "session-start\nsession-end\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervised_lifecycle_skips_in_flight_hooks_and_recovers_after_completion() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let output = workspace.path().join("in-flight-output");
+        let count = workspace.path().join("in-flight-count");
+        let secret = "secret-argument-must-not-be-logged";
+        let script = workspace.path().join("in-flight-hook");
+        fs::write(
+            &script,
+            "#!/bin/sh\ncount_file=$1\nout=$2\ncount=0\n[ -f \"$count_file\" ] && count=$(cat \"$count_file\")\ncount=$((count + 1))\nprintf '%s' \"$count\" > \"$count_file\"\nprintf 'started\\n' >> \"$out\"\nsleep 1\nprintf 'completed\\n' >> \"$out\"\n",
+        )
+        .expect("write hook executable");
+        let mut permissions = fs::metadata(&script).expect("hook metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("make hook executable");
+
+        let mut config = nca_common::config::NcaConfig::default();
+        config.session.history_dir = workspace.path().join("sessions");
+        config.session.last_session_file = workspace.path().join("last-session");
+        config.memory.file_path = workspace.path().join("memory.json");
+        config.provider.default = ProviderKind::Custom;
+        config.provider.custom.base_url = "http://127.0.0.1:1".into();
+        config.provider.custom.api_key = Some("test-key".into());
+        config.provider.custom.model = "test-model".into();
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAi;
+        config.model.default_model = "test-model".into();
+        config.memory.context.auto_detect_context_window = false;
+        config.memory.context.query_provider_models_api = false;
+        config.hooks.idle_hook.command = Some(script.to_string_lossy().into_owned());
+        config.hooks.idle_hook.args = vec![
+            count.to_string_lossy().into_owned(),
+            output.to_string_lossy().into_owned(),
+            secret.into(),
+        ];
+
+        let mut supervisor = Supervisor::create(SupervisorConfig {
+            config,
+            workspace_root: workspace.path().to_path_buf(),
+            safe_mode: true,
+            interactive_approvals: false,
+            session_id: Some("idle-hook-in-flight".into()),
+            approval_handler: None,
+            orchestration_context: None,
+            execution: ExecutionContext::normal(),
+            explicitly_requested_skills: Vec::new(),
+        })
+        .await
+        .expect("create supervisor");
+        let event_tx = supervisor.agent().event_sender().expect("event sender");
+        let mut handle = supervisor.take_handle();
+        let event_log_path = handle.event_log_path.clone();
+        let fanout = spawn_event_fanout(
+            handle.take_event_rx().expect("event receiver"),
+            event_log_path.clone(),
+            None,
+            None,
+            None,
+            handle.take_idle_hook(),
+        );
+
+        for state in [
+            nca_common::event::BusyState::Thinking,
+            nca_common::event::BusyState::Idle,
+            nca_common::event::BusyState::Thinking,
+            nca_common::event::BusyState::Idle,
+        ] {
+            event_tx
+                .send(AgentEvent::BusyStateChanged { state })
+                .await
+                .expect("busy state event");
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if fs::read_to_string(&count)
+                    .map(|content| content == "1")
+                    .unwrap_or(false)
+                    && fs::read_to_string(&output)
+                        .map(|content| content == "started\n")
+                        .unwrap_or(false)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first invocation should start");
+        assert_eq!(
+            fs::read_to_string(&output).expect("first output"),
+            "started\n"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if fs::read_to_string(&output)
+                    .map(|content| content == "started\ncompleted\n")
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first invocation should complete");
+
+        for state in [
+            nca_common::event::BusyState::Thinking,
+            nca_common::event::BusyState::Idle,
+        ] {
+            event_tx
+                .send(AgentEvent::BusyStateChanged { state })
+                .await
+                .expect("recovery state event");
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if fs::read_to_string(&count)
+                    .map(|content| content == "2")
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a later transition should start a new invocation");
+        assert_eq!(
+            fs::read_to_string(&output).expect("all hook output"),
+            "started\ncompleted\nstarted\n"
+        );
+        assert!(
+            !fs::read_to_string(&event_log_path)
+                .expect("event log")
+                .contains(secret),
+            "hook arguments must not be copied into lifecycle logs"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if fs::read_to_string(&output)
+                    .map(|content| content == "started\ncompleted\nstarted\ncompleted\n")
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("recovered invocation should complete");
+        fanout.abort();
+        supervisor.finish(EndReason::Completed).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervised_lifecycle_terminates_timeout_and_recovers_on_next_transition() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let script = workspace.path().join("timeout-recovery-hook");
+        let count = workspace.path().join("timeout-count");
+        let output = workspace.path().join("timeout-output");
+        fs::write(
+            &script,
+            "#!/bin/sh\ncount_file=$1\nout=$2\ncount=0\n[ -f \"$count_file\" ] && count=$(cat \"$count_file\")\ncount=$((count + 1))\nprintf '%s' \"$count\" > \"$count_file\"\nif [ \"$count\" -eq 1 ]; then exec sleep 30; fi\nprintf recovered > \"$out\"\n",
+        )
+        .expect("write timeout hook");
+        let mut permissions = fs::metadata(&script)
+            .expect("timeout hook metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("make timeout hook executable");
+
+        let mut config = nca_common::config::NcaConfig::default();
+        config.session.history_dir = workspace.path().join("sessions");
+        config.session.last_session_file = workspace.path().join("last-session");
+        config.memory.file_path = workspace.path().join("memory.json");
+        config.provider.default = ProviderKind::Custom;
+        config.provider.custom.base_url = "http://127.0.0.1:1".into();
+        config.provider.custom.api_key = Some("test-key".into());
+        config.provider.custom.model = "test-model".into();
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAi;
+        config.model.default_model = "test-model".into();
+        config.memory.context.auto_detect_context_window = false;
+        config.memory.context.query_provider_models_api = false;
+        config.hooks.idle_hook.command = Some(script.to_string_lossy().into_owned());
+        config.hooks.idle_hook.args = vec![
+            count.to_string_lossy().into_owned(),
+            output.to_string_lossy().into_owned(),
+        ];
+
+        let mut supervisor = Supervisor::create(SupervisorConfig {
+            config,
+            workspace_root: workspace.path().to_path_buf(),
+            safe_mode: true,
+            interactive_approvals: false,
+            session_id: Some("idle-hook-timeout-recovery".into()),
+            approval_handler: None,
+            orchestration_context: None,
+            execution: ExecutionContext::normal(),
+            explicitly_requested_skills: Vec::new(),
+        })
+        .await
+        .expect("create supervisor");
+        let event_tx = supervisor.agent().event_sender().expect("event sender");
+        let mut handle = supervisor.take_handle();
+        let fanout = spawn_event_fanout(
+            handle.take_event_rx().expect("event receiver"),
+            handle.event_log_path.clone(),
+            None,
+            None,
+            None,
+            handle.take_idle_hook(),
+        );
+        for state in [
+            nca_common::event::BusyState::Thinking,
+            nca_common::event::BusyState::Idle,
+        ] {
+            event_tx
+                .send(AgentEvent::BusyStateChanged { state })
+                .await
+                .expect("timeout state event");
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if fs::read_to_string(&count)
+                    .map(|content| content == "1")
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timeout invocation should start");
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        assert!(!output.exists(), "the timed-out process must not complete");
+
+        for state in [
+            nca_common::event::BusyState::Thinking,
+            nca_common::event::BusyState::Idle,
+        ] {
+            event_tx
+                .send(AgentEvent::BusyStateChanged { state })
+                .await
+                .expect("recovery state event");
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if fs::read_to_string(&output)
+                    .map(|content| content == "recovered")
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timeout must release the in-flight guard");
+
+        fanout.abort();
+        supervisor.finish(EndReason::Completed).await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervised_lifecycle_keeps_running_after_spawn_and_nonzero_hook_failures() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let failure_script = workspace.path().join("failure-hook");
+        fs::write(&failure_script, "#!/bin/sh\nexit 7\n").expect("write failure hook");
+        let mut permissions = fs::metadata(&failure_script)
+            .expect("failure hook metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&failure_script, permissions).expect("make failure hook executable");
+
+        for (session_id, command) in [
+            (
+                "idle-hook-spawn-failure",
+                workspace.path().join("missing-hook"),
+            ),
+            ("idle-hook-nonzero", failure_script.clone()),
+        ] {
+            let mut config = nca_common::config::NcaConfig::default();
+            config.session.history_dir = workspace.path().join(format!("{session_id}-sessions"));
+            config.session.last_session_file = workspace.path().join(format!("{session_id}-last"));
+            config.memory.file_path = workspace.path().join(format!("{session_id}-memory.json"));
+            config.provider.default = ProviderKind::Custom;
+            config.provider.custom.base_url = "http://127.0.0.1:1".into();
+            config.provider.custom.api_key = Some("test-key".into());
+            config.provider.custom.model = "test-model".into();
+            config.provider.custom.compatibility = ProviderCompatibility::OpenAi;
+            config.model.default_model = "test-model".into();
+            config.memory.context.auto_detect_context_window = false;
+            config.memory.context.query_provider_models_api = false;
+            config.hooks.idle_hook.command = Some(command.to_string_lossy().into_owned());
+
+            let mut supervisor = Supervisor::create(SupervisorConfig {
+                config,
+                workspace_root: workspace.path().to_path_buf(),
+                safe_mode: true,
+                interactive_approvals: false,
+                session_id: Some(session_id.into()),
+                approval_handler: None,
+                orchestration_context: None,
+                execution: ExecutionContext::normal(),
+                explicitly_requested_skills: Vec::new(),
+            })
+            .await
+            .expect("create supervisor");
+            let event_tx = supervisor.agent().event_sender().expect("event sender");
+            let mut handle = supervisor.take_handle();
+            let fanout = spawn_event_fanout(
+                handle.take_event_rx().expect("event receiver"),
+                handle.event_log_path.clone(),
+                None,
+                None,
+                None,
+                handle.take_idle_hook(),
+            );
+            for state in [
+                nca_common::event::BusyState::Thinking,
+                nca_common::event::BusyState::Idle,
+            ] {
+                event_tx
+                    .send(AgentEvent::BusyStateChanged { state })
+                    .await
+                    .expect("failure state event");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            fanout.abort();
+            supervisor.finish(EndReason::Completed).await;
+        }
     }
 
     #[test]

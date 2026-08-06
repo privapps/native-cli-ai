@@ -1,4 +1,4 @@
-.PHONY: all build dev release clean test install fmt lint docs-reference docs-check to-spec-check help
+.PHONY: all build dev release clean test install fmt lint docs-reference docs-check to-spec-check dependency-audit help
 
 # Default target
 all: build
@@ -90,6 +90,10 @@ to-spec-check:
 	target/docs-tools/validate-to-spec-tests
 	target/docs-tools/validate-to-spec
 
+# Run a clean dependency and build-footprint audit in a disposable target directory
+dependency-audit:
+	bash tools/dependency-build-footprint.sh
+
 # Update dependencies
 update:
 	cargo update
@@ -114,3 +118,4 @@ help:
 	@echo "  docs-reference - Generate the top-level CLI reference"
 	@echo "  docs-check - Validate documentation structure and links"
 	@echo "  to-spec-check - Validate local to-spec workflow and destination safety"
+	@echo "  dependency-audit - Measure clean dependency and build footprint"

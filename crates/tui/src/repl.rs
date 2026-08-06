@@ -14,7 +14,7 @@ use crate::tui::{
     ApprovalAnswer, CustomProviderProbeAction, CustomProviderSetupSubmission, DisplayBlock,
     ModelPickerAction, ModelPickerEntry, SharedTuiState, SkillPickerEntry, TuiCmd, TuiSessionState,
     git_create_branch, git_current_branch, git_list_branches, git_switch_branch,
-    replay_event_log_into_state, run_blocking, spawn_tui_bridge,
+    replay_event_log_into_state, run_blocking, spawn_tui_bridge_with_idle_hook,
 };
 use nca_common::config::{
     CustomCredentialSource, CustomProviderConfig, CustomProviderConfigError, CustomProviderSetup,
@@ -139,6 +139,18 @@ fn resolve_explicit_skill(
     Ok(SkillCatalog::discover(workspace_root, skill_directories)?
         .into_iter()
         .find(|skill| skill.command == command))
+}
+
+fn projected_reasoning_effort(config: &NcaConfig) -> Option<String> {
+    if !config.reasoning_effort_active_for_default_provider() {
+        return None;
+    }
+    let effort = config.model.reasoning_effort.trim();
+    if effort.is_empty() || effort.eq_ignore_ascii_case("nil") {
+        None
+    } else {
+        Some(effort.to_string())
+    }
 }
 
 impl ReplOutput<'_> {
@@ -334,6 +346,13 @@ impl Repl {
         }
     }
 
+    fn sync_tui_reasoning_effort(&self, state: &Arc<Mutex<TuiSessionState>>) {
+        let effort = projected_reasoning_effort(self.runtime.config());
+        if let Ok(mut g) = state.lock() {
+            g.set_reasoning_effort(effort);
+        }
+    }
+
     fn prepare_interactive_prompt(
         &self,
         input: &str,
@@ -388,6 +407,13 @@ impl Repl {
     /// Run the interactive REPL until the user exits.
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let mut editor = self.build_editor()?;
+
+        eprintln!(
+            "[session] {}\n  state: {}\n  events: {}",
+            self.runtime.session_id(),
+            self.runtime.state_path().display(),
+            self.runtime.event_log_path().display()
+        );
 
         let _spawn_task = {
             let spawn_rx = self.runtime.take_spawn_rx();
@@ -487,6 +513,7 @@ impl Repl {
                         "\n[cancel] Press Ctrl+D to exit, or wait for current operation to complete"
                     );
                 }
+                Ok(_) => continue,
                 Err(err) => {
                     eprintln!("read error: {err}");
                     break;
@@ -576,10 +603,11 @@ impl Repl {
             return;
         }
         if objective.is_none() && crate::goal::is_complete(&existing) {
-            out.eprintln(
-                "[goal] the existing checklist is already complete; use `/goal <objective>` for a new goal",
-            );
-            return;
+            if let Some(claim) = self.runtime.completion_claim() {
+                out.println(&format!("[goal] completed: {}", claim.summary));
+                return;
+            }
+            out.println("[goal] existing checklist is complete but unverified; requesting final verification");
         }
 
         let mut prompt;
@@ -590,6 +618,9 @@ impl Repl {
             }
             out.println("[goal] starting fresh objective");
             prompt = crate::goal::initial_prompt(objective);
+        } else if crate::goal::is_complete(&existing) {
+            out.println("[goal] continuing existing checklist for final verification");
+            prompt = crate::goal::final_verification_prompt().to_string();
         } else {
             out.println("[goal] continuing existing checklist");
             prompt = crate::goal::continuation_prompt().to_string();
@@ -634,10 +665,24 @@ impl Repl {
 
             let todos = self.runtime.todos();
             if crate::goal::is_complete(&todos) {
+                if let Some(claim) = self.runtime.completion_claim() {
+                    out.println(&format!(
+                        "[goal] completed after {iteration} iteration(s): {}",
+                        claim.summary
+                    ));
+                    return;
+                }
+                if iteration == limit {
+                    out.println(&format!(
+                        "[goal] incomplete after {iteration} iteration(s): checklist completed but final verification was not accepted"
+                    ));
+                    return;
+                }
                 out.println(&format!(
-                    "[goal] completed after {iteration} iteration(s): all checklist items are completed"
+                    "[goal] checklist completed after {iteration} iteration(s); requesting final verification"
                 ));
-                return;
+                prompt = crate::goal::final_verification_prompt().to_string();
+                continue;
             }
             if todos.is_empty() {
                 out.println(&format!(
@@ -729,7 +774,7 @@ impl Repl {
                 }
             } else {
                 out.eprintln(
-                    "[provider] custom provider is not configured yet; use /custom <openai|anthropic> <base-url> [api-key] [model]",
+                    "[provider] custom provider is not configured yet; use /custom <openai|responses|anthropic> <base-url> [api-key] [model]",
                 );
             }
             return Ok(());
@@ -744,6 +789,9 @@ impl Repl {
                     g.model = self.runtime.model().to_string();
                     g.set_active_provider(p, self.runtime.config().provider.base_url_for(p));
                     g.mark_dirty();
+                }
+                if let ReplOutput::Tui(st) = &out {
+                    self.sync_tui_reasoning_effort(st);
                 }
                 match self.runtime.config().save_provider_patch_workspace(
                     self.runtime.workspace_root(),
@@ -971,6 +1019,7 @@ impl Repl {
                 ProviderKind::Custom,
                 self.runtime.config().provider.custom.base_url.as_str(),
             );
+            g.set_reasoning_effort(projected_reasoning_effort(self.runtime.config()));
             g.mark_dirty();
         }
         Ok(persistence_warning)
@@ -1220,7 +1269,7 @@ impl Repl {
         };
 
         match command {
-            "/q" | "/quit" | "/exit" => return Ok(false),
+            "/quit" | "/exit" => return Ok(false),
             "/stop" => {
                 self.runtime.request_cancel();
                 out.println("[stop] cancelling current turn…");
@@ -1280,6 +1329,12 @@ impl Repl {
                 let mut lines = vec![
                     format!("Session:     {}", snapshot.id),
                     format!("Model:       {}", self.runtime.model()),
+                    format!(
+                        "Provider:    {}",
+                        self.runtime.config().provider.diagnostic_name_for(
+                            self.runtime.config().provider.default
+                        )
+                    ),
                     format!("Agent:       @{}", self.agent_profile.label()),
                     format!("Permission:  {:?}", self.runtime.permission_mode()),
                     format!("Children:    {}", snapshot.child_session_ids.len()),
@@ -1302,9 +1357,14 @@ impl Repl {
                     "Provider health:".into(),
                 ];
                 for provider in ProviderKind::ALL {
+                    let provider_name = self
+                        .runtime
+                        .config()
+                        .provider
+                        .diagnostic_name_for(provider);
                     lines.push(format!(
-                        "  {:<12} key {}",
-                        provider.display_name(),
+                        "  {:<30} key {}",
+                        provider_name,
                         if self.runtime.config().provider.api_key_present_for(provider) {
                             "configured"
                         } else {
@@ -1748,7 +1808,10 @@ impl Repl {
                     let provider = self.runtime.config().provider.default;
                     out.println(&format!(
                         "default_provider={} default_model={} thinking={} budget={}",
-                        provider.display_name(),
+                        self.runtime
+                            .config()
+                            .provider
+                            .diagnostic_name_for(provider),
                         self.runtime.config().model.default_model,
                         self.runtime.config().model.enable_thinking,
                         self.runtime.config().model.thinking_budget
@@ -1763,7 +1826,10 @@ impl Repl {
                     for provider in nca_common::config::ProviderKind::ALL {
                         out.println(&format!(
                             "  {} -> {} ({})",
-                            provider.display_name(),
+                            self.runtime
+                                .config()
+                                .provider
+                                .diagnostic_name_for(provider),
                             self.runtime.config().provider.model_for(provider),
                             self.runtime.config().provider.base_url_for(provider)
                         ));
@@ -1925,7 +1991,10 @@ impl Repl {
             "/config" => {
                 let config = self.runtime.config();
                 let mut lines = vec![
-                    format!("Provider:    {}", config.provider.default.display_name()),
+                    format!(
+                        "Provider:    {}",
+                        config.provider.diagnostic_name_for(config.provider.default)
+                    ),
                     format!("Model:       {}", self.runtime.model()),
                     format!("Permission:  {:?}", self.runtime.permission_mode()),
                     format!("Memory:      {}", self.runtime.memory_store_path().display()),
@@ -1946,8 +2015,8 @@ impl Repl {
                 ];
                 for provider in ProviderKind::ALL {
                     lines.push(format!(
-                        "  {:<12} {}",
-                        format!("{}:", provider.display_name()),
+                        "  {:<30} {}",
+                        config.provider.diagnostic_name_for(provider),
                         config.provider.base_url_for(provider)
                     ));
                 }
@@ -1986,7 +2055,12 @@ impl Repl {
                 let lines = vec![
                     "Workspace settings (.nca/config.local.toml):".into(),
                     String::new(),
-                    format!("  Provider:    {}", self.runtime.config().provider.default.display_name()),
+                    format!(
+                        "  Provider:    {}",
+                        self.runtime.config().provider.diagnostic_name_for(
+                            self.runtime.config().provider.default
+                        )
+                    ),
                     format!("  Model:       {}", self.runtime.model()),
                     format!("  Editor:      {}", self.runtime.config().effective_editor_command()),
                     format!("  Permission:  {:?}", self.runtime.permission_mode()),
@@ -2022,7 +2096,9 @@ impl Repl {
                     } else {
                         out.println(&format!(
                             "current default provider: {} (model {})",
-                            self.runtime.config().provider.default.display_name(),
+                            self.runtime.config().provider.diagnostic_name_for(
+                                self.runtime.config().provider.default
+                            ),
                             self.runtime.model()
                         ));
                         out.println("usage: /provider <minimax|openai|anthropic|openrouter|custom>");
@@ -2040,7 +2116,7 @@ impl Repl {
                         out.println("[provider] add custom provider wizard opened");
                     } else {
                         out.println("Wizard needs the full-screen TUI. Use:");
-                        out.println("  /custom <openai|anthropic> <base-url> [api-key] [model]");
+                        out.println("  /custom <openai|responses|anthropic> <base-url> [api-key] [model]");
                     }
                 } else if let Some(p) = ProviderKind::from_cli_name(rest)
                     .or_else(|| ProviderKind::parse_display_name(rest))
@@ -2079,7 +2155,7 @@ impl Repl {
                                 }
                             ),
                             String::new(),
-                            "usage: /custom <openai|anthropic> <base-url> [api-key] [model]".into(),
+                            "usage: /custom <openai|responses|anthropic> <base-url> [api-key] [model]".into(),
                             "TUI:   /provider → \"Add custom provider…\"".into(),
                             "example: /custom openai https://sumopod.example sk-test my-model".into(),
                         ];
@@ -2223,9 +2299,14 @@ impl Repl {
                         .config()
                         .provider
                         .api_key_present_for(provider);
+                    let provider_name = self
+                        .runtime
+                        .config()
+                        .provider
+                        .diagnostic_name_for(provider);
                     lines.push(format!(
                         "{}{} API key {} ({})",
-                        provider.display_name(),
+                        provider_name,
                         if provider == self.runtime.config().provider.default {
                             " [selected]"
                         } else {
@@ -2375,6 +2456,9 @@ impl Repl {
                     cfg.model.reasoning_effort = value.to_string();
                     match self.runtime.apply_nca_config(cfg) {
                         Ok(()) => {
+                            if let ReplOutput::Tui(st) = &out {
+                                self.sync_tui_reasoning_effort(st);
+                            }
                             if let Err(error) = self
                                 .runtime
                                 .config()
@@ -2510,11 +2594,18 @@ impl Repl {
         ));
         let tui_state = shared_state.arc();
         if let Ok(mut g) = tui_state.lock() {
+            g.blocks.push(DisplayBlock::System(format!(
+                "session {}\nstate: {}\nevents: {}",
+                self.runtime.session_id(),
+                self.runtime.state_path().display(),
+                self.runtime.event_log_path().display()
+            )));
             let provider = self.runtime.config().provider.default;
             g.set_active_provider(
                 provider,
                 self.runtime.config().provider.base_url_for(provider),
             );
+            g.set_reasoning_effort(projected_reasoning_effort(self.runtime.config()));
             g.set_prompt_history(self.runtime.prompt_history().to_vec());
         }
 
@@ -2529,6 +2620,7 @@ impl Repl {
 
         let log_path = self.runtime.event_log_path();
         replay_event_log_into_state(&log_path, &tui_state).await;
+        self.sync_tui_reasoning_effort(&tui_state);
 
         // Populate the git branch name immediately so it appears on first render.
         let workspace = self.runtime.workspace_root().to_path_buf();
@@ -2547,7 +2639,8 @@ impl Repl {
         let ipc = self.runtime.take_ipc_handle();
         let approval = self.runtime.take_ipc_approval_pending();
         let question = self.runtime.question_pending();
-        let _bridge = spawn_tui_bridge(
+        let idle_hook = self.runtime.take_idle_hook();
+        let _bridge = spawn_tui_bridge_with_idle_hook(
             rx,
             log_path,
             ipc,
@@ -2555,6 +2648,7 @@ impl Repl {
             question.clone(),
             tui_state.clone(),
             Some(shared_state.version_tx()),
+            idle_hook,
         );
 
         let _spawn_task = {
@@ -2830,6 +2924,7 @@ impl Repl {
                                 )));
                                 g.mark_transcript_dirty();
                             }
+                            self.sync_tui_reasoning_effort(&tui_state);
                         }
                         Err(e) => {
                             if let Ok(mut g) = tui_state.lock() {
@@ -2970,6 +3065,7 @@ impl Repl {
                                 )));
                                 g.mark_transcript_dirty();
                             }
+                            self.sync_tui_reasoning_effort(&tui_state);
                         }
                     } else if let Ok(mut g) = tui_state.lock() {
                         g.blocks.push(DisplayBlock::System(
@@ -3363,6 +3459,7 @@ fn complete_repl_input(
         for path in filter_paths_prefix(&files, &prefix) {
             suggestions.push(Suggestion {
                 value: format!("@{path}"),
+                display_override: None,
                 description: Some("workspace file".to_string()),
                 extra: None,
                 span: reedline::Span {
@@ -3371,6 +3468,7 @@ fn complete_repl_input(
                 },
                 append_whitespace: false,
                 style: None,
+                match_indices: None,
             });
         }
         if !suggestions.is_empty() {
@@ -3384,11 +3482,13 @@ fn complete_repl_input(
             if spec.name.starts_with(line) {
                 suggestions.push(Suggestion {
                     value: spec.name.to_string(),
+                    display_override: None,
                     description: Some(spec.description.to_string()),
                     extra: None,
                     span: reedline::Span { start: 0, end: 0 },
                     append_whitespace: true,
                     style: None,
+                    match_indices: None,
                 });
             }
         }
@@ -3405,11 +3505,13 @@ fn complete_repl_input(
             if full.starts_with(line) {
                 suggestions.push(Suggestion {
                     value: full,
+                    display_override: None,
                     description: Some("Shell command".to_string()),
                     extra: None,
                     span: reedline::Span { start: 0, end: 0 },
                     append_whitespace: true,
                     style: None,
+                    match_indices: None,
                 });
             }
         }
@@ -3423,6 +3525,7 @@ fn complete_repl_input(
             if skill_cmd.starts_with(line) {
                 suggestions.push(Suggestion {
                     value: skill_cmd,
+                    display_override: None,
                     description: Some(format!(
                         "{} — {} [{}]{}",
                         skill.display_label(),
@@ -3438,6 +3541,7 @@ fn complete_repl_input(
                     span: reedline::Span { start: 0, end: 0 },
                     append_whitespace: true,
                     style: None,
+                    match_indices: None,
                 });
             }
         }
@@ -3487,7 +3591,7 @@ fn build_model_picker_entries(
             ""
         };
         entries.push(ModelPickerEntry {
-            label: format!("{}{}", p.display_name(), selected),
+            label: format!("{}{}", config.provider.diagnostic_name_for(p), selected),
             detail: format!("{model} ({key_status})"),
             action: ModelPickerAction::SwitchProvider(p),
             is_header: false,
@@ -3595,6 +3699,32 @@ mod tests {
                         "type": "function",
                         "function": {
                             "name": "update_todos",
+                            "arguments": arguments
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        format!("data: {event}\n\ndata: [DONE]\n\n")
+    }
+
+    fn goal_completion_tool_response(call_id: &str) -> String {
+        let arguments = serde_json::json!({
+            "summary": "objective verified",
+            "evidence": "scripted application-level goal checks passed",
+            "verification": "passed"
+        })
+        .to_string();
+        let event = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": "complete_goal",
                             "arguments": arguments
                         }
                     }]
@@ -4594,12 +4724,13 @@ mod tests {
 
     #[test]
     fn model_picker_exposes_custom_as_a_provider_switch_action() {
-        let config = NcaConfig::default();
+        let mut config = NcaConfig::default();
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
         let entries = build_model_picker_entries(&config, &[]);
         let custom = entries
             .iter()
-            .find(|entry| entry.label == "Custom")
-            .expect("custom provider entry");
+            .find(|entry| entry.label == "Custom (OpenAI Responses)")
+            .expect("custom Responses provider entry");
 
         assert!(!custom.is_header);
         assert!(matches!(
@@ -4725,6 +4856,7 @@ mod tests {
             goal_tool_response("call-1", "in_progress"),
             goal_text_response("made a start"),
             goal_tool_response("call-2", "completed"),
+            goal_completion_tool_response("claim-1"),
             goal_text_response("verified completion"),
         ])
         .await;
@@ -4745,11 +4877,69 @@ mod tests {
         let _ = bodies
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("fourth provider request");
+        let _ = bodies
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("fifth provider request");
         let state = state.lock().expect("state lock");
         assert!(state.blocks.iter().any(|block| matches!(
             block,
-            DisplayBlock::System(message) if message.contains("completed after 2 iteration")
+            DisplayBlock::System(message)
+                if message.contains("completed after 2 iteration")
+                    && message.contains("objective verified")
         )));
+    }
+
+    #[tokio::test]
+    async fn completed_checklist_without_claim_requests_final_verification_and_cannot_succeed() {
+        let (mut repl, state, _workspace, bodies) = goal_repl(vec![
+            goal_tool_response("complete", "completed"),
+            goal_text_response("I finished the work"),
+            goal_text_response("verification remains inconclusive"),
+        ])
+        .await;
+        repl.runtime.config_mut().session.max_goal_iterations = 2;
+        repl.handle_command("/goal missing handshake", ReplOutput::Tui(&state))
+            .await
+            .expect("goal command");
+
+        let _first = bodies
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("first provider request");
+        let _second = bodies
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("checklist response provider request");
+        let final_verification = bodies
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("final verification provider request");
+        assert!(
+            provider_user_prompt(&final_verification, ProviderCompatibility::OpenAi)
+                .contains("completion handshake is still missing")
+        );
+
+        let state = state.lock().expect("state lock");
+        let messages: Vec<_> = state
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                DisplayBlock::System(message) => Some(message.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("requesting final verification"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| { message.contains("final verification was not accepted") })
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.contains("[goal] completed after"))
+        );
     }
 
     #[tokio::test]
@@ -4859,7 +5049,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn goal_stops_when_a_tool_returns_an_error_even_if_the_turn_finishes() {
+    async fn goal_evaluates_todos_after_a_tool_error_and_usable_response() {
         let (mut repl, state, _workspace, bodies) = goal_repl(vec![
             goal_unknown_tool_response(),
             goal_text_response("the provider continued after the tool failure"),
@@ -4869,6 +5059,65 @@ mod tests {
             .await
             .expect("goal command");
         for _ in 0..2 {
+            let _ = bodies
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("provider request");
+        }
+        let state = state.lock().expect("state lock");
+        assert!(state.blocks.iter().any(|block| matches!(
+            block,
+            DisplayBlock::System(message)
+                if message.contains("incomplete after 1 iteration")
+                    && message.contains("tool error")
+        )));
+    }
+
+    #[tokio::test]
+    async fn goal_reports_recoverable_tool_error_as_incomplete() {
+        let (mut repl, state, _workspace, bodies) = goal_repl(vec![
+            goal_tool_response("start", "in_progress"),
+            goal_text_response("started"),
+            goal_unknown_tool_response(),
+            goal_text_response("the failure is recoverable"),
+        ])
+        .await;
+        repl.handle_command("/goal recoverable objective", ReplOutput::Tui(&state))
+            .await
+            .expect("goal command");
+        for _ in 0..4 {
+            let _ = bodies
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("provider request");
+        }
+        let state = state.lock().expect("state lock");
+        assert!(state.blocks.iter().any(|block| matches!(
+            block,
+            DisplayBlock::System(message) if message.contains("incomplete after 2 iteration")
+                && message.contains("tool error")
+        )));
+        assert!(!state.blocks.iter().any(|block| matches!(
+            block,
+            DisplayBlock::System(message) if message.contains("completed after")
+        )));
+    }
+
+    #[tokio::test]
+    async fn goal_reports_same_tool_input_breaker_as_incomplete() {
+        let responses = vec![
+            goal_tool_response("start-breaker", "in_progress"),
+            goal_text_response("started"),
+            // Three identical failures occur inside one runtime turn. The
+            // agent's bounded breaker returns recovery context instead of
+            // allowing the provider loop to continue indefinitely.
+            goal_unknown_tool_response(),
+            goal_unknown_tool_response(),
+            goal_unknown_tool_response(),
+        ];
+        let (mut repl, state, _workspace, bodies) = goal_repl(responses).await;
+        repl.handle_command("/goal breaker objective", ReplOutput::Tui(&state))
+            .await
+            .expect("goal command");
+        for _ in 0..5 {
             let _ = bodies
                 .recv_timeout(std::time::Duration::from_secs(1))
                 .expect("provider request");
@@ -4913,6 +5162,7 @@ mod tests {
             goal_tool_response("resume-1", "in_progress"),
             goal_text_response("paused"),
             goal_tool_response("resume-2", "completed"),
+            goal_completion_tool_response("resume-claim"),
             goal_text_response("verified"),
         ])
         .await;
@@ -4955,12 +5205,124 @@ mod tests {
             .handle_command("/goal", ReplOutput::Tui(&resumed_state))
             .await
             .expect("continue resumed goal");
-        for _ in 0..2 {
+        for _ in 0..3 {
             let _ = bodies
                 .recv_timeout(std::time::Duration::from_secs(1))
                 .expect("resume provider request");
         }
         assert!(crate::goal::is_complete(&resumed.runtime.todos()));
+    }
+
+    #[tokio::test]
+    async fn resumed_verified_goal_is_recognized_without_repeating_work() {
+        let (mut repl, state, workspace, bodies) = goal_repl(vec![
+            goal_tool_response("resume-claim-list", "completed"),
+            goal_completion_tool_response("resume-claim"),
+            goal_text_response("verified"),
+        ])
+        .await;
+        repl.handle_command("/goal persist the objective", ReplOutput::Tui(&state))
+            .await
+            .expect("initial goal command");
+        for _ in 0..3 {
+            let _ = bodies
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("initial provider request");
+        }
+        let session_id = repl.runtime.session_id().to_string();
+        let config = repl.runtime.config().clone();
+        repl.runtime.finish(EndReason::Completed).await;
+        drop(repl);
+
+        let runtime = build_resumed_session_runtime(
+            config,
+            workspace.path(),
+            false,
+            true,
+            false,
+            &session_id,
+            None,
+        )
+        .await
+        .expect("resume verified goal session");
+        let resumed_state = Arc::new(Mutex::new(TuiSessionState::new(
+            session_id,
+            runtime.model().to_string(),
+            "@build".into(),
+            "YOLO".into(),
+            PathBuf::from(workspace.path()),
+        )));
+        let mut resumed = Repl::new(runtime, false, false);
+        resumed
+            .handle_command("/goal", ReplOutput::Tui(&resumed_state))
+            .await
+            .expect("recognize verified goal");
+        let state = resumed_state.lock().expect("resumed state");
+        assert!(state.blocks.iter().any(|block| matches!(
+            block,
+            DisplayBlock::System(message)
+                if message.contains("[goal] completed: objective verified")
+        )));
+    }
+
+    #[tokio::test]
+    async fn resumed_legacy_completed_checklist_stays_unverified() {
+        let (mut repl, state, workspace, bodies) = goal_repl(vec![
+            goal_tool_response("legacy-list", "completed"),
+            goal_text_response("the checklist is done but evidence is inconclusive"),
+            goal_text_response("still no accepted handshake"),
+        ])
+        .await;
+        repl.runtime.config_mut().session.max_goal_iterations = 1;
+        repl.handle_command("/goal legacy completion", ReplOutput::Tui(&state))
+            .await
+            .expect("initial goal command");
+        for _ in 0..2 {
+            let _ = bodies
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("initial provider request");
+        }
+        let session_id = repl.runtime.session_id().to_string();
+        let config = repl.runtime.config().clone();
+        repl.runtime.finish(EndReason::Completed).await;
+        drop(repl);
+
+        let runtime = build_resumed_session_runtime(
+            config,
+            workspace.path(),
+            false,
+            true,
+            false,
+            &session_id,
+            None,
+        )
+        .await
+        .expect("resume legacy goal session");
+        let resumed_state = Arc::new(Mutex::new(TuiSessionState::new(
+            session_id,
+            runtime.model().to_string(),
+            "@build".into(),
+            "YOLO".into(),
+            PathBuf::from(workspace.path()),
+        )));
+        let mut resumed = Repl::new(runtime, false, false);
+        resumed
+            .handle_command("/goal", ReplOutput::Tui(&resumed_state))
+            .await
+            .expect("continue unverified goal");
+        let _ = bodies
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("resume provider request");
+        let state = resumed_state.lock().expect("resumed state");
+        assert!(state.blocks.iter().any(|block| matches!(
+            block,
+            DisplayBlock::System(message)
+                if message.contains("final verification was not accepted")
+        )));
+        assert!(!state.blocks.iter().any(|block| matches!(
+            block,
+            DisplayBlock::System(message) if message.contains("[goal] completed:")
+        )));
     }
 
     #[tokio::test]
@@ -5042,6 +5404,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_custom_command_normalizes_and_persists_without_full_config_save() {
         let (mut repl, state, workspace) = test_repl(false).await;
+        repl.runtime.config_mut().model.reasoning_effort = "low".into();
         repl.handle_command(
             "/custom openai https://legacy.example/v1 pasted-secret legacy-model",
             ReplOutput::Tui(&state),
@@ -5055,10 +5418,89 @@ mod tests {
             "https://legacy.example/v1"
         );
         assert_eq!(repl.runtime.config().provider.custom.model, "legacy-model");
+        assert_eq!(
+            state
+                .lock()
+                .expect("state lock")
+                .reasoning_effort
+                .as_deref(),
+            Some("low")
+        );
         let saved = std::fs::read_to_string(workspace.path().join(".nca/config.local.toml"))
             .expect("workspace config");
         assert!(saved.contains("legacy-model"));
         assert!(!saved.contains("test-minimax-key"));
+    }
+
+    #[test]
+    fn reasoning_projection_trims_supported_values_and_omits_nil_or_unsupported() {
+        let mut config = NcaConfig::default();
+        config.provider.default = ProviderKind::OpenAi;
+        config.model.reasoning_effort = "  medium  ".into();
+        assert_eq!(
+            projected_reasoning_effort(&config).as_deref(),
+            Some("medium")
+        );
+
+        config.model.reasoning_effort = "   ".into();
+        assert!(projected_reasoning_effort(&config).is_none());
+        config.model.reasoning_effort = "nil".into();
+        assert!(projected_reasoning_effort(&config).is_none());
+
+        config.model.reasoning_effort = "high".into();
+        config.provider.default = ProviderKind::MiniMax;
+        assert!(projected_reasoning_effort(&config).is_none());
+
+        config.provider.default = ProviderKind::Custom;
+        config.provider.custom.compatibility = ProviderCompatibility::OpenAiResponses;
+        assert_eq!(projected_reasoning_effort(&config).as_deref(), Some("high"));
+        config.provider.custom.compatibility = ProviderCompatibility::Anthropic;
+        assert!(projected_reasoning_effort(&config).is_none());
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_command_refreshes_tui_projection() {
+        let (mut repl, state, _) = test_repl(false).await;
+        repl.runtime.config_mut().provider.default = ProviderKind::OpenAi;
+        repl.runtime.config_mut().model.reasoning_effort = "low".into();
+
+        repl.handle_command("/reasoning-effort medium", ReplOutput::Tui(&state))
+            .await
+            .expect("reasoning effort command");
+        assert_eq!(
+            state
+                .lock()
+                .expect("state lock")
+                .reasoning_effort
+                .as_deref(),
+            Some("medium")
+        );
+
+        repl.handle_command("/reasoning-effort nil", ReplOutput::Tui(&state))
+            .await
+            .expect("clear reasoning effort");
+        assert!(state.lock().expect("state lock").reasoning_effort.is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_switch_refreshes_tui_reasoning_projection() {
+        let (mut repl, state, _) = test_repl(false).await;
+        repl.runtime.config_mut().provider.default = ProviderKind::OpenAi;
+        repl.runtime.config_mut().model.reasoning_effort = "medium".into();
+        repl.sync_tui_reasoning_effort(&state);
+        assert_eq!(
+            state
+                .lock()
+                .expect("state lock")
+                .reasoning_effort
+                .as_deref(),
+            Some("medium")
+        );
+
+        repl.apply_provider_in_session(ProviderKind::MiniMax, ReplOutput::Tui(&state))
+            .await
+            .expect("provider switch");
+        assert!(state.lock().expect("state lock").reasoning_effort.is_none());
     }
 
     #[tokio::test]
@@ -5115,6 +5557,44 @@ mod tests {
                 && line.contains("OpenAI-compatible only")
                 && line.contains("inactive for active provider")
         }));
+    }
+
+    #[tokio::test]
+    async fn exit_commands_dispatch_and_removed_q_is_unknown() {
+        for command in ["/exit", "/quit"] {
+            let (mut repl, state, _) = test_repl(false).await;
+            assert!(
+                !repl
+                    .dispatch_tui_slash_command(command, &state)
+                    .await
+                    .expect("exit command dispatch")
+            );
+            assert!(state.lock().expect("state lock").should_exit);
+        }
+
+        let (mut repl, state, _) = test_repl(false).await;
+        assert!(
+            repl.dispatch_tui_slash_command("/q", &state)
+                .await
+                .expect("unknown command dispatch")
+        );
+        let state = state.lock().expect("state lock");
+        assert!(!state.should_exit);
+        assert!(state.blocks.iter().any(|block| {
+            matches!(block, DisplayBlock::System(line) if line == "[!] unknown command: /q")
+        }));
+
+        let suggestions = repl.complete("/q", 2);
+        assert!(
+            suggestions
+                .iter()
+                .all(|suggestion| suggestion.value != "/q")
+        );
+        assert!(
+            repl.complete("/sk", 3)
+                .iter()
+                .any(|suggestion| suggestion.value == "/skills")
+        );
     }
 
     #[tokio::test]
@@ -5326,5 +5806,40 @@ mod tests {
         .expect("resolve explicit skill")
         .expect("manual skill");
         assert!(skill.is_manual_only());
+    }
+
+    #[tokio::test]
+    async fn status_and_doctor_identify_custom_responses_protocol() {
+        let (mut repl, state, _) = test_repl(true).await;
+        repl.runtime.config_mut().provider.default = ProviderKind::Custom;
+        repl.runtime.config_mut().provider.custom.compatibility =
+            ProviderCompatibility::OpenAiResponses;
+
+        repl.handle_command("/status", ReplOutput::Tui(&state))
+            .await
+            .expect("status command");
+        {
+            let state = state.lock().expect("state lock");
+            assert!(state.info_modal_lines().iter().any(|line| {
+                line.contains("Provider:") && line.contains("Custom (OpenAI Responses)")
+            }));
+            assert!(
+                state
+                    .info_modal_lines()
+                    .iter()
+                    .any(|line| line.contains("Custom (OpenAI Responses)"))
+            );
+        }
+
+        repl.handle_command("/doctor", ReplOutput::Tui(&state))
+            .await
+            .expect("doctor command");
+        let state = state.lock().expect("state lock");
+        assert!(
+            state
+                .info_modal_lines()
+                .iter()
+                .any(|line| line.contains("Custom (OpenAI Responses)"))
+        );
     }
 }

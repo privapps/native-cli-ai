@@ -233,6 +233,30 @@ matcher = ""        # Optional regex to match on
 blocking = false    # If true, waits for completion
 ```
 
+The optional idle-transition hook is configured separately from these existing
+lifecycle-hook lists:
+
+```toml
+[hooks.idle_hook]
+command = "/usr/local/bin/notify-idle"
+args = ["--workspace", "example"]
+```
+
+`command` is the executable to launch and `args` is its ordered argument list;
+they are not a shell command string. The executable is launched directly, so
+shell syntax such as pipes, redirects, quoting, and variable expansion is not
+interpreted. `args` defaults to an empty list.
+
+The idle-hook configuration is resolved once at application startup. It does
+not run for the initial idle state or for idle-to-idle notifications; it runs
+only after an authoritative non-idle/busy state changes to idle. The hook is
+asynchronous and has a five-second timeout. Hook failures, unsuccessful exits,
+and timeouts are best-effort outcomes: they are logged and do not change the
+session result. Start, completion, failure, timeout, and skipped outcomes are
+logged without reconstructing or exposing the full argument list. If a hook is
+already running when another eligible transition occurs, the new invocation is
+skipped and not queued or run concurrently.
+
 ### `[web]` — Web Request Settings
 
 ```toml
@@ -298,6 +322,8 @@ Environment variables override config file values.
 | `NCA_WEB_TIMEOUT_SECS` | Override web request timeout |
 | `NCA_WEB_MAX_FETCH_CHARS` | Override max characters for web fetches |
 | `NCA_DEBUG_REQUEST` | Set to `1` to print MiniMax request bodies to stderr or emit and append custom OpenAI-compatible request method, URL, redacted headers, and body to stderr and `./debug.log`; response data is never logged |
+| `IDLE_HOOK_COMMAND` | Startup-snapshotted executable for the optional non-idle-to-idle hook |
+| `IDLE_HOOK_ARGS` | Startup-snapshotted ordered argument list for `IDLE_HOOK_COMMAND` (JSON string array is preferred) |
 | `NCA_SKIP_CONTEXT_API` | Set to `1` to skip provider model API queries |
 | `NCA_CONTEXT_API_CACHE_TTL_SECS` | Cache TTL for model context API |
 | `XDG_RUNTIME_DIR` | IPC socket directory (fallback: `/tmp/nca/`) |

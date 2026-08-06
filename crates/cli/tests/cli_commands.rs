@@ -1,7 +1,8 @@
 use assert_cmd::Command;
 use chrono::{Duration, Utc};
-use nca_common::message::Message;
+use nca_common::message::{Message, MessageToolCall};
 use nca_common::session::{SessionMeta, SessionState, SessionStatus};
+use nca_common::todo::{AgentTodo, TodoStatus};
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
@@ -33,6 +34,29 @@ fn write_session(
     model: &str,
     status: SessionStatus,
 ) {
+    write_session_state(
+        workspace,
+        id,
+        updated_at,
+        model,
+        status,
+        vec![Message::user("hello")],
+        Vec::new(),
+        Vec::new(),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_session_state(
+    workspace: &Path,
+    id: &str,
+    updated_at: chrono::DateTime<Utc>,
+    model: &str,
+    status: SessionStatus,
+    messages: Vec<Message>,
+    prompt_history: Vec<String>,
+    todos: Vec<AgentTodo>,
+) {
     let sessions_dir = workspace.join(".nca").join("sessions");
     fs::create_dir_all(&sessions_dir).expect("create sessions dir");
 
@@ -57,12 +81,13 @@ fn write_session(
             orchestration: None,
             execution: Default::default(),
         },
-        messages: vec![Message::user("hello")],
-        prompt_history: Vec::new(),
+        messages,
+        prompt_history,
         total_input_tokens: 0,
         total_output_tokens: 0,
         estimated_cost_usd: 0.0,
-        todos: Vec::new(),
+        todos,
+        completion_claim: None,
     };
 
     let json = serde_json::to_string_pretty(&session).expect("serialize session");
@@ -325,6 +350,246 @@ fn status_outputs_session_snapshot_json() {
     assert_eq!(payload["status"], "completed");
     assert_eq!(payload["model"], "MiniMax-M2.5");
     assert_eq!(payload["estimated_cost_usd"], 0.0);
+    assert!(
+        payload["state_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("session-status.json"))
+    );
+    assert!(
+        payload["events_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("session-status.events.jsonl"))
+    );
+}
+
+#[test]
+fn session_list_and_status_expose_authoritative_human_and_json_paths() {
+    let workspace = tempdir().expect("temporary workspace");
+    let nca_home = workspace.path().join("nca-home");
+    let now = Utc::now();
+    write_session(
+        workspace.path(),
+        "session-paths",
+        now,
+        "MiniMax-M2.5",
+        SessionStatus::Completed,
+    );
+    write_event_log(
+        workspace.path(),
+        "session-paths",
+        "{\"id\":1,\"event\":{\"type\":\"SessionEnded\",\"reason\":\"Completed\"}}\n",
+    );
+
+    let human = Command::cargo_bin("nca")
+        .expect("binary")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.path())
+        .env("NCA_HOME", &nca_home)
+        .args(["sessions", "--workspace", "."])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let human = String::from_utf8_lossy(&human);
+    assert!(human.contains("state:"));
+    assert!(human.contains("events:"));
+
+    let json = Command::cargo_bin("nca")
+        .expect("binary")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.path())
+        .env("NCA_HOME", &nca_home)
+        .args(["status", "session-paths", "--workspace", ".", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&json).expect("status JSON");
+    let state_path = Path::new(payload["state_path"].as_str().expect("state path"));
+    let events_path = Path::new(payload["events_path"].as_str().expect("events path"));
+    assert!(state_path.is_absolute());
+    assert!(events_path.is_absolute());
+    assert!(state_path.is_file());
+    assert!(events_path.is_file());
+    assert_eq!(
+        state_path.file_name().and_then(|name| name.to_str()),
+        Some("session-paths.json")
+    );
+    assert_eq!(
+        events_path.file_name().and_then(|name| name.to_str()),
+        Some("session-paths.events.jsonl")
+    );
+}
+
+#[test]
+fn sessions_searches_all_persisted_evidence_and_legacy_user_messages() {
+    let workspace = tempdir().expect("temporary workspace");
+    let nca_home = workspace.path().join("nca-home");
+    let now = Utc::now();
+    write_session_state(
+        workspace.path(),
+        "session-evidence",
+        now,
+        "MiniMax-M2.5",
+        SessionStatus::Completed,
+        vec![
+            Message::assistant_with_tool_calls(
+                "",
+                vec![MessageToolCall {
+                    id: "call-evidence".into(),
+                    name: "evidence_tool_name".into(),
+                    arguments: serde_json::json!({"needle": "evidence_tool_argument"}),
+                }],
+            ),
+            Message::tool("call-evidence", "evidence_tool_result"),
+            Message::assistant("evidence_assistant_message"),
+        ],
+        vec!["evidence_prompt_history".into()],
+        vec![AgentTodo {
+            id: "todo-evidence".into(),
+            content: "evidence_todo_content".into(),
+            status: TodoStatus::InProgress,
+            source: None,
+        }],
+    );
+    write_session_state(
+        workspace.path(),
+        "session-legacy",
+        now - Duration::minutes(1),
+        "MiniMax-M2.5",
+        SessionStatus::Completed,
+        vec![Message::user("evidence_legacy_user_message")],
+        Vec::new(),
+        Vec::new(),
+    );
+
+    for query in [
+        "evidence_prompt_history",
+        "evidence_todo_content",
+        "in_progress",
+        "evidence_assistant_message",
+        "evidence_tool_name",
+        "evidence_tool_argument",
+        "evidence_tool_result",
+    ] {
+        let output = Command::cargo_bin("nca")
+            .expect("binary")
+            .current_dir(workspace.path())
+            .env("HOME", workspace.path())
+            .env("NCA_HOME", &nca_home)
+            .args(["sessions", "--search", query, "--json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let payload: Value = serde_json::from_slice(&output).expect("search JSON");
+        let sessions = payload["sessions"].as_array().expect("sessions array");
+        assert!(
+            sessions
+                .iter()
+                .any(|session| session["id"] == "session-evidence"),
+            "query {query:?}"
+        );
+    }
+
+    let output = Command::cargo_bin("nca")
+        .expect("binary")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.path())
+        .env("NCA_HOME", &nca_home)
+        .args([
+            "sessions",
+            "--search",
+            "evidence_legacy_user_message",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).expect("legacy search JSON");
+    assert!(
+        payload["sessions"]
+            .as_array()
+            .expect("sessions array")
+            .iter()
+            .any(|session| session["id"] == "session-legacy")
+    );
+
+    let output = Command::cargo_bin("nca")
+        .expect("binary")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.path())
+        .env("NCA_HOME", &nca_home)
+        .args([
+            "sessions",
+            "--search",
+            "empty_assistant_placeholder",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).expect("empty assistant search JSON");
+    assert!(
+        payload["sessions"]
+            .as_array()
+            .expect("sessions array")
+            .is_empty()
+    );
+}
+
+#[test]
+fn workspace_option_selects_sessions_from_another_current_directory_and_rejects_invalid_paths() {
+    let workspace = tempdir().expect("target workspace");
+    let current = tempdir().expect("unrelated current directory");
+    let nca_home = current.path().join("nca-home");
+    write_session(
+        workspace.path(),
+        "session-explicit-workspace",
+        Utc::now(),
+        "MiniMax-M2.5",
+        SessionStatus::Completed,
+    );
+
+    let output = Command::cargo_bin("nca")
+        .expect("binary")
+        .current_dir(current.path())
+        .env("HOME", current.path())
+        .env("NCA_HOME", &nca_home)
+        .args([
+            "sessions",
+            "--workspace",
+            workspace.path().to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).expect("workspace JSON");
+    assert_eq!(payload["sessions"][0]["id"], "session-explicit-workspace");
+
+    Command::cargo_bin("nca")
+        .expect("binary")
+        .current_dir(current.path())
+        .env("HOME", current.path())
+        .env("NCA_HOME", &nca_home)
+        .args([
+            "sessions",
+            "--workspace",
+            current.path().join("missing").to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("invalid workspace"));
 }
 
 #[test]
@@ -907,4 +1172,86 @@ fn index_show_and_build_json_status() {
     let status: Value = serde_json::from_slice(&out).expect("status json");
     assert!(status["path"].as_str().unwrap().contains("cli-index.json"));
     assert!(status["workspace_id"].as_str().unwrap().len() > 10);
+}
+
+#[test]
+fn responses_compatibility_is_visible_in_status_models_and_doctor_diagnostics() {
+    let temp = tempdir().expect("tempdir");
+    write_local_config_contents(
+        temp.path(),
+        r#"
+[provider]
+default = "custom"
+
+[provider.custom]
+compatibility = "openai-responses"
+api_key = "responses-key"
+base_url = "https://gateway.example/v1"
+model = "responses-model"
+"#,
+    );
+    write_session(
+        temp.path(),
+        "responses-status",
+        Utc::now(),
+        "responses-model",
+        SessionStatus::Completed,
+    );
+
+    let doctor = Command::cargo_bin("nca")
+        .expect("binary")
+        .current_dir(temp.path())
+        .env("HOME", temp.path())
+        .args(["doctor", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let doctor: Value = serde_json::from_slice(&doctor).expect("doctor JSON");
+    assert_eq!(doctor["provider"], "Custom");
+    assert_eq!(doctor["compatibility"], "OpenAI Responses");
+    assert!(
+        doctor["providers"]
+            .as_array()
+            .expect("providers")
+            .iter()
+            .any(|provider| provider["provider"] == "Custom"
+                && provider["compatibility"] == "OpenAI Responses"
+                && provider["selected"] == true)
+    );
+
+    let models = Command::cargo_bin("nca")
+        .expect("binary")
+        .current_dir(temp.path())
+        .env("HOME", temp.path())
+        .args(["models", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let models: Value = serde_json::from_slice(&models).expect("models JSON");
+    assert!(
+        models["provider_models"]
+            .as_array()
+            .expect("provider models")
+            .iter()
+            .any(|provider| provider["provider"] == "Custom"
+                && provider["compatibility"] == "OpenAI Responses")
+    );
+
+    let status = Command::cargo_bin("nca")
+        .expect("binary")
+        .current_dir(temp.path())
+        .env("HOME", temp.path())
+        .args(["status", "responses-status", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status: Value = serde_json::from_slice(&status).expect("status JSON");
+    assert_eq!(status["provider"], "Custom");
+    assert_eq!(status["compatibility"], "OpenAI Responses");
 }

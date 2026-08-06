@@ -20,7 +20,7 @@ pub mod theme;
 pub mod transcript;
 
 pub use app::{TuiCmd, run_blocking};
-pub use bridge::spawn_tui_bridge;
+pub use bridge::{spawn_tui_bridge, spawn_tui_bridge_with_idle_hook};
 pub use git::{git_create_branch, git_current_branch, git_list_branches, git_switch_branch};
 pub use input::{ApprovalAnswer, CustomProviderProbeAction, CustomProviderSetupSubmission};
 pub use overlay::{UiOverlay, UiOverlayKind};

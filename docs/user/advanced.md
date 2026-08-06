@@ -188,6 +188,33 @@ blocking = false
 | `matcher` | string | `""` | Regex pattern to filter when the hook fires |
 | `blocking` | bool | `false` | Whether to wait for the hook to complete |
 
+### Idle transition hook
+
+The idle hook is a separate optional lifecycle action. Configure it with the
+`IDLE_HOOK_COMMAND` and `IDLE_HOOK_ARGS` environment variables, or with the
+`[hooks.idle_hook]` TOML table:
+
+```toml
+[hooks.idle_hook]
+command = "/usr/local/bin/notify-idle"
+args = ["--workspace", "example"]
+```
+
+`IDLE_HOOK_COMMAND` names the executable and `IDLE_HOOK_ARGS` supplies its
+ordered arguments. Together they are an executable plus argument list, not a
+shell command string; nca launches the executable directly without shell
+interpretation or appended event payloads. Omit the command, or set it to an
+empty or whitespace-only value, to disable the idle hook.
+
+The configuration is snapshotted at startup. There is no startup trigger: the
+hook runs asynchronously only when the authoritative application state changes
+from non-idle/busy to idle. It has a five-second timeout. Spawn failures,
+unsuccessful exits, and timeouts are best-effort: they are logged and do not
+fail or alter the session. Hook start, completion, failure, timeout, and
+skip-without-queue outcomes are logged without exposing full argument values.
+If an earlier idle-hook invocation is still running, a later eligible
+transition is skipped rather than queued or run concurrently.
+
 ---
 
 ## Persistent Memory

@@ -34,6 +34,16 @@ cp target/release/nca /usr/local/bin/
 
 The release profile is optimized for size and speed (`opt-level = 3`, `lto = "thin"`, `strip = true`).
 
+Normal development builds use `debug = 0` to avoid filling the target directory
+with full debugger symbols. When source-level debugging is needed, opt in to
+the documented full-debug profile:
+
+```bash
+cargo build --profile full-debug
+```
+
+Return to the normal low-disk profile with the usual `cargo build` command.
+
 ### Verify Installation
 
 ```bash

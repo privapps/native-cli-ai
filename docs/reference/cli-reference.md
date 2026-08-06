@@ -65,6 +65,8 @@ Options:
           Permission handling mode (default: from config, fallback to `default`) [possible values: default, plan, accept-edits, dont-ask, bypass-permissions]
       --max-turns <MAX_TURNS>
           Max turns per run (overrides config)
+      --workspace <PATH>
+          Workspace whose session/configuration store should be used
   -h, --help
           Print help
 ```

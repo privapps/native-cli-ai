@@ -202,7 +202,7 @@ Type `/` to access slash commands. In the TUI, this opens an inline autocomplete
 | `/help` | Show help with all commands and keyboard shortcuts |
 | `/status` | Display session status (ID, model, agent profile, permission mode) |
 | `/clear` | Clear the screen |
-| `/exit`, `/quit`, `/q` | Exit the session |
+| `/exit`, `/quit` | Exit the session |
 | `/new` | Start a new session |
 | `/export` | Export the current session to markdown |
 | `/stop` | Cancel the current agent turn |
@@ -282,6 +282,13 @@ such as `none`, `low`, `medium`, `high`, `xhigh`, and gateway-specific strings
 are passed through unchanged. The setting is not sent to MiniMax, Anthropic,
 or an Anthropic-compatible Custom endpoint, and it is not part of the Custom
 provider setup wizard.
+
+The `/status` and `/doctor` diagnostics identify a configured Custom protocol as
+`Custom (OpenAI Responses)` instead of only `Custom`. OpenAI Responses is a
+separate wire format from Chat Completions: requests use `/responses`, native
+input items and function tools, and Responses streaming events. Choose
+`responses` (or `openai-responses` / `openai_responses` in configuration) only
+for a gateway that implements that API; use `openai` for Chat Completions.
 
 ### Session and Context
 

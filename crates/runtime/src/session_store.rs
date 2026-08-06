@@ -17,8 +17,18 @@ impl SessionStore {
         &self.sessions_dir
     }
 
+    /// Return the exact state path used by this store for a session.
+    pub fn state_path(&self, session_id: &str) -> PathBuf {
+        self.sessions_dir.join(format!("{session_id}.json"))
+    }
+
+    /// Return the exact event-log path used by this store for a session.
+    pub fn events_path(&self, session_id: &str) -> PathBuf {
+        self.sessions_dir.join(format!("{session_id}.events.jsonl"))
+    }
+
     pub async fn save(&self, session: &SessionState) -> Result<(), SessionStoreError> {
-        let path = self.sessions_dir.join(format!("{}.json", session.meta.id));
+        let path = self.state_path(&session.meta.id);
         let json = serde_json::to_string_pretty(session)
             .map_err(|e| SessionStoreError::Serialize(e.to_string()))?;
 
@@ -34,7 +44,7 @@ impl SessionStore {
     }
 
     pub async fn load(&self, session_id: &str) -> Result<SessionState, SessionStoreError> {
-        let path = self.sessions_dir.join(format!("{session_id}.json"));
+        let path = self.state_path(session_id);
         let json = tokio::fs::read_to_string(&path)
             .await
             .map_err(|e| SessionStoreError::Io(e.to_string()))?;
@@ -48,7 +58,14 @@ impl SessionStore {
     ) -> Result<SessionSnapshot, SessionStoreError> {
         self.load(session_id)
             .await
-            .map(|session| session.snapshot())
+            .map(|session| self.snapshot_with_paths(session_id, &session))
+    }
+
+    pub fn snapshot_with_paths(&self, session_id: &str, session: &SessionState) -> SessionSnapshot {
+        let mut snapshot = session.snapshot();
+        snapshot.state_path = Some(self.state_path(session_id));
+        snapshot.events_path = Some(self.events_path(session_id));
+        snapshot
     }
 
     pub async fn list(&self) -> Result<Vec<String>, SessionStoreError> {

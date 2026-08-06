@@ -280,6 +280,13 @@ impl NcaConfig {
             self.web.max_fetch_chars = max_fetch_chars;
         }
 
+        if let Ok(command) = env::var("IDLE_HOOK_COMMAND") {
+            self.hooks.idle_hook.command = Some(command);
+        }
+        if let Ok(args) = env::var("IDLE_HOOK_ARGS") {
+            self.hooks.idle_hook.args = parse_idle_hook_args(&args);
+        }
+
         self.sync_default_model_from_provider();
     }
 
@@ -1252,6 +1259,33 @@ impl ProviderConfig {
         }
     }
 
+    /// Return the wire compatibility selected by a provider, when it has one.
+    ///
+    /// Custom providers are a single configurable slot, so diagnostics must
+    /// include this value rather than reporting only `Custom`.
+    pub fn compatibility_for(&self, provider: ProviderKind) -> Option<ProviderCompatibility> {
+        match provider {
+            ProviderKind::MiniMax | ProviderKind::OpenRouter => None,
+            ProviderKind::Anthropic => Some(ProviderCompatibility::Anthropic),
+            ProviderKind::OpenAi => Some(ProviderCompatibility::OpenAi),
+            ProviderKind::Custom => Some(self.custom.compatibility),
+        }
+    }
+
+    /// Return a human-readable provider label suitable for diagnostics.
+    pub fn diagnostic_name_for(&self, provider: ProviderKind) -> String {
+        match (provider, self.compatibility_for(provider)) {
+            (ProviderKind::Custom, Some(ProviderCompatibility::OpenAiResponses)) => {
+                format!(
+                    "{} ({})",
+                    provider.display_name(),
+                    ProviderCompatibility::OpenAiResponses.display_name()
+                )
+            }
+            _ => provider.display_name().to_string(),
+        }
+    }
+
     /// Returns `true` if at least one provider has an API key configured
     /// (either in config or via environment variable).
     pub fn any_api_key_present(&self) -> bool {
@@ -2171,6 +2205,16 @@ pub struct HookConfig {
     pub subagent_start: Vec<HookCommand>,
     #[serde(default)]
     pub subagent_stop: Vec<HookCommand>,
+    #[serde(default)]
+    pub idle_hook: IdleHookConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct IdleHookConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2372,6 +2416,9 @@ impl HookConfig {
         if let Some(subagent_stop) = partial.subagent_stop {
             self.subagent_stop = subagent_stop;
         }
+        if let Some(idle_hook) = partial.idle_hook {
+            self.idle_hook = idle_hook;
+        }
     }
 }
 
@@ -2557,6 +2604,7 @@ struct PartialHookConfig {
     approval_requested: Option<Vec<HookCommand>>,
     subagent_start: Option<Vec<HookCommand>>,
     subagent_stop: Option<Vec<HookCommand>>,
+    idle_hook: Option<IdleHookConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -2604,6 +2652,16 @@ fn resolve_api_key_value(inline: &Option<String>, env_name: &str) -> Option<Stri
         .map(String::from)
         .or_else(|| env::var(env_name).ok())
         .filter(|v| !v.trim().is_empty())
+}
+
+fn parse_idle_hook_args(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    serde_json::from_str::<Vec<String>>(trimmed)
+        .unwrap_or_else(|_| trimmed.split_whitespace().map(str::to_string).collect())
 }
 
 fn default_skill_directories() -> Vec<PathBuf> {
@@ -2671,6 +2729,96 @@ mod tests {
         assert_eq!(configured.web.search_retry_attempts, 2);
         assert_eq!(configured.web.search_challenge_retries, 9);
         assert_eq!(configured.web.search_user_agent, "test-agent");
+    }
+
+    #[test]
+    fn idle_hook_environment_configuration_preserves_ordered_arguments() {
+        let _guard = EnvGuard::set(&[
+            ("IDLE_HOOK_COMMAND", Some("  /tmp/notify  ")),
+            (
+                "IDLE_HOOK_ARGS",
+                Some(r#"["first value", "second", "$literal"]"#),
+            ),
+        ]);
+        let mut config = NcaConfig::default();
+        config.apply_env();
+
+        assert_eq!(
+            config.hooks.idle_hook.command.as_deref(),
+            Some("  /tmp/notify  ")
+        );
+        assert_eq!(
+            config.hooks.idle_hook.args,
+            vec!["first value", "second", "$literal"]
+        );
+    }
+
+    #[test]
+    fn idle_hook_environment_arguments_fall_back_to_ordered_words() {
+        let _guard = EnvGuard::set(&[
+            ("IDLE_HOOK_COMMAND", Some("notify")),
+            ("IDLE_HOOK_ARGS", Some("--first one --second")),
+        ]);
+        let mut config = NcaConfig::default();
+        config.apply_env();
+
+        assert_eq!(
+            config.hooks.idle_hook.args,
+            vec!["--first", "one", "--second"]
+        );
+    }
+
+    #[test]
+    fn idle_hook_file_configuration_defaults_without_new_fields() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let path = workspace_config_path(workspace.path());
+        std::fs::create_dir_all(path.parent().expect("config parent")).expect("config dir");
+        std::fs::write(
+            &path,
+            "[hooks.idle_hook]\ncommand = '/tmp/notify'\nargs = ['one', 'two']\n",
+        )
+        .expect("write config");
+
+        let config = NcaConfig::load_workspace_file(workspace.path()).expect("load config");
+        assert_eq!(
+            config.hooks.idle_hook.command.as_deref(),
+            Some("/tmp/notify")
+        );
+        assert_eq!(config.hooks.idle_hook.args, vec!["one", "two"]);
+    }
+
+    #[test]
+    fn legacy_hook_configuration_without_idle_hook_remains_loadable() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let path = workspace_config_path(workspace.path());
+        std::fs::create_dir_all(path.parent().expect("config parent")).expect("config dir");
+        std::fs::write(
+            &path,
+            "[[hooks.session_start]]\ncommand = 'notify-session-start'\nmatcher = 'session'\nblocking = true\n\n[[hooks.session_end]]\ncommand = 'notify-session-end'\n",
+        )
+        .expect("write legacy config");
+
+        let config = NcaConfig::load_workspace_file(workspace.path()).expect("load config");
+        assert_eq!(config.hooks.session_start.len(), 1);
+        assert_eq!(
+            config.hooks.session_start[0].command,
+            "notify-session-start"
+        );
+        assert_eq!(
+            config.hooks.session_start[0].matcher.as_deref(),
+            Some("session")
+        );
+        assert!(config.hooks.session_start[0].blocking);
+        assert_eq!(config.hooks.session_end[0].command, "notify-session-end");
+        assert_eq!(config.hooks.idle_hook, IdleHookConfig::default());
+    }
+
+    #[test]
+    fn default_config_disables_idle_hook() {
+        assert_eq!(
+            NcaConfig::default().hooks.idle_hook,
+            IdleHookConfig::default()
+        );
     }
 
     #[test]

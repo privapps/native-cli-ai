@@ -19,6 +19,11 @@ pub fn continuation_prompt() -> &'static str {
     "Continue the existing objective autonomously. Inspect the current checklist, work on the next incomplete item, keep all todo statuses current, and verify concrete progress. Do not claim completion while any checklist item remains incomplete."
 }
 
+/// Build the bounded final verification request after the checklist is complete.
+pub fn final_verification_prompt() -> &'static str {
+    "The checklist is fully completed, but the completion handshake is still missing. Perform final verification now, then call complete_goal with a concise summary, concrete evidence, and verification exactly `passed`. Do not rely on prose alone."
+}
+
 /// A checklist is a valid successful goal only when it has work and every
 /// item is completed.
 pub fn is_complete(todos: &[AgentTodo]) -> bool {
@@ -66,6 +71,14 @@ mod tests {
         let prompt = continuation_prompt();
         assert!(prompt.contains("next incomplete item"));
         assert!(prompt.contains("todo statuses"));
+    }
+
+    #[test]
+    fn final_verification_prompt_requires_handshake_evidence() {
+        let prompt = final_verification_prompt();
+        assert!(prompt.contains("complete_goal"));
+        assert!(prompt.contains("concrete evidence"));
+        assert!(prompt.contains("passed"));
     }
 
     fn todo(id: &str, status: TodoStatus) -> AgentTodo {

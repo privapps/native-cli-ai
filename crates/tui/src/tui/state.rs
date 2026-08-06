@@ -137,6 +137,8 @@ pub struct TuiSessionState {
     /// Latest context compaction diagnostics (if any).
     pub context_report: Option<ContextCompactionReport>,
     pub model: String,
+    /// Copied, display-ready reasoning effort for the active provider, if supported.
+    pub reasoning_effort: Option<String>,
     /// Sanitized host label for the active custom provider, if selected.
     pub custom_provider_host: Option<String>,
     pub agent_profile: String,
@@ -245,6 +247,7 @@ impl TuiSessionState {
             todos: Vec::new(),
             context_report: None,
             model,
+            reasoning_effort: None,
             custom_provider_host: None,
             agent_profile,
             permission_mode,
@@ -1431,6 +1434,14 @@ impl TuiSessionState {
         }
     }
 
+    /// Update the copied, display-ready reasoning effort projection.
+    pub fn set_reasoning_effort(&mut self, effort: Option<String>) {
+        if self.reasoning_effort != effort {
+            self.reasoning_effort = effort;
+            self.mark_dirty();
+        }
+    }
+
     /// Update the status-bar identity without retaining credentials or paths.
     pub fn set_active_provider(&mut self, provider: ProviderKind, base_url: &str) {
         self.custom_provider_host = if provider == ProviderKind::Custom {
@@ -2529,6 +2540,22 @@ mod tests {
 
         assert!(st.custom_provider_setup_open());
         assert!(st.blocks.is_empty());
+    }
+
+    #[test]
+    fn reasoning_effort_projection_is_copied_and_replaceable() {
+        let mut st = TuiSessionState::new(
+            "session".into(),
+            "model".into(),
+            "@build".into(),
+            "default".into(),
+            PathBuf::from("."),
+        );
+        assert!(st.reasoning_effort.is_none());
+        st.set_reasoning_effort(Some("medium".into()));
+        assert_eq!(st.reasoning_effort.as_deref(), Some("medium"));
+        st.set_reasoning_effort(None);
+        assert!(st.reasoning_effort.is_none());
     }
 
     #[test]

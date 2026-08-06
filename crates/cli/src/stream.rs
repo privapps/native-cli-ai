@@ -4,6 +4,7 @@
 
 use colored::Colorize;
 use nca_common::event::{AgentEvent, EventEnvelope, InteractiveQuestionPayload, QuestionSelection};
+use nca_runtime::idle_hook::IdleHookRunner;
 use nca_runtime::ipc::IpcHandle;
 use nca_runtime::supervisor;
 use nca_tui::ipc_pending::{ApprovalPendingMap, QuestionPendingMap};
@@ -134,6 +135,7 @@ struct IpcRebroadcast {
 }
 
 /// Spawns the stream task: event fanout (disk + IPC + rendering) and command consumer.
+#[allow(dead_code)]
 pub fn spawn_stream_task(
     rx: tokio::sync::mpsc::Receiver<AgentEvent>,
     mode: StreamMode,
@@ -142,6 +144,30 @@ pub fn spawn_stream_task(
     approval_pending: Option<ApprovalPendingMap>,
     question_pending: Option<QuestionPendingMap>,
     cancel_tx: Option<oneshot::Sender<()>>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_stream_task_with_idle_hook(
+        rx,
+        mode,
+        log_path,
+        ipc_handle,
+        approval_pending,
+        question_pending,
+        cancel_tx,
+        None,
+    )
+}
+
+/// Spawns the stream task with the startup-resolved idle-hook observer.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_stream_task_with_idle_hook(
+    rx: tokio::sync::mpsc::Receiver<AgentEvent>,
+    mode: StreamMode,
+    log_path: std::path::PathBuf,
+    ipc_handle: Option<IpcHandle>,
+    approval_pending: Option<ApprovalPendingMap>,
+    question_pending: Option<QuestionPendingMap>,
+    cancel_tx: Option<oneshot::Sender<()>>,
+    idle_hook: Option<IdleHookRunner>,
 ) -> tokio::task::JoinHandle<()> {
     let qp = question_pending.clone();
     let (event_tx_ipc, command_rx) = match ipc_handle {
@@ -156,15 +182,27 @@ pub fn spawn_stream_task(
         supervisor::spawn_command_consumer(crx, approval_pending, question_pending, cancel_tx);
     }
 
-    spawn_event_fanout_task(rx, mode, log_path, event_tx_ipc, qp)
+    spawn_event_fanout_task_with_idle_hook(rx, mode, log_path, event_tx_ipc, qp, idle_hook)
 }
 
+#[allow(dead_code)]
 pub fn spawn_event_fanout_task(
     rx: tokio::sync::mpsc::Receiver<AgentEvent>,
     mode: StreamMode,
     log_path: std::path::PathBuf,
     event_tx_ipc: Option<tokio::sync::broadcast::Sender<String>>,
     question_pending: Option<QuestionPendingMap>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_event_fanout_task_with_idle_hook(rx, mode, log_path, event_tx_ipc, question_pending, None)
+}
+
+pub fn spawn_event_fanout_task_with_idle_hook(
+    rx: tokio::sync::mpsc::Receiver<AgentEvent>,
+    mode: StreamMode,
+    log_path: std::path::PathBuf,
+    event_tx_ipc: Option<tokio::sync::broadcast::Sender<String>>,
+    question_pending: Option<QuestionPendingMap>,
+    idle_hook: Option<IdleHookRunner>,
 ) -> tokio::task::JoinHandle<()> {
     let stats = StreamStats::new();
 
@@ -201,6 +239,9 @@ pub fn spawn_event_fanout_task(
         let qp = question_pending;
         while let Some(event) = rx.recv().await {
             event_id += 1;
+            if let Some(ref runner) = idle_hook {
+                runner.observe(&event);
+            }
             let envelope = EventEnvelope::new(event_id, event.clone());
 
             if let Some(ref ipc) = ipc_handle_rebuilt {
@@ -653,5 +694,70 @@ mod tests {
 
         let log = std::fs::read_to_string(log_path).expect("read event log");
         assert!(log.contains("function call is missing its identity"));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod idle_hook_tests {
+    use super::*;
+    use nca_common::config::IdleHookConfig;
+    use nca_common::event::BusyState;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn stream_fanout_observes_busy_to_idle_events_for_idle_hook() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let script = workspace.path().join("idle-hook");
+        let output = workspace.path().join("observed");
+        let output_literal = output.to_string_lossy().replace('\'', "'\\''");
+        fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf observed >> '{output_literal}'\n"),
+        )
+        .expect("write hook");
+        let mut permissions = fs::metadata(&script).expect("hook metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("make hook executable");
+
+        let runner = IdleHookRunner::from_config(&IdleHookConfig {
+            command: Some(script.to_string_lossy().into_owned()),
+            args: Vec::new(),
+        })
+        .expect("idle hook runner");
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let task = spawn_event_fanout_task_with_idle_hook(
+            rx,
+            StreamMode::Off,
+            workspace.path().join("events.jsonl"),
+            None,
+            None,
+            Some(runner),
+        );
+
+        for state in [
+            BusyState::Thinking,
+            BusyState::Streaming,
+            BusyState::Idle,
+            BusyState::Idle,
+        ] {
+            tx.send(AgentEvent::BusyStateChanged { state })
+                .await
+                .expect("send event");
+        }
+        drop(tx);
+        task.await.expect("stream fanout exits");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if output.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("stream fanout should start the idle hook");
+        assert_eq!(fs::read_to_string(output).expect("hook output"), "observed");
     }
 }

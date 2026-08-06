@@ -268,7 +268,7 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
     command!(
         "exit",
         "/exit",
-        ["/quit", "/q"],
+        ["/quit"],
         "Exit",
         System,
         "ctrl+x q",
@@ -386,6 +386,23 @@ mod tests {
         }
         assert!(!help.contains("/undo"));
         assert!(!help.contains("/redo"));
+    }
+
+    #[test]
+    fn exit_commands_keep_only_explicit_aliases() {
+        let exit = resolve_command("/exit").expect("exit command");
+        assert_eq!(exit.aliases, &["/quit"]);
+        assert_eq!(resolve_command("/quit").map(|spec| spec.id), Some("exit"));
+        assert!(resolve_command("/q").is_none());
+
+        let help = help_lines().join("\n");
+        assert!(help.lines().any(|line| line.contains("/exit")));
+        assert!(help.lines().any(|line| line.contains("/skills")));
+        assert!(
+            !help
+                .lines()
+                .any(|line| line.trim_start().starts_with("/q "))
+        );
     }
 
     #[test]

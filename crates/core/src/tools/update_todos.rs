@@ -1,6 +1,7 @@
 //! Atomically replace the session todo list and broadcast `TodosUpdated`.
 
 use nca_common::event::AgentEvent;
+use nca_common::session::GoalCompletionClaim;
 use nca_common::todo::{AgentTodo, TodoSource, TodoStatus};
 use nca_common::tool::{ToolCall, ToolDefinition, ToolResult};
 use std::collections::HashSet;
@@ -16,15 +17,35 @@ pub const MAX_ID_CHARS: usize = 64;
 /// Shared authoritative todo list for a session.
 pub type TodoStore = Arc<Mutex<Vec<AgentTodo>>>;
 
+/// Shared optional completion metadata for a session.
+pub type CompletionClaimStore = Arc<Mutex<Option<GoalCompletionClaim>>>;
+
 /// Tool that replaces the full session todo list in one call.
 pub struct UpdateTodosTool {
     event_tx: mpsc::Sender<AgentEvent>,
     todos: TodoStore,
+    completion_claim: Option<CompletionClaimStore>,
 }
 
 impl UpdateTodosTool {
     pub fn new(event_tx: mpsc::Sender<AgentEvent>, todos: TodoStore) -> Self {
-        Self { event_tx, todos }
+        Self {
+            event_tx,
+            todos,
+            completion_claim: None,
+        }
+    }
+
+    pub fn new_with_completion_claim(
+        event_tx: mpsc::Sender<AgentEvent>,
+        todos: TodoStore,
+        completion_claim: CompletionClaimStore,
+    ) -> Self {
+        Self {
+            event_tx,
+            todos,
+            completion_claim: Some(completion_claim),
+        }
     }
 }
 
@@ -184,6 +205,23 @@ impl ToolExecutor for UpdateTodosTool {
             }
         };
 
+        if let Some(completion_claim) = &self.completion_claim {
+            let mut guard = match completion_claim.lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    return ToolResult {
+                        call_id: call.id.clone(),
+                        success: false,
+                        output: String::new(),
+                        error: Some("completion claim store lock poisoned".into()),
+                    };
+                }
+            };
+            // A full checklist replacement describes a new snapshot, so no
+            // previously accepted evidence may be reused for it.
+            *guard = None;
+        }
+
         {
             let mut guard = match self.todos.lock() {
                 Ok(g) => g,
@@ -295,6 +333,27 @@ mod tests {
             .collect();
         let err = validate_todos(&serde_json::Value::Array(items)).unwrap_err();
         assert!(err.contains("at most"));
+    }
+
+    #[tokio::test]
+    async fn replacement_invalidates_completion_claim() {
+        let (tx, _rx) = mpsc::channel(4);
+        let store: TodoStore = Arc::new(Mutex::new(Vec::new()));
+        let claims: CompletionClaimStore = Arc::new(Mutex::new(Some(GoalCompletionClaim {
+            summary: "old".into(),
+            evidence: "old test".into(),
+            verification: "passed".into(),
+        })));
+        let tool = UpdateTodosTool::new_with_completion_claim(tx, store, claims.clone());
+        let result = tool
+            .execute(&ToolCall {
+                id: "replace".into(),
+                name: "update_todos".into(),
+                input: serde_json::json!({"todos": sample_todos()}),
+            })
+            .await;
+        assert!(result.success, "{result:?}");
+        assert!(claims.lock().unwrap().is_none());
     }
 
     #[tokio::test]

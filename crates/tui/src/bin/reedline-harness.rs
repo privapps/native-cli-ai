@@ -14,6 +14,7 @@ fn main() {
         }
         Ok(Signal::CtrlD) => println!("NCA_REEDLINE_CTRLD"),
         Ok(Signal::CtrlC) => println!("NCA_REEDLINE_CTRLC"),
+        Ok(_) => println!("NCA_REEDLINE_OTHER"),
         Err(error) => {
             eprintln!("NCA_REEDLINE_ERROR={error}");
             std::process::exit(1);

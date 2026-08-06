@@ -532,6 +532,7 @@ fn responses_request_body(
     reasoning_effort: &str,
     workspace_root: &Path,
 ) -> Result<Value, ProviderError> {
+    let _ = temperature;
     let responses_tools = responses_tool_definitions(tools)?;
     let mut input = Vec::new();
     for message in messages {
@@ -577,7 +578,6 @@ fn responses_request_body(
         "stream": true,
         "store": false,
         "max_output_tokens": max_tokens,
-        "temperature": temperature,
     });
 
     if !responses_tools.is_empty() {
@@ -1606,7 +1606,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_openai_completion_is_reported_as_stream_error() {
-        let _debug_env = debug_request_env(Some("1"));
+        let _debug_env = DebugRequestEnvGuard::set(Some("1"));
         let body = concat!(
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
             "data: [DONE]\n\n"
@@ -1639,7 +1639,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_debug_log_failure_does_not_block_custom_request() {
-        let _debug_env = debug_request_env(Some("1"));
+        let _debug_env = DebugRequestEnvGuard::set(Some("1"));
         let body = concat!(
             "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
             "data: [DONE]\n\n"
@@ -1766,7 +1766,7 @@ mod tests {
     #[tokio::test]
     async fn custom_provider_debug_request_requires_exact_env_value_through_public_chat() {
         for value in [None, Some(""), Some("0"), Some("true"), Some(" 1")] {
-            let _debug_env = debug_request_env(value);
+            let _debug_env = DebugRequestEnvGuard::set(value);
             let body = concat!(
                 "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
                 "data: [DONE]\n\n"
@@ -1933,7 +1933,7 @@ mod tests {
 
     #[tokio::test]
     async fn custom_openai_compatible_provider_streams() {
-        let _debug_env = debug_request_env(Some("1"));
+        let _debug_env = DebugRequestEnvGuard::set(Some("1"));
         let body = concat!(
             "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \"},\"index\":0,\"finish_reason\":null}]}\n\n",
             "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n",
@@ -2012,7 +2012,7 @@ mod tests {
 
     #[tokio::test]
     async fn custom_openai_responses_provider_streams_text_with_native_request_settings() {
-        let _debug_env = debug_request_env(Some("1"));
+        let _debug_env = DebugRequestEnvGuard::set(Some("1"));
         let body = concat!(
             "event: response.output_text.delta\n",
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n",
@@ -2938,7 +2938,7 @@ data: {"type":"response.output_text.delta","delta":"partial"}
 
     #[tokio::test]
     async fn custom_anthropic_compatible_provider_streams_tools() {
-        let _debug_env = debug_request_env(Some("1"));
+        let _debug_env = DebugRequestEnvGuard::set(Some("1"));
         let body = concat!(
             "event: content_block_start\n",
             "data: {\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"lookup\"}}\n\n",

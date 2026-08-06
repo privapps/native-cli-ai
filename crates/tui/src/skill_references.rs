@@ -49,6 +49,7 @@ pub fn complete_skill_references(
         })
         .map(|skill| Suggestion {
             value: format!("${}", skill.command),
+            display_override: None,
             description: Some(format!(
                 "{} — {}{}",
                 skill.display_label(),
@@ -63,6 +64,7 @@ pub fn complete_skill_references(
             span: Span { start, end: pos },
             append_whitespace: skill_reference_completion_should_append_space(line, pos),
             style: None,
+            match_indices: None,
         })
         .collect()
 }

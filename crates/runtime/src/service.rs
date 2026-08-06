@@ -1,3 +1,4 @@
+use crate::idle_hook::IdleHookRunner;
 use crate::supervisor::{
     SessionControlCommand, Supervisor, SupervisorConfig, spawn_command_consumer_with_store,
     spawn_subagent_consumer,
@@ -136,6 +137,7 @@ async fn run_service_session_with_startup(
     let event_rx = handle
         .take_event_rx()
         .ok_or_else(|| "missing event receiver".to_string())?;
+    let idle_hook = handle.take_idle_hook();
     let approval_pending = handle.take_approval_pending();
     let question_pending = handle.take_question_pending();
 
@@ -147,8 +149,12 @@ async fn run_service_session_with_startup(
         command_rx = Some(crx);
     }
 
-    let fanout_task =
-        spawn_service_event_fanout(event_rx, info.event_log_path.clone(), event_tx_ipc);
+    let fanout_task = spawn_service_event_fanout(
+        event_rx,
+        info.event_log_path.clone(),
+        event_tx_ipc,
+        idle_hook,
+    );
 
     let subagent_task = if let Some(spawn_rx) = handle.take_spawn_rx() {
         Some(spawn_subagent_consumer(
@@ -259,6 +265,7 @@ fn spawn_service_event_fanout(
     mut event_rx: tokio::sync::mpsc::Receiver<AgentEvent>,
     log_path: PathBuf,
     event_tx_ipc: Option<tokio::sync::broadcast::Sender<String>>,
+    idle_hook: Option<IdleHookRunner>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         use tokio::fs::OpenOptions;
@@ -274,6 +281,9 @@ fn spawn_service_event_fanout(
         let mut event_id: u64 = 0;
         while let Some(event) = event_rx.recv().await {
             event_id += 1;
+            if let Some(ref runner) = idle_hook {
+                runner.observe(&event);
+            }
             let envelope = EventEnvelope::new(event_id, event);
             if let Some(ref tx) = event_tx_ipc {
                 let line = serde_json::to_string(&envelope).unwrap_or_default();

@@ -64,8 +64,16 @@ impl SessionRuntime {
         self.handle.as_mut()?.take_event_rx()
     }
 
+    pub fn take_idle_hook(&mut self) -> Option<nca_runtime::idle_hook::IdleHookRunner> {
+        self.handle.as_mut()?.take_idle_hook()
+    }
+
     pub fn event_log_path(&self) -> std::path::PathBuf {
         self.supervisor.event_log_path()
+    }
+
+    pub fn state_path(&self) -> std::path::PathBuf {
+        self.supervisor.state_path()
     }
 
     pub async fn run_turn(&mut self, prompt: &str) -> Result<String, ProviderError> {
@@ -243,6 +251,10 @@ impl SessionRuntime {
 
     pub fn todos(&self) -> Vec<nca_common::todo::AgentTodo> {
         self.supervisor.todos()
+    }
+
+    pub fn completion_claim(&self) -> Option<nca_common::session::GoalCompletionClaim> {
+        self.supervisor.completion_claim()
     }
 
     pub fn last_turn_tool_error(&self) -> Option<String> {
